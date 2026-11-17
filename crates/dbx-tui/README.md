@@ -59,8 +59,40 @@ width, between 26 and 34 columns (with its separator). Closing a database
 node, or a connection, tells the Core to `release` the databases it opened
 (`Core::release`: dbx's `remove_pool_by_key` for `<connection id>:<database>`),
 except the connection's saved default database, so browsing many databases
-does not hold a server connection slot for each. Selecting a row
-sets `Model.active` (connection and database) and the editor's title.
+does not hold a server connection slot for each. Moving the cursor never
+changes where the editor runs: `u` (use) on a database, or anything under one,
+gives that connection and database to the query tab, and on a connection row
+gives it the database the connection was saved with.
+
+## Running a statement (editor and results)
+
+The query tab owns its target (`editor · <connection> / <database>` in the
+editor's title) and a database session: dbx's `client_session_id` is the tab,
+so `SET`, temporary tables and transactions last from run to run. The session
+is closed when the tab is given another database or connection (a run still in
+flight there is cancelled first, and the close waits for that run to end so the
+cancel reaches the server) and on quit, by key, overlay or signal (the shell
+waits up to 2.5 s for runs to end and sessions to close); collapsing the database in the sidebar does not touch it, because
+`Core::release` removes only the database's shared pool.
+
+| Key | Does |
+|---|---|
+| `f5`, `alt+enter`, `ctrl+g r` | run the selection, or else the statement under the cursor (dbx splits statements at `;`, and also before a line starting with a keyword such as `CREATE`, `INSERT`, `UPDATE`, `DELETE` or `SET`, but not `SELECT` or `WITH`, after two or more blank lines; a cursor on a blank line after a statement runs that statement) |
+| anything else, editor focused | the editor's own (`ratatui-textarea` defaults: shift+arrows select, `ctrl+u`/`ctrl+r` undo/redo) |
+| `ctrl+c` | taken before the editor; cancels a run from slice 06 |
+
+A run has no time limit unless the connection sets its own query timeout in
+the dbx desktop app (dbx's default of 60 counts as unset); a pasted text over
+256 KiB, or with a line over 16 KiB, is refused with a notice.
+
+Only one run at a time per tab: a second is refused with a notice. The mode bar
+shows `running 3s` (woken each second through `next_deadline`), then `N rows
+12ms` (`N+` when the row cap of 1,000 cut the result), `N rows affected` or
+`failed`. The results pane starts with the first line of the statement that
+ran, then shows the header and the rows that fit, numbers
+right-aligned, NULL as a dimmed `∅`, a line break in a cell as `⏎`; a failed
+run shows dbx's message, `line L, column C` when Postgres gives a position, and
+the statement that ran with a `^` under the position.
 
 ## Tests
 
@@ -72,7 +104,7 @@ Run every command from the dbx workspace root.
 | Store: `DbxCore` on scratch stores (layer 1) | `cargo test -p dbx-tui --test store -- --test-threads=1` | nothing external; temp dirs, key files, a local TCP port |
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `add-connection` and `browse-pagila` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `first-query` and `quit-mid-run` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live

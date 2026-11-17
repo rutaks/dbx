@@ -2,21 +2,25 @@
 //! `view(frame)`. No tokio, no terminal I/O, no dbx types.
 
 mod connection_ui;
+pub mod editor;
 pub mod form;
 pub mod keys;
 pub mod layout;
 pub mod overlay;
+pub mod query;
 pub mod requests;
 pub mod sidebar;
 pub mod text_field;
 pub mod theme;
 pub mod tree;
-mod view;
+pub(crate) mod view;
 
 #[cfg(test)]
 mod connections_tests;
 #[cfg(test)]
 mod form_tests;
+#[cfg(test)]
+mod run_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
@@ -29,12 +33,15 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 
-use crate::core::{Connection, ConnectionDraft, ConnectionId, CoreError, DatabasePath, RunId};
+use crate::core::{
+    Connection, ConnectionDraft, ConnectionId, CoreError, DatabasePath, ResultSet, RunId, RunRequest, TabId, DEFAULT_ROW_CAP,
+};
 use keys::{Action, KeyCombo, Keybinds};
 use layout::{HintHit, HitMap};
 use overlay::{ErrorOverlay, FieldHit, Overlay, OverlayAction, OverlayButton};
 use requests::{RequestId, Requests, Target};
-use sidebar::{Active, SidebarUi};
+use query::{Notice, QueryTab};
+use sidebar::SidebarUi;
 use theme::Palette;
 use tree::{Listing, NodeId, RowKey, SchemaCache, Slot};
 
@@ -78,11 +85,17 @@ pub struct Model {
     /// What the Core told us about each connection's databases, schemas,
     /// tables and columns.
     pub schema: SchemaCache,
-    /// The connection and database the cursor row is in: where the editor will
-    /// run (slice 05).
-    pub active: Option<Active>,
+    /// The query tabs. One until the tab bar arrives (slice 15).
+    pub tabs: Vec<QueryTab>,
     pub requests: Requests,
+    /// The id the next run gets.
+    pub next_run: u64,
+    /// The most rows a run fetches.
+    pub row_cap: usize,
 }
+
+/// `ctrl+c`: never a key for the focused pane.
+const CTRL_C: KeyCombo = KeyCombo { code: KeyCode::Char('c'), mods: crossterm::event::KeyModifiers::CONTROL };
 
 /// Rows one notch of the mouse wheel scrolls.
 const WHEEL_ROWS: isize = 3;
@@ -124,6 +137,11 @@ pub struct Ui {
     /// back on the same one (by id) when the new list arrives.
     pub reload_anchor: Option<ConnectionId>,
     pub note: Option<SidebarNote>,
+    /// The SQL editor of the query tab.
+    pub editor: editor::Editor,
+    pub notice: Option<Notice>,
+    /// The `now` of the last update: what the view measures elapsed time by.
+    pub now: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -143,6 +161,8 @@ pub enum CoreCall {
     /// List one tree node's children: databases of a connection, schemas of a
     /// database, tables of a schema, columns of a table.
     List(NodeId),
+    /// Run a statement in a query tab.
+    Run(RunId, RunRequest),
 }
 
 /// The reply to a `CoreCall`.
@@ -153,6 +173,7 @@ pub enum CoreReply {
     Saved(Result<Connection, CoreError>),
     Removed(Result<(), CoreError>),
     Listed(Result<Listing, CoreError>),
+    Ran(Result<ResultSet, CoreError>),
 }
 
 #[derive(Debug)]
@@ -176,6 +197,8 @@ pub enum Command {
     /// Let the Core drop the server connections it holds for one database
     /// (its node collapsed). Fire and forget: nothing comes back.
     Release(DatabasePath),
+    /// End a query tab's database session on one database. Fire and forget.
+    CloseSession(TabId, DatabasePath),
     Quit,
 }
 
@@ -197,8 +220,10 @@ impl App {
             model: Model {
                 connections: Loadable::Loading,
                 schema: SchemaCache::default(),
-                active: None,
+                tabs: vec![QueryTab::new(TabId(1))],
                 requests: Requests::default(),
+                next_run: 1,
+                row_cap: DEFAULT_ROW_CAP,
             },
             ui: Ui {
                 focus: PaneId::Sidebar,
@@ -216,6 +241,9 @@ impl App {
                 next_form_serial: 1,
                 reload_anchor: None,
                 note: None,
+                editor: editor::Editor::new(),
+                notice: None,
+                now: None,
             },
         }
     }
@@ -235,6 +263,7 @@ impl App {
         let mut fx = Effects::default();
         self.ensure_rows();
         self.expire_prefix(now, &mut fx);
+        self.on_time(now, &mut fx);
         // Anything but a key press ends prefix mode, so a click or a paste
         // cannot be followed by a stray command key. Plain pointer movement
         // does not count: terminals report it constantly.
@@ -256,18 +285,27 @@ impl App {
             Event::Mouse(mouse) => self.on_mouse(mouse, now, &mut fx),
             Event::Resize(..) => fx.repaint = true,
             Event::Core(id, reply) => self.on_reply(id, reply, &mut fx),
-            Event::Paste(_) | Event::Timer => {}
+            Event::Paste(text) => self.on_paste(&text, &mut fx),
+            Event::Timer => {}
         }
         self.ensure_rows();
         fx
     }
 
+    /// Quitting from outside the keys (a signal).
+    pub fn quit_requested(&mut self) -> Effects {
+        let mut fx = Effects::default();
+        self.quit(&mut fx);
+        fx
+    }
+
     /// When the shell should next wake with `Event::Timer`.
     pub fn next_deadline(&self) -> Option<Instant> {
-        match self.ui.mode {
+        let prefix = match self.ui.mode {
             Mode::Prefix { expires } => Some(expires),
             Mode::Normal => None,
-        }
+        };
+        [prefix, self.query_deadline()].into_iter().flatten().min()
     }
 
     pub fn view(&mut self, frame: &mut Frame) {
@@ -293,21 +331,40 @@ impl App {
                 if combo == self.ui.keys.prefix {
                     self.ui.mode = Mode::Prefix { expires: now + self.ui.prefix_timeout };
                     fx.repaint = true;
-                } else if self.ui.focus == PaneId::Sidebar {
-                    self.on_sidebar_key(combo, fx);
+                } else if let Some(action) = self.ui.keys.lookup_direct(&combo) {
+                    self.perform(action, now, fx);
+                } else if combo == CTRL_C {
+                    // Cancels a run (slice 06). It never reaches the editor,
+                    // whose own ctrl+c is a copy into its private buffer.
+                } else {
+                    match self.ui.focus {
+                        PaneId::Sidebar => self.on_sidebar_key(combo, fx),
+                        // The editor takes text: every other key is its own.
+                        PaneId::Editor => fx.repaint |= self.ui.editor.key(key),
+                        PaneId::Results => {}
+                    }
                 }
             }
             Mode::Prefix { .. } => {
                 self.ui.mode = Mode::Normal;
                 fx.repaint = true;
                 if let Some(action) = self.ui.keys.lookup(&combo) {
-                    self.perform(action, fx);
+                    self.perform(action, now, fx);
                 }
             }
         }
     }
 
-    fn perform(&mut self, action: Action, fx: &mut Effects) {
+    fn on_paste(&mut self, text: &str, fx: &mut Effects) {
+        if self.ui.focus == PaneId::Editor {
+            match self.ui.editor.paste(text) {
+                Ok(changed) => fx.repaint |= changed,
+                Err(why) => self.notify(format!("The text was not pasted: {why}."), true, fx),
+            }
+        }
+    }
+
+    fn perform(&mut self, action: Action, now: Instant, fx: &mut Effects) {
         use PaneId::*;
         let target = match (action, self.ui.focus) {
             (Action::FocusRight, Sidebar) => Some(Editor),
@@ -323,7 +380,11 @@ impl App {
                 None
             }
             (Action::Quit, _) => {
-                fx.commands.push(Command::Quit);
+                self.quit(fx);
+                None
+            }
+            (Action::Run | Action::RunDirect, _) => {
+                self.run_statement(now, fx);
                 None
             }
             _ => None,
@@ -410,7 +471,7 @@ impl App {
                 fx.commands.extend(again.commands);
                 fx.repaint = true;
             }
-            OverlayAction::Quit => fx.commands.push(Command::Quit),
+            OverlayAction::Quit => self.quit(fx),
             OverlayAction::FormSave => self.begin_save(fx),
             OverlayAction::FormTest => self.begin_test(fx),
             OverlayAction::FormClose => self.request_close_form(fx),
@@ -437,6 +498,7 @@ impl App {
             (Target::TestConnection(serial), CoreReply::Tested(result)) => self.on_tested(serial, result),
             (Target::SaveConnection(serial), CoreReply::Saved(result)) => self.on_saved(serial, result, fx),
             (Target::RemoveConnection(id), CoreReply::Removed(result)) => self.on_removed(id, result, fx),
+            (Target::Run(_), CoreReply::Ran(result)) => self.on_ran(result),
             (Target::Children(node), CoreReply::Listed(result)) => {
                 if !self.on_listed(node, result, fx) {
                     return;
@@ -458,6 +520,9 @@ impl App {
                 // A connection that is no longer saved takes its tree with it.
                 for gone in self.model.schema.connections().into_iter().filter(|c| !list.iter().any(|k| &k.id == c)) {
                     self.forget_connection(&gone, fx);
+                }
+                if let Some(t) = self.tab().target.clone().filter(|t| !list.iter().any(|k| k.id == t.connection)) {
+                    self.connection_removed(&t.connection, fx);
                 }
                 Loadable::Ready(list)
             }

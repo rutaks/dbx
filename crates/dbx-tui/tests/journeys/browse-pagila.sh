@@ -101,7 +101,11 @@ expect databases 'edge'
 goto 'pagila'
 key Enter
 wait_for 77-schemas '▸ public'
-expect schemas 'editor · local pg / pagila'
+# The cursor does not point the editor anywhere (slice 05); `u` does.
+expect_not schemas 'editor · local pg'
+expect schemas 'u use'
+key u
+wait_for 77b-used 'editor · local pg / pagila'
 goto 'public'
 key Enter
 wait_for 78-tables 'film_list +view'

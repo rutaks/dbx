@@ -177,6 +177,7 @@ impl App {
                 }
                 // Its tree, and any listing still on its way, go with it.
                 self.forget_connection(&id, fx);
+                self.connection_removed(&id, fx);
             }
             Err(e) if self.ui.overlay.is_some() => {
                 // Whatever is open (a form with typed text, say) is not ours

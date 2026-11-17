@@ -218,6 +218,34 @@ pub struct RunRequest {
     pub row_cap: usize,
 }
 
+/// How far into `buffer` the position `at` is, in UTF-16 code units: the unit
+/// dbx's statement finder counts in. Rows are split at `\n`; a position past
+/// the end of its row or of the buffer is clamped to that end.
+pub fn utf16_offset(buffer: &str, at: Cursor) -> usize {
+    let byte = byte_offset(buffer, at);
+    buffer[..byte].encode_utf16().count()
+}
+
+/// The text between two positions of `buffer`, in either order.
+pub fn text_between(buffer: &str, a: Cursor, b: Cursor) -> String {
+    let (from, to) = if (a.row, a.col) <= (b.row, b.col) { (a, b) } else { (b, a) };
+    buffer[byte_offset(buffer, from)..byte_offset(buffer, to)].to_string()
+}
+
+/// The byte index of a position (row, then character within the row),
+/// clamped to the end of its row and of the buffer.
+fn byte_offset(buffer: &str, at: Cursor) -> usize {
+    let mut start = 0;
+    for (row, line) in buffer.split('\n').enumerate() {
+        if row == at.row {
+            let within = line.char_indices().nth(at.col).map_or(line.len(), |(i, _)| i);
+            return start + within;
+        }
+        start += line.len() + 1;
+    }
+    buffer.len()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellKind {
     Integer,
@@ -254,10 +282,18 @@ pub struct ResultSet {
     /// The row cap cut the result short. There is no total count.
     pub truncated: bool,
     pub elapsed: Duration,
+    /// What the server said while running it (notices, warnings), one line
+    /// each, as `SEVERITY: message`.
     pub messages: Vec<String>,
+    /// Rows changed, for a statement that returns no result set (`columns`
+    /// is empty).
+    pub affected: u64,
     /// The statement text that actually ran.
     pub ran: String,
 }
+
+/// The rows a run fetches unless told otherwise (design section 5).
+pub const DEFAULT_ROW_CAP: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HistoryQuery {
@@ -285,15 +321,29 @@ pub enum CoreErrorKind {
     Other,
 }
 
+/// Where in the statement that ran the server found an error: 1-based line
+/// and column, counted in characters of that statement (not of the buffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlPosition {
+    pub line: u32,
+    pub column: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreError {
     pub kind: CoreErrorKind,
     pub message: String,
+    /// For a failed run, the statement that was sent: dbx leaves the SQL out
+    /// of its error text, so the error view shows it next to the message.
+    pub statement: Option<String>,
+    /// For a SQL error, where the server says it is, when it says (native
+    /// Postgres does).
+    pub position: Option<SqlPosition>,
 }
 
 impl CoreError {
     pub fn new(kind: CoreErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
+        Self { kind, message: message.into(), statement: None, position: None }
     }
 }
 
@@ -329,8 +379,43 @@ pub trait Core: Send + Sync {
     /// returns `CoreErrorKind::Cancelled` promptly.
     async fn run(&self, run: RunId, request: RunRequest) -> Result<ResultSet, CoreError>;
     fn cancel(&self, run: RunId);
-    /// Ends the database session a query tab owns.
-    async fn close_session(&self, tab: TabId) -> Result<(), CoreError>;
+    /// Ends the database session query tab `tab` holds on database `at`, if
+    /// it has one: its `SET`s, temporary tables and open transaction go with
+    /// it. The next run of the tab there starts a new session.
+    async fn close_session(&self, tab: TabId, at: &DatabasePath) -> Result<(), CoreError>;
 
     async fn history(&self, query: HistoryQuery) -> Result<Vec<HistoryEntry>, CoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(row: usize, col: usize) -> Cursor {
+        Cursor { row, col }
+    }
+
+    #[test]
+    fn a_cursor_after_a_multi_byte_character_counts_in_utf16_units() {
+        // `é` is one UTF-16 unit (two UTF-8 bytes), `😀` two (four bytes).
+        let buffer = "select 'é😀';\nselect 2;";
+        assert_eq!(utf16_offset(buffer, at(0, 0)), 0);
+        assert_eq!(utf16_offset(buffer, at(0, 9)), 9, "after `é`");
+        assert_eq!(utf16_offset(buffer, at(0, 10)), 11, "after `😀`, which takes two units");
+        assert_eq!(utf16_offset(buffer, at(0, 12)), 13, "end of the first row");
+        assert_eq!(utf16_offset(buffer, at(1, 0)), 14, "the line break counts as one");
+        assert_eq!(utf16_offset(buffer, at(1, 3)), 17);
+        assert_eq!(utf16_offset(buffer, at(1, 99)), 23, "clamped to the row's end");
+        assert_eq!(utf16_offset(buffer, at(9, 0)), 23, "clamped to the buffer's end");
+    }
+
+    #[test]
+    fn the_text_between_two_positions_spans_rows_and_takes_either_order() {
+        let buffer = "select 1;\nselect 'é😀' as x;\nselect 3;";
+        assert_eq!(text_between(buffer, at(1, 0), at(1, 11)), "select 'é😀'");
+        assert_eq!(text_between(buffer, at(1, 11), at(1, 0)), "select 'é😀'", "reversed");
+        assert_eq!(text_between(buffer, at(0, 7), at(2, 6)), "1;\nselect 'é😀' as x;\nselect");
+        assert_eq!(text_between(buffer, at(2, 0), at(2, 99)), "select 3;", "clamped");
+        assert_eq!(text_between(buffer, at(1, 2), at(1, 2)), "");
+    }
 }

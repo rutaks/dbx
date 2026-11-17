@@ -3,6 +3,7 @@
 
 mod form;
 mod panel;
+mod results;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -39,6 +40,7 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     draw_editor(app, &p, buf, &hits);
     draw_results(app, &p, buf, &hits);
     app.ui.mode_hints = draw_mode_bar(app, &p, buf, &hits);
+    draw_notice(app, &p, buf);
     // The overlay comes last, over everything else dimmed.
     let drawn = match &mut app.ui.overlay {
         Some(overlay) => {
@@ -168,6 +170,20 @@ impl<'a> Painter<'a> {
             cx += 1;
         }
         cx
+    }
+
+    /// Replaces whatever a widget wrote into the bounds that a terminal would
+    /// act on (control characters, bidirectional overrides), cell by cell.
+    fn clean(&self, buf: &mut Buffer) {
+        for y in self.bounds.top()..self.bounds.bottom() {
+            for x in self.bounds.left()..self.bounds.right() {
+                let cell = &mut buf[(x, y)];
+                if cell.symbol().chars().any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+                    let safe = display_safe(cell.symbol());
+                    cell.set_symbol(if safe.is_empty() { " " } else { &safe });
+                }
+            }
+        }
     }
 
     /// A pane title on its top edge: bold accent when focused, overlay0 if not.
@@ -387,26 +403,52 @@ fn draw_column(p: &Painter, buf: &mut Buffer, row: Rect, base: u16, label_x: u16
     p.within(Rect::new(type_x, row.y, end.saturating_sub(type_x), 1)).put(buf, type_x, row.y, &right, muted);
 }
 
+/// A NULL cell: dimmed, and not text a cell could hold by accident.
+pub const NULL_MARK: &str = "∅";
+/// A line break inside a cell.
+pub const NEWLINE_MARK: &str = "⏎";
+
 /// Marks a primary key column.
 pub const KEY_MARK: &str = "◆";
 /// Marks a column that may be NULL.
 pub const NULLABLE_MARK: &str = "?";
 
-fn draw_editor(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
+fn draw_editor(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     let r = hits.editor;
-    if !r.is_empty() {
-        // The title names where a statement would run: the connection and
-        // database the sidebar's cursor is in.
-        let mut title = "editor".to_string();
-        if let (Some(active), Loadable::Ready(list)) = (&app.model.active, &app.model.connections) {
-            if let Some(c) = list.iter().find(|c| c.id == active.connection) {
-                title.push_str(&format!(" · {}", display_safe(&c.name)));
-                if let Some(db) = &active.database {
-                    title.push_str(&format!(" / {}", display_safe(db)));
-                }
-            }
-        }
-        p.within(r).title(buf, r.x + 1, r.y, &title, app.ui.focus == PaneId::Editor);
+    if r.is_empty() {
+        return;
+    }
+    let focused = app.ui.focus == PaneId::Editor;
+    // The title names where a statement runs: the tab's own target.
+    let title = match app.target_label() {
+        Some(label) => format!("editor · {label}"),
+        None => "editor".to_string(),
+    };
+    p.within(r).title(buf, r.x + 1, r.y, &title, focused);
+    let area = Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(1), r.height.saturating_sub(1)).intersection(p.bounds);
+    if area.is_empty() {
+        return;
+    }
+    let placeholder = editor_placeholder(app);
+    let editor = &mut app.ui.editor;
+    editor.set_placeholder(&placeholder);
+    editor.style(p.theme, focused);
+    ratatui::widgets::Widget::render(editor.widget(), area, buf);
+    // The widget draws the buffer as it is; nothing it drew may carry a
+    // control character to the terminal.
+    p.within(area).clean(buf);
+}
+
+/// What the empty editor says: what to do next, with the keys that do it.
+fn editor_placeholder(app: &App) -> String {
+    let keys = &app.ui.keys;
+    if app.tab().target.is_none() {
+        let use_key = keys.key_for(Action::UseTarget).unwrap_or_default();
+        return format!("No database yet: in the sidebar, press {use_key} on one. Then type SQL here.");
+    }
+    match keys.key_for(Action::RunDirect) {
+        Some(run) => format!("Type SQL, then {run} runs the statement under the cursor."),
+        None => "Type SQL.".to_string(),
     }
 }
 
@@ -426,6 +468,8 @@ fn draw_results(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
         p.within(sep).put(buf, sep.x, r.y, "├", line);
     }
     pr.title(buf, r.x + 1, r.y, " results ", app.ui.focus == PaneId::Results);
+    let area = Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(1), r.height.saturating_sub(1));
+    results::draw(app, p, buf, area.intersection(r));
 }
 
 /// The hints for the mode bar in normal mode: only keys that work now.
@@ -433,8 +477,14 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     let keys = &app.ui.keys;
     let one = |action: Action, desc: &'static str| keys.key_for(action).map(|k| Hint { keys: vec![(k, action)], desc });
     let mut hints = Vec::new();
+    let prefix = Hint { keys: vec![(keys.prefix.to_string(), Action::OpenPrefix)], desc: "prefix" };
+    if app.ui.focus == PaneId::Editor {
+        hints.extend(one(Action::RunDirect, "run"));
+        hints.push(prefix);
+        return hints;
+    }
     if app.ui.focus != PaneId::Sidebar || !matches!(&app.model.connections, Loadable::Ready(_)) {
-        return vec![Hint { keys: vec![(keys.prefix.to_string(), Action::OpenPrefix)], desc: "prefix" }];
+        return vec![prefix];
     }
     // Most relevant first, because a hint that does not fit is dropped and
     // the ones after it with it: what the row under the cursor can do, then
@@ -449,6 +499,9 @@ fn normal_hints(app: &App) -> Vec<Hint> {
         hints.extend(one(Action::Collapse, "collapse"));
     } else if row.node.parent().is_some() || !row.is_node() {
         hints.extend(one(Action::Collapse, "parent"));
+    }
+    if app.cursor_can_be_used() {
+        hints.extend(one(Action::UseTarget, "use"));
     }
     if app.cursor_on_editable() {
         hints.extend(one(Action::EditConnection, "edit"));
@@ -501,12 +554,19 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
             h
         }
     };
+    // The run state sits on the right; hints stop short of it.
+    let mut right_edge = r.right();
+    if let Some((text, role)) = run_state(app) {
+        let at = r.right().saturating_sub(width_of(&text) + 1).max(x);
+        p.put(buf, at, r.y, &text, p.fg(role));
+        right_edge = at.saturating_sub(1);
+    }
     let mut hit_rects = Vec::new();
     for hint in hints {
         let start = x + 2;
         // A hint that does not fit whole is left out, not cut in half.
         let keys_w: u16 = hint.keys.iter().map(|(k, _)| width_of(k)).sum::<u16>() + hint.keys.len().saturating_sub(1) as u16;
-        if start + keys_w + 1 + width_of(hint.desc) > r.right() {
+        if start + keys_w + 1 + width_of(hint.desc) > right_edge {
             break;
         }
         x = start;
@@ -528,4 +588,86 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
         }
     }
     hit_rects
+}
+
+/// The tab's run state for the mode bar: running with its elapsed whole
+/// seconds, then the row count (`+` when the row cap cut it) and duration, or
+/// the failure.
+fn run_state(app: &App) -> Option<(String, Role)> {
+    use super::query::{Outcome, RunState};
+    let tab = app.tab();
+    if let RunState::Running { started, .. } = tab.run {
+        let secs = app.ui.now.map_or(0, |now| now.saturating_duration_since(started).as_secs());
+        return Some((format!("running {secs}s"), Role::Yellow));
+    }
+    match tab.outcome.as_ref()? {
+        Outcome::Rows(set) if set.columns.is_empty() => {
+            Some((format!("{}  {}", affected_text(set.affected), duration_text(set.elapsed)), Role::Subtext0))
+        }
+        Outcome::Rows(set) => {
+            let plus = if set.truncated { "+" } else { "" };
+            let noun = if set.rows.len() == 1 && !set.truncated { "row" } else { "rows" };
+            Some((format!("{}{plus} {noun}  {}", thousands(set.rows.len()), duration_text(set.elapsed)), Role::Subtext0))
+        }
+        Outcome::Failed { error, elapsed } => {
+            let what = match error.kind {
+                crate::core::CoreErrorKind::Cancelled => "cancelled",
+                crate::core::CoreErrorKind::Timeout => "timed out",
+                _ => "failed",
+            };
+            Some((format!("{what}  {}", duration_text(*elapsed)), Role::Red))
+        }
+    }
+}
+
+/// `3 rows affected`, `1 row affected`.
+pub(super) fn affected_text(n: u64) -> String {
+    format!("{} {} affected", thousands(n as usize), if n == 1 { "row" } else { "rows" })
+}
+
+/// A count with thousands separators: `1,000`.
+pub(super) fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `12ms`, `<1ms`, `3.4s`.
+pub(super) fn duration_text(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    match ms {
+        0 => "<1ms".to_string(),
+        1..=999 => format!("{ms}ms"),
+        _ => format!("{:.1}s", d.as_secs_f64()),
+    }
+}
+
+/// The notice: a small bordered card in the bottom right corner, above the
+/// mode bar, with a coloured `●`. It takes no input and expires on its own.
+fn draw_notice(app: &App, p: &Painter, buf: &mut Buffer) {
+    let Some(notice) = &app.ui.notice else { return };
+    let area = buf.area;
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let width = (width_of(&notice.text) + 6).min(48).min(area.width - 2);
+    let lines = panel::wrap(&notice.text, width.saturating_sub(6) as usize);
+    let height = lines.len() as u16 + 2;
+    let rect = Rect::new(area.right() - width - 1, area.bottom().saturating_sub(height + 1), width, height).intersection(area);
+    let inner = panel::panel(p, buf, rect, "notice", Role::SurfaceDim, Role::Overlay0);
+    if inner.is_empty() {
+        return;
+    }
+    let bg = p.theme.color(Role::PanelBg);
+    let pi = p.within(inner);
+    pi.put(buf, inner.x, inner.y, "●", p.fg(if notice.failure { Role::Red } else { Role::Yellow }).bg(bg));
+    for (i, line) in lines.iter().enumerate() {
+        pi.put(buf, inner.x + 2, inner.y + i as u16, line, p.fg(Role::Text).bg(bg));
+    }
 }

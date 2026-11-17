@@ -438,35 +438,6 @@ async fn a_server_with_three_databases_shows_three_nodes_and_expanding_the_secon
     assert!(rows[rows.iter().position(|r| r.contains("pagila")).unwrap() + 1].contains("edge"), "the first has no children shown");
 }
 
-#[tokio::test]
-async fn selecting_a_table_in_another_database_changes_the_editors_active_database() {
-    let mut h = pagila().await;
-    let title = |h: &mut Harness| frame_rows(&mut h.app, 114, 30).iter().find(|r| r.contains("editor")).cloned().unwrap();
-    // Selecting the connection: its saved database (none, for this fixture).
-    assert!(title(&mut h).contains("editor · local pg"), "{}", title(&mut h));
-    assert_eq!(h.app.model.active, Some(Active { connection: cid("local pg"), database: None }));
-
-    h.press("enter");
-    h.settle().await;
-    h.press("j j");
-    assert_eq!(h.app.model.active.as_ref().and_then(|a| a.database.as_deref()), Some("edge"));
-    assert!(title(&mut h).contains("local pg / edge"), "{}", title(&mut h));
-    h.press("enter");
-    h.settle().await;
-    h.press("j enter");
-    h.settle().await;
-    h.press("j");
-    assert!(cursor_text(&mut h, 114, 30).unwrap().contains("actor"));
-    assert_eq!(h.app.model.active, Some(Active { connection: cid("local pg"), database: Some("edge".into()) }));
-    assert!(title(&mut h).contains("local pg / edge"));
-
-    // Up to the first database: the title follows the cursor.
-    h.press("g");
-    h.press("j");
-    assert!(title(&mut h).contains("local pg / pagila"), "{}", title(&mut h));
-    assert_eq!(h.app.model.active.as_ref().and_then(|a| a.database.as_deref()), Some("pagila"));
-}
-
 // ---- keys ----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -734,7 +705,6 @@ async fn a_reply_that_inserts_rows_above_the_cursor_does_not_move_the_cursor_ont
     h.settle().await;
     assert!(tree_text(&mut h).contains("three"));
     assert!(cursor_text(&mut h, 114, 30).unwrap().contains("beta"), "{:?}", cursor_text(&mut h, 114, 30));
-    assert_eq!(h.app.model.active.as_ref().map(|a| a.connection.clone()), Some(cid("beta")));
 }
 
 #[tokio::test]
@@ -1156,24 +1126,10 @@ fn page_keys_parse_and_print() {
     assert_eq!(KeyCombo::from_event(&k), KeyCombo::parse("pagedown").unwrap());
 }
 
-#[tokio::test]
-async fn the_cursor_on_a_connection_makes_its_saved_database_the_active_one() {
-    let fake = FakeCore::new();
-    let mut c = conn("local pg", DbKind::Postgres);
-    c.database = Some("pagila".into());
-    fake.script_connections(Scripted::ok(vec![c]));
-    let mut h = Harness::start(fake);
-    h.settle().await;
-    assert_eq!(h.app.model.active, Some(Active { connection: cid("local pg"), database: Some("pagila".into()) }));
-    let title = frame_rows(&mut h.app, 114, 30).iter().find(|r| r.contains("editor")).cloned().unwrap();
-    assert!(title.contains("editor · local pg / pagila"), "{title:?}");
-}
-
 #[test]
 fn no_connections_means_no_active_context_and_the_tree_keys_do_nothing() {
     let mut app = ready_app();
-    assert_eq!(app.model.active, None);
-    for keys in ["j", "k", "enter", "h", "l", "r", "g", "G", "e", "d", "pagedown"] {
+    for keys in ["j", "k", "enter", "h", "l", "r", "g", "G", "e", "d", "u", "pagedown"] {
         let fx = press(&mut app, keys);
         assert!(fx.commands.is_empty(), "{keys}");
     }
@@ -1407,7 +1363,6 @@ async fn when_the_row_the_cursor_is_on_disappears_it_goes_to_the_nearest_ancesto
     assert!(!tree_text(&mut h).contains("one"));
     let at = cursor_text(&mut h, 114, 30).unwrap();
     assert!(at.contains("public"), "the schema `one` was in, not an unrelated row: {at:?}");
-    assert_eq!(h.app.model.active.as_ref().and_then(|a| a.database.clone()), Some("a".into()));
 }
 
 #[tokio::test]

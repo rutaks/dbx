@@ -118,6 +118,9 @@ impl fmt::Display for KeyCombo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Prefix,
+    /// Read directly, whichever pane has focus, before the pane sees the key
+    /// (`f5`, `alt+enter`): keys no pane uses for anything else.
+    Direct,
     Sidebar,
 }
 
@@ -134,6 +137,10 @@ pub enum Action {
     /// Press the prefix key. Has no binding of its own: the prefix is a key
     /// (`Keybinds::prefix`); this is what a click on its hint does.
     OpenPrefix,
+    /// Run the selection, or the statement under the cursor, in the query tab.
+    Run,
+    /// The same, from a direct key (`f5`, `alt+enter`).
+    RunDirect,
     // The sidebar's own keys.
     MoveDown,
     MoveUp,
@@ -146,6 +153,8 @@ pub enum Action {
     Refresh,
     EditConnection,
     RemoveConnection,
+    /// Make the database under the cursor the one the query tab runs on.
+    UseTarget,
 }
 
 impl Action {
@@ -158,6 +167,7 @@ impl Action {
             Action::NewConnection => "new",
             Action::Quit => "quit",
             Action::OpenPrefix => "prefix",
+            Action::Run | Action::RunDirect => "run",
             Action::MoveDown | Action::MoveUp => "move",
             Action::Expand => "expand",
             Action::Collapse => "collapse",
@@ -167,6 +177,7 @@ impl Action {
             Action::Refresh => "refresh",
             Action::EditConnection => "edit",
             Action::RemoveConnection => "remove",
+            Action::UseTarget => "use",
         }
     }
 
@@ -179,7 +190,9 @@ impl Action {
             | Action::Zoom
             | Action::NewConnection
             | Action::Quit
+            | Action::Run
             | Action::OpenPrefix => Scope::Prefix,
+            Action::RunDirect => Scope::Direct,
             _ => Scope::Sidebar,
         }
     }
@@ -190,6 +203,7 @@ impl Action {
 pub struct Keybinds {
     pub prefix: KeyCombo,
     bindings: Vec<(KeyCombo, Action)>,
+    direct: Vec<(KeyCombo, Action)>,
     sidebar: Vec<(KeyCombo, Action)>,
 }
 
@@ -206,9 +220,11 @@ impl Default for Keybinds {
                 (plain('k'), Action::FocusUp),
                 (plain('l'), Action::FocusRight),
                 (plain('n'), Action::NewConnection),
+                (plain('r'), Action::Run),
                 (plain('z'), Action::Zoom),
                 (plain('q'), Action::Quit),
             ],
+            direct: vec![(key("f5"), Action::RunDirect), (key("alt+enter"), Action::RunDirect)],
             sidebar: vec![
                 (key("j"), Action::MoveDown),
                 (key("down"), Action::MoveDown),
@@ -231,6 +247,7 @@ impl Default for Keybinds {
                 (key("e"), Action::EditConnection),
                 (key("d"), Action::RemoveConnection),
                 (key("delete"), Action::RemoveConnection),
+                (key("u"), Action::UseTarget),
             ],
         }
     }
@@ -242,6 +259,11 @@ impl Keybinds {
         self.bindings.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
 
+    /// The action bound directly to `key`, read before any pane sees it.
+    pub fn lookup_direct(&self, key: &KeyCombo) -> Option<Action> {
+        self.direct.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+    }
+
     /// The action the sidebar binds to `key`.
     pub fn lookup_sidebar(&self, key: &KeyCombo) -> Option<Action> {
         self.sidebar.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
@@ -250,6 +272,7 @@ impl Keybinds {
     fn table(&self, scope: Scope) -> &[(KeyCombo, Action)] {
         match scope {
             Scope::Prefix => &self.bindings,
+            Scope::Direct => &self.direct,
             Scope::Sidebar => &self.sidebar,
         }
     }
@@ -267,6 +290,7 @@ impl Keybinds {
         let Some(combo) = KeyCombo::parse(key) else { return false };
         let table = match action.scope() {
             Scope::Prefix => &mut self.bindings,
+            Scope::Direct => &mut self.direct,
             Scope::Sidebar => &mut self.sidebar,
         };
         table.retain(|(k, a)| *a != action && *k != combo);

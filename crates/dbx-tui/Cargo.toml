@@ -27,6 +27,9 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 dbx-core = { path = "../dbx-core", default-features = false, features = ["sqlite-bundled", "os-keyring"] }
 futures = "0.3"
 ratatui = "0.30"
+# The SQL editor widget, confirmed with ratatui 0.30 in the prototype (design
+# section 11). Wrapped by `app::editor::Editor`; its own renderer for now.
+ratatui-textarea = "0.9"
 # dbx's TLS needs a process-wide crypto provider installed at startup.
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 serde_json = "1"

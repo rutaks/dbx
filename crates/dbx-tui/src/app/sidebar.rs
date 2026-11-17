@@ -19,14 +19,6 @@ use crate::core::{Connection, ConnectionId, CoreError, CoreErrorKind, DbKind};
 /// A second click on the same row within this long is a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
-/// The connection and database the editor will run against (slice 05), as the
-/// selected row says. `database` is `None` for a connection saved with none.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Active {
-    pub connection: ConnectionId,
-    pub database: Option<String>,
-}
-
 /// The sidebar's cursor, scroll position, expanded nodes and visible rows.
 #[derive(Debug)]
 pub struct SidebarUi {
@@ -80,8 +72,7 @@ impl App {
     }
 
     /// Rebuilds the visible rows if the tree (or the sidebar's width) changed,
-    /// keeps the cursor on the row it was on, and updates the active
-    /// connection and database from it.
+    /// and keeps the cursor on the row it was on.
     pub fn ensure_rows(&mut self) {
         let width = match self.ui.hits.sidebar.width {
             0 => 26,
@@ -120,18 +111,6 @@ impl App {
             sb.built_retry_key = retry_key;
             sb.rebuilds += 1;
         }
-        self.sync_active();
-    }
-
-    fn sync_active(&mut self) {
-        let sb = &self.ui.sidebar;
-        self.model.active = sb.rows.get(sb.cursor).map(|row| Active {
-            connection: row.node.connection().clone(),
-            database: match &row.kind {
-                RowKind::Connection { default_database, .. } => default_database.clone(),
-                _ => row.node.database().map(str::to_string),
-            },
-        });
     }
 
     /// The row under the cursor.
@@ -164,7 +143,6 @@ impl App {
         sb.cursor_key = sb.rows.get(index).map(Row::key);
         let moved = index != sb.cursor;
         sb.cursor = index;
-        self.sync_active();
         moved
     }
 
@@ -205,6 +183,7 @@ impl App {
             Action::Refresh => self.refresh_at_cursor(fx),
             Action::EditConnection => self.open_edit_form(fx),
             Action::RemoveConnection => self.open_remove_confirm(fx),
+            Action::UseTarget => self.use_target(fx),
             _ => {}
         }
     }
@@ -486,7 +465,7 @@ impl App {
                 self.ui.mode = Mode::Prefix { expires: now + self.ui.prefix_timeout };
                 fx.repaint = true;
             }
-            a if a.scope() == super::keys::Scope::Prefix => self.perform(a, fx),
+            a if a.scope() != super::keys::Scope::Sidebar => self.perform(a, now, fx),
             a => self.perform_sidebar(a, fx),
         }
     }

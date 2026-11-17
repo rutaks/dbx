@@ -51,7 +51,7 @@ pub enum Call {
     Release(DatabasePath),
     Run(RunId),
     Cancel(RunId),
-    CloseSession(TabId),
+    CloseSession(TabId, DatabasePath),
     History,
 }
 
@@ -235,8 +235,8 @@ impl Core for FakeCore {
         self.cancel_signal.notify_waiters();
     }
 
-    async fn close_session(&self, tab: TabId) -> Result<(), CoreError> {
-        self.record(Call::CloseSession(tab));
+    async fn close_session(&self, tab: TabId, at: &DatabasePath) -> Result<(), CoreError> {
+        self.record(Call::CloseSession(tab, at.clone()));
         reply(&self.close_session, || unscripted("call")).await
     }
 
@@ -279,6 +279,7 @@ mod tests {
             truncated: false,
             elapsed: Duration::ZERO,
             messages: vec![],
+            affected: 0,
             ran: "select 1".into(),
         }
     }
@@ -330,7 +331,7 @@ mod tests {
             core.tables(&schema).await.err(),
             core.columns(&table).await.err(),
             core.run(RunId(1), request()).await.err(),
-            core.close_session(TabId(1)).await.err(),
+            core.close_session(TabId(1), &db).await.err(),
             core.history(HistoryQuery::default()).await.err(),
         ];
         for (i, r) in results.iter().enumerate() {

@@ -26,11 +26,31 @@ pub use terminal::TerminalGuard;
 /// The Core calls in flight, by request, so the app can abandon one: aborting
 /// the task drops the Core's future, which is what stops a slow listing.
 #[derive(Clone, Default)]
-pub struct Tasks(Arc<Mutex<HashMap<RequestId, AbortHandle>>>);
+pub struct Tasks {
+    calls: Arc<Mutex<HashMap<RequestId, AbortHandle>>>,
+    /// Session closes still running, for quitting to wait on.
+    closing: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Each tab's latest run: true once it has ended (or its task is gone).
+    runs: Arc<Mutex<HashMap<crate::core::TabId, tokio::sync::watch::Receiver<bool>>>>,
+}
+
+/// Waits until a run has ended, or `bound` has passed. True if it ended.
+async fn run_ended(mut done: tokio::sync::watch::Receiver<bool>, bound: std::time::Duration) -> bool {
+    tokio::time::timeout(bound, async move {
+        // A dropped sender (the task was aborted) means it ended too.
+        while !*done.borrow_and_update() {
+            if done.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
 
 impl Tasks {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, AbortHandle>> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.calls.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// How many calls are in flight.
@@ -47,6 +67,34 @@ impl Tasks {
             handle.abort();
         }
     }
+}
+
+/// How long quitting waits for the query tabs' sessions to close.
+pub const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a session close waits for the tab's run to end first. dbx sends
+/// Postgres's cancel request from inside the run, using the session's cancel
+/// context, which closing the session removes: a close that went first would
+/// leave the statement running on the server. A cancel lands in tens of
+/// milliseconds on the fixture and took 1.0 s in the spike; 2 s covers a slow
+/// network without making quitting feel stuck.
+pub const RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The most quitting waits, in all, for runs to end and sessions to close. It
+/// returns as soon as they have.
+pub const QUIT_WAIT: std::time::Duration = std::time::Duration::from_millis(2_500);
+
+/// Waits until every run and session close started so far has ended, or
+/// `bound` has passed. True if they all ended.
+pub async fn finish_closing(tasks: &Tasks, bound: std::time::Duration) -> bool {
+    let closes: Vec<_> = std::mem::take(&mut *tasks.closing.lock().unwrap_or_else(|p| p.into_inner()));
+    let runs: Vec<_> = tasks.runs.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect();
+    let all = async {
+        let ended = futures::future::join_all(runs.into_iter().map(|r| run_ended(r, bound))).await;
+        futures::future::join_all(closes).await;
+        ended.into_iter().all(|e| e)
+    };
+    tokio::time::timeout(bound, all).await.unwrap_or(false)
 }
 
 /// Stack size for the runtime's threads. dbx's metadata and export futures
@@ -80,6 +128,9 @@ pub async fn run(core: Arc<dyn Core>) -> io::Result<()> {
     let mut effects = app.start();
     loop {
         if execute(effects.commands, &core, &tx, &tasks) {
+            // A tab's session ends cleanly if the server answers quickly;
+            // otherwise the process ending closes its socket all the same.
+            finish_closing(&tasks, QUIT_WAIT).await;
             return Ok(());
         }
         if effects.repaint {
@@ -94,10 +145,11 @@ pub async fn run(core: Arc<dyn Core>) -> io::Result<()> {
                 Some(Err(e)) => return Err(e),
                 None => return Ok(()),
             },
-            // Being killed is a way to quit: return so the guard restores the terminal.
-            _ = terminate.recv() => return Ok(()),
-            _ = hangup.recv() => return Ok(()),
-            _ = interrupt.recv() => return Ok(()),
+            // Being killed is a way to quit, the same way as the keys: runs are
+            // cancelled and sessions closed, then the guard restores the terminal.
+            _ = terminate.recv() => { effects = app.quit_requested(); continue; }
+            _ = hangup.recv() => { effects = app.quit_requested(); continue; }
+            _ = interrupt.recv() => { effects = app.quit_requested(); continue; }
             Some((id, reply)) = rx.recv() => Some(Event::Core(id, reply)),
             _ = async {
                 match deadline {
@@ -135,8 +187,35 @@ pub(crate) fn execute(
                     let _ = core.release(&at).await;
                 });
             }
+            Command::CloseSession(tab, at) => {
+                let core = core.clone();
+                let run = tasks.runs.lock().unwrap_or_else(|p| p.into_inner()).get(&tab).cloned();
+                // Nothing waits for it but quitting: a failure leaves an idle
+                // session the server ends when the process does. The tab's
+                // run ends first, so its cancel can still reach the server.
+                let task = tokio::spawn(async move {
+                    if let Some(run) = run {
+                        run_ended(run, RUN_WAIT).await;
+                    }
+                    let _ = core.close_session(tab, &at).await;
+                });
+                let mut closing = tasks.closing.lock().unwrap_or_else(|p| p.into_inner());
+                closing.retain(|t| !t.is_finished());
+                closing.push(task);
+            }
             Command::Core(id, call) => {
                 let (core, tx, done) = (core.clone(), tx.clone(), tasks.clone());
+                // A run tells whoever waits on its tab when it has ended.
+                let ended = match &call {
+                    CoreCall::Run(_, request) => {
+                        let (ended, watch) = tokio::sync::watch::channel(false);
+                        let mut runs = tasks.runs.lock().unwrap_or_else(|p| p.into_inner());
+                        runs.retain(|_, r| !*r.borrow());
+                        runs.insert(request.tab, watch);
+                        Some(ended)
+                    }
+                    _ => None,
+                };
                 // Held while spawning, so a call that finishes at once cannot
                 // forget itself before it has been remembered.
                 let mut running = tasks.lock();
@@ -147,8 +226,12 @@ pub(crate) fn execute(
                         CoreCall::SaveConnection(draft) => CoreReply::Saved(core.save_connection(&draft).await),
                         CoreCall::RemoveConnection(id) => CoreReply::Removed(core.remove_connection(&id).await),
                         CoreCall::List(node) => CoreReply::Listed(list(core.as_ref(), node).await),
+                        CoreCall::Run(run, request) => CoreReply::Ran(core.run(run, request).await),
                     };
                     done.lock().remove(&id);
+                    if let Some(ended) = ended {
+                        let _ = ended.send(true);
+                    }
                     let _ = tx.send((id, reply));
                 });
                 running.insert(id, task.abort_handle());
@@ -184,7 +267,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     use super::*;
-    use crate::core::{Call, FakeCore, RunId};
+    use crate::core::{Call, FakeCore, RunId, Scripted};
 
     #[tokio::test]
     async fn quit_does_not_swallow_the_commands_around_it() {
@@ -244,6 +327,99 @@ mod tests {
         assert!(matches!(reply, CoreReply::Listed(Ok(Listing::Databases(v))) if v == vec!["quick".to_string()]));
         assert!(tasks.is_empty(), "a finished call forgets itself");
         execute(vec![Command::Abandon(RequestId(99))], &core, &tx, &tasks); // unknown: nothing happens
+    }
+
+    fn edge() -> crate::core::DatabasePath {
+        crate::core::DatabasePath { connection: crate::core::ConnectionId("c".into()), database: "edge".into() }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quitting_waits_for_session_closes_but_never_longer_than_the_bound() {
+        use crate::core::{Scripted, TabId};
+        use std::time::Duration;
+        let fake = Arc::new(FakeCore::new());
+        fake.script_close_session(Scripted::ok(()).after(Duration::from_millis(100)));
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tasks = Tasks::default();
+        let quit = execute(vec![Command::CloseSession(TabId(1), edge()), Command::Quit], &core, &tx, &tasks);
+        assert!(quit);
+        let started = tokio::time::Instant::now();
+        assert!(finish_closing(&tasks, QUIT_WAIT).await, "the close finished");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(fake.calls(), vec![Call::CloseSession(TabId(1), edge())]);
+
+        // A close that hangs does not hold the quit beyond the bound.
+        fake.script_close_session(Scripted::ok(()).after(Duration::from_secs(60)));
+        execute(vec![Command::CloseSession(TabId(1), edge())], &core, &tx, &tasks);
+        let started = tokio::time::Instant::now();
+        assert!(!finish_closing(&tasks, QUIT_WAIT).await, "gave up");
+        assert_eq!(started.elapsed(), QUIT_WAIT);
+    }
+
+    fn run_call(n: u64) -> Command {
+        let request = crate::core::RunRequest {
+            connection: crate::core::ConnectionId("c".into()),
+            database: Some("edge".into()),
+            tab: crate::core::TabId(1),
+            buffer: "select pg_sleep(20)".into(),
+            cursor: crate::core::Cursor::default(),
+            selection: None,
+            row_cap: 10,
+        };
+        Command::Core(RequestId(n), CoreCall::Run(RunId(n), request))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tabs_session_is_closed_only_after_its_run_has_finished_so_the_cancel_can_reach_the_server() {
+        use crate::core::{Scripted, TabId};
+        use std::time::Duration;
+        let fake = Arc::new(FakeCore::new());
+        // A run that ignores nothing but takes a second to wind down.
+        fake.script_run(Scripted::ok(crate::core::ResultSet {
+            columns: vec![], rows: vec![], truncated: false, elapsed: Duration::ZERO, messages: vec![], affected: 0, ran: String::new(),
+        }).after(Duration::from_secs(1)));
+        fake.script_close_session(Scripted::ok(()));
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tasks = Tasks::default();
+        execute(vec![run_call(1)], &core, &tx, &tasks);
+        tokio::task::yield_now().await;
+        let quit = execute(vec![Command::CloseSession(TabId(1), edge()), Command::Quit], &core, &tx, &tasks);
+        assert!(quit);
+        tokio::time::advance(Duration::from_millis(900)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fake.calls(), vec![Call::Run(RunId(1))], "no close while the run is still going");
+        assert!(finish_closing(&tasks, QUIT_WAIT).await);
+        assert_eq!(fake.calls(), vec![Call::Run(RunId(1)), Call::CloseSession(TabId(1), edge())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quitting_waits_for_a_cancelled_run_to_end_but_not_forever() {
+        use std::time::Duration;
+        let fake = Arc::new(FakeCore::new());
+        // A run that would take a minute and is never cancelled: quitting gives up.
+        fake.script_run(Scripted::err(crate::core::CoreErrorKind::Other, "slow").after(Duration::from_secs(60)));
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tasks = Tasks::default();
+        execute(vec![run_call(1), Command::Quit], &core, &tx, &tasks);
+        let started = tokio::time::Instant::now();
+        assert!(!finish_closing(&tasks, QUIT_WAIT).await);
+        assert_eq!(started.elapsed(), QUIT_WAIT);
+        // A cancelled run ends at once, and quitting does not wait out the bound.
+        let fake = Arc::new(FakeCore::new());
+        fake.script_run(Scripted::err(crate::core::CoreErrorKind::Other, "slow").after(Duration::from_secs(60)));
+        let core: Arc<dyn Core> = fake.clone();
+        let tasks = Tasks::default();
+        execute(vec![run_call(2)], &core, &tx, &tasks);
+        tokio::task::yield_now().await;
+        execute(vec![Command::Cancel(RunId(2)), Command::Quit], &core, &tx, &tasks);
+        let started = tokio::time::Instant::now();
+        assert!(finish_closing(&tasks, QUIT_WAIT).await);
+        assert!(started.elapsed() < Duration::from_millis(10));
     }
 
     #[test]

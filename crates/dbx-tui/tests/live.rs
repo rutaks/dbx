@@ -12,7 +12,8 @@ mod common;
 
 use common::*;
 use dbx_tui::core::{
-    ConnectionDraft, ConnectionId, Core, CoreErrorKind, DatabasePath, DbxCore, SchemaPath, TableKind, TablePath,
+    Cell, CellKind, ConnectionDraft, ConnectionId, Core, CoreErrorKind, Cursor, DatabasePath, DbxCore, RunId, RunRequest,
+    SchemaPath, TabId, TableKind, TablePath, DEFAULT_ROW_CAP,
 };
 
 const FIXTURE_PASSWORD: &str = "dbxtui";
@@ -318,4 +319,253 @@ async fn releasing_a_database_closes_its_server_connections_and_the_next_call_op
     core.release(&database(&id, "postgres")).await.expect("never opened");
     core.release(&database(&ConnectionId("nope".into()), "edge")).await.expect("unknown connection");
     wait_for_server_connections("edge", before.len()).await;
+}
+
+// ---- slice 05: running statements -------------------------------------------
+
+/// A run request for `buffer` in `tab` on `database`, the cursor at its end.
+fn run_request(id: &ConnectionId, database: &str, tab: u32, buffer: &str) -> RunRequest {
+    let rows: Vec<&str> = buffer.split('\n').collect();
+    let cursor = Cursor { row: rows.len() - 1, col: rows.last().unwrap().chars().count() };
+    RunRequest {
+        connection: id.clone(),
+        database: Some(database.into()),
+        tab: TabId(tab),
+        buffer: buffer.into(),
+        cursor,
+        selection: None,
+        row_cap: DEFAULT_ROW_CAP,
+    }
+}
+
+fn texts(rows: &[Vec<Cell>]) -> Vec<Vec<Option<String>>> {
+    rows.iter()
+        .map(|r| r.iter().map(|c| match c { Cell::Null => None, Cell::Value(v) => Some(v.clone()) }).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn select_1_returns_one_integer_column_and_the_cell_1() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let started = std::time::Instant::now();
+    let set = core.run(RunId(1), run_request(&id, "pagila", 1, "select 1")).await.expect("select 1");
+    eprintln!("OBSERVED select 1: wall {:?}, dbx elapsed {:?}, columns {:?}", started.elapsed(), set.elapsed, set.columns);
+    assert_eq!(set.columns.len(), 1);
+    assert_eq!(set.columns[0].kind, CellKind::Integer);
+    assert_eq!(set.rows, vec![vec![Cell::Value("1".into())]]);
+    assert_eq!(set.ran.trim(), "select 1");
+    assert!(!set.truncated);
+
+    let started = std::time::Instant::now();
+    let again = core.run(RunId(2), run_request(&id, "pagila", 1, "select 1")).await.unwrap();
+    eprintln!("OBSERVED select 1 again on the tab's session: wall {:?}, dbx elapsed {:?}", started.elapsed(), again.elapsed);
+}
+
+#[tokio::test]
+async fn a_syntax_error_is_a_sql_error_with_its_position_in_the_statement_that_ran() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let err = core
+        .run(RunId(1), run_request(&id, "pagila", 1, "select 1;\nselect title\n  fro film"))
+        .await
+        .expect_err("a syntax error");
+    eprintln!("OBSERVED syntax error: {err:?}");
+    assert_eq!(err.kind, CoreErrorKind::Sql);
+    assert!(err.message.contains("syntax error"), "{}", err.message);
+    assert!(!err.message.contains("SQL text omitted"), "{}", err.message);
+    let ran = err.statement.as_deref().expect("the statement that ran");
+    assert_eq!(ran.trim(), "select title\n  fro film", "only the statement under the cursor ran");
+    let at = err.position.expect("Postgres gives a position");
+    assert_eq!((at.line, at.column), (2, 7), "`film`, on the statement's second line");
+}
+
+#[tokio::test]
+async fn set_search_path_lasts_for_the_tabs_next_run_and_not_in_another_tabs_session() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let run = |tab, sql: &str| core.run(RunId(rand_id()), run_request(&id, "edge", tab, sql));
+    run(1, "set search_path to other").await.expect("set");
+    let found = run(1, "select name from things").await.expect("`things` is in schema other");
+    assert_eq!(texts(&found.rows), vec![vec![Some("in the second schema".to_string())]]);
+    let elsewhere = run(2, "select name from things").await.expect_err("tab 2 has its own session");
+    assert_eq!(elsewhere.kind, CoreErrorKind::Sql, "{elsewhere:?}");
+    let path = run(2, "show search_path").await.unwrap();
+    assert_eq!(texts(&path.rows), vec![vec![Some("\"$user\", public".to_string())]]);
+    let path = run(1, "show search_path").await.unwrap();
+    assert_eq!(texts(&path.rows), vec![vec![Some("other".to_string())]]);
+}
+
+#[tokio::test]
+async fn closing_a_tabs_session_ends_it_and_releasing_the_database_does_not() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let run = |sql: &str| core.run(RunId(rand_id()), run_request(&id, "edge", 1, sql));
+    run("set search_path to other").await.unwrap();
+    // The sidebar collapsing `edge` releases its pool; the tab's session is not that pool.
+    core.release(&database(&id, "edge")).await.unwrap();
+    assert_eq!(texts(&run("show search_path").await.unwrap().rows), vec![vec![Some("other".to_string())]]);
+    let before = server_connections("edge");
+    core.close_session(TabId(1), &database(&id, "edge")).await.expect("close");
+    let after = wait_for_server_connections("edge", before.len() - 1).await;
+    eprintln!("OBSERVED edge connections with the tab's session open: {before:?}; after closing it: {after:?}");
+    assert_eq!(after.len(), before.len() - 1, "the session's server connection is gone");
+    // The next run starts a new session, with the default search path.
+    assert_eq!(texts(&run("show search_path").await.unwrap().rows), vec![vec![Some("\"$user\", public".to_string())]]);
+    core.close_session(TabId(1), &database(&id, "edge")).await.unwrap();
+    core.close_session(TabId(9), &database(&id, "edge")).await.expect("closing a session that never existed is fine");
+}
+
+#[tokio::test]
+async fn the_row_cap_cuts_a_long_result_and_says_it_was_truncated() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let mut request = run_request(&id, "pagila", 1, "select generate_series(1, 50) as n");
+    request.row_cap = 10;
+    let set = core.run(RunId(1), request).await.unwrap();
+    assert_eq!(set.rows.len(), 10);
+    assert!(set.truncated);
+    let set = core.run(RunId(2), run_request(&id, "pagila", 1, "select generate_series(1, 50) as n")).await.unwrap();
+    assert_eq!((set.rows.len(), set.truncated), (50, false));
+}
+
+#[tokio::test]
+async fn a_statement_without_a_result_set_reports_the_rows_it_changed() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let run = |sql: &str| core.run(RunId(rand_id()), run_request(&id, "edge", 1, sql));
+    // A temporary table lives in the tab's session and goes with it.
+    run("create temp table scratch_05 (x int)").await.expect("create");
+    let set = run("insert into scratch_05 values (1), (2), (3)").await.expect("insert");
+    eprintln!("OBSERVED insert: columns {:?}, affected {}, messages {:?}", set.columns, set.affected, set.messages);
+    assert!(set.columns.is_empty());
+    assert_eq!(set.affected, 3);
+    let empty = run("select x from scratch_05 where x > 99").await.unwrap();
+    assert_eq!((empty.columns.len(), empty.rows.len()), (1, 0), "an empty result keeps its header");
+    core.close_session(TabId(1), &database(&id, "edge")).await.unwrap();
+}
+
+#[tokio::test]
+async fn nothing_at_the_cursor_is_an_error_and_nothing_is_sent() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let err = core.run(RunId(1), run_request(&id, "pagila", 1, "  \n ")).await.expect_err("nothing to run");
+    assert_eq!(err.kind, CoreErrorKind::Other, "{err:?}");
+}
+
+#[tokio::test]
+async fn edge_case_cells_come_back_as_exact_text_and_null_is_not_empty_or_the_text_null() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let run = |sql: &str| core.run(RunId(rand_id()), run_request(&id, "edge", 1, sql));
+    let text = run("select id, v from text_values order by id").await.unwrap();
+    eprintln!("OBSERVED text_values: {:?} {:?}", text.columns, texts(&text.rows));
+    let v: Vec<Option<String>> = text.rows.iter().map(|r| texts(std::slice::from_ref(r))[0][1].clone()).collect();
+    assert_eq!(v[0], None);
+    assert_eq!(v[1].as_deref(), Some(""));
+    assert_eq!(v[2].as_deref(), Some("NULL"));
+    assert_eq!(v[5].as_deref(), Some("line1\nline2\n\tindented"));
+    assert_eq!(v[6].as_deref(), Some("日本語 😀 👨‍👩‍👧 ａｂｃ"));
+    let numbers = run("select big, exact, approx from numbers order by id").await.unwrap();
+    eprintln!("OBSERVED numbers: {:?} {:?}", numbers.columns, texts(&numbers.rows));
+    let n = texts(&numbers.rows);
+    assert_eq!(n[0][0].as_deref(), Some("9007199254740993"));
+    assert_eq!(n[0][1].as_deref(), Some("12345678901234567890.123456789"));
+    assert_eq!(n[1][0].as_deref(), Some("-9223372036854775808"));
+    assert_eq!(n[1][2].as_deref(), Some("0.30000000000000004"));
+    assert_eq!(numbers.columns.iter().map(|c| c.kind).collect::<Vec<_>>(), vec![CellKind::Integer, CellKind::Decimal, CellKind::Float]);
+    for sql in ["select * from temporal order by id", "select * from other_types order by id", "select 1::int as i, now() as t"] {
+        let set = run(sql).await.unwrap();
+        eprintln!("OBSERVED {sql}: {:?} {:?}", set.columns, texts(&set.rows));
+    }
+}
+
+fn rand_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1_000);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
+
+/// The fixture connection saved as another dbx head would, with
+/// `query_timeout_secs` set.
+async fn seeded_with_timeout(core: &DbxCore, secs: u64) -> ConnectionId {
+    core.seed_config(serde_json::json!({
+        "id": format!("timeout-{secs}"),
+        "name": format!("timeout {secs}"),
+        "db_type": "postgres",
+        "host": "127.0.0.1",
+        "port": 55433,
+        "username": "postgres",
+        "password": FIXTURE_PASSWORD,
+        "database": "pagila",
+        "ssl": false,
+        "driver_profile": null,
+        "query_timeout_secs": secs,
+    }))
+    .await
+    .expect("seed")
+}
+
+#[tokio::test]
+async fn a_connection_with_a_1_s_query_timeout_cuts_a_5_s_statement_and_says_whose_limit_it_was() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = seeded_with_timeout(&core, 1).await;
+    let started = std::time::Instant::now();
+    let err = core.run(RunId(1), run_request(&id, "pagila", 1, "select pg_sleep(5)")).await.expect_err("cut");
+    eprintln!("OBSERVED timeout after {:?}: {err:?}", started.elapsed());
+    assert_eq!(err.kind, CoreErrorKind::Timeout, "{err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    assert!(err.message.contains("1 s") && err.message.contains("connection"), "{}", err.message);
+}
+
+/// dbx's own default is 30 s when a run asks for nothing; a run of ours asks
+/// for no limit. Slow (31 s), so run on demand: `-- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn with_no_timeout_on_the_connection_a_statement_runs_past_dbxs_30_s_default() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let set = core.run(RunId(1), run_request(&id, "pagila", 1, "select pg_sleep(31) as slept")).await.expect("not cut at 30 s");
+    assert_eq!(set.rows.len(), 1);
+}
+
+#[tokio::test]
+async fn a_cancel_lands_even_while_another_core_call_holds_the_state_lock() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    let id = saved_fixture(&core).await;
+    let running = tokio::spawn({
+        let (core, id) = (core.clone(), id.clone());
+        async move { core.run(RunId(77), run_request(&id, "pagila", 1, "select pg_sleep(20)")).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let started = std::time::Instant::now();
+    {
+        let _busy = core.hold_state_lock().await;
+        core.cancel(RunId(77));
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), running).await.expect("cancelled promptly").unwrap();
+    eprintln!("OBSERVED cancel under a held lock: {:?} after {:?}", result.as_ref().err(), started.elapsed());
+    assert_eq!(result.expect_err("cancelled").kind, CoreErrorKind::Cancelled);
 }

@@ -23,6 +23,8 @@ use dbx_core::connection::{
 use dbx_core::runtime_config::{is_transient_runtime_config_id, TEST_PROBE_ID_PREFIX};
 use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::persistence::secret_codec::SecretKeyPolicy;
+use dbx_core::query::{execute_sql_statement_with_options_typed, QueryExecutionError, QueryExecutionOptions};
+use dbx_core::query_cancel::RunningTaskMetadata;
 use dbx_core::storage::{MigrationPreflight, Storage};
 use tokio::sync::Mutex;
 
@@ -159,6 +161,10 @@ fn resolved(path: &Path) -> PathBuf {
 pub struct DbxCore {
     options: Result<StoreOptions, CoreError>,
     state: Mutex<Option<Arc<AppState>>>,
+    /// The state once open, readable without waiting on `state`'s lock:
+    /// `cancel` is not async and must never miss because another call holds
+    /// the lock for a moment.
+    opened: std::sync::OnceLock<Arc<AppState>>,
     policy: SecretKeyPolicy,
     /// Held for the whole of a save or a remove: each reads the saved config,
     /// writes the store and then updates dbx's runtime list, and two of them
@@ -178,13 +184,13 @@ async fn blocking<T: Send + 'static>(fut: impl std::future::Future<Output = T> +
 
 impl DbxCore {
     pub fn new(options: StoreOptions) -> Self {
-        DbxCore { options: Ok(options), state: Mutex::new(None), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()) }
+        DbxCore { options: Ok(options), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()) }
     }
 
     /// The client's DbxCore: the store named by the environment. If that
     /// cannot be worked out, every call fails with the reason.
     pub fn from_env() -> Self {
-        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()) }
+        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()) }
     }
 
     /// Keys only from the environment or the data directory, never the OS
@@ -216,6 +222,7 @@ impl DbxCore {
             CoreError::new(CoreErrorKind::Other, format!("opening the store stopped unexpectedly: {e}"))
         })??;
         *slot = Some(state.clone());
+        let _ = self.opened.set(state.clone());
         Ok(state)
     }
 
@@ -240,6 +247,14 @@ impl DbxCore {
         let state = self.state().await.ok()?;
         let configs = state.configs.read().await;
         configs.get(&id.0).and_then(|c| serde_json::to_value(c).ok())
+    }
+
+    /// Holds the lock `state()` takes, as another Core call does for a moment
+    /// while it looks the state up. Tests only: a cancel must not depend on
+    /// that lock being free.
+    #[cfg(feature = "test-support")]
+    pub async fn hold_state_lock(&self) -> impl Drop + '_ {
+        self.state.lock().await
     }
 
     /// Every id in dbx's runtime connection list, temporary ones included.
@@ -651,6 +666,166 @@ fn not_yet<T>(slice: &str) -> Result<T, CoreError> {
     Err(CoreError::new(CoreErrorKind::Other, format!("not available yet (slice {slice})")))
 }
 
+// ---- runs ------------------------------------------------------------------------
+
+/// The query timeout a run asks dbx for, in seconds, or `None` for no limit.
+/// The connection's own `query_timeout_secs` when it sets one; dbx fills a
+/// connection that never set it with its default (60), which counts as unset.
+///
+/// The value must be passed in `QueryExecutionOptions.timeout_secs`: on the
+/// single-statement path dbx's `operation_budget_for_pool_key` overwrites the
+/// connection's query timeout with the per-call one, and an absent per-call
+/// timeout means dbx's built-in 30 s (`QUERY_TIMEOUT`), not the connection's.
+fn query_timeout(config: &ConnectionConfig) -> Option<u64> {
+    let secs = config.effective_query_timeout_secs();
+    (secs != 0 && config.query_timeout_secs != dbx_core::models::connection::default_query_timeout_secs()).then_some(secs)
+}
+
+/// dbx's session id for a query tab. dbx treats the text before a `:` as an
+/// owner and some suffixes (`:count`, `:export`) as kinds of work, so it has
+/// neither.
+fn session_id(tab: TabId) -> String {
+    format!("dbx-tui-tab-{}", tab.0)
+}
+
+/// The id a run is registered under in dbx's running-query list.
+fn run_key(run: RunId) -> String {
+    format!("dbx-tui-run-{}", run.0)
+}
+
+/// The statement a run executes: the selection if there is one, otherwise
+/// the statement under the cursor as dbx splits statements for `db_type`
+/// (`find_statement_at_cursor_for_database`, which counts the cursor in
+/// UTF-16 units).
+fn statement_to_run(request: &RunRequest, db_type: DatabaseType) -> String {
+    if let Some((a, b)) = request.selection.filter(|(a, b)| a != b) {
+        return text_between(&request.buffer, a, b);
+    }
+    let cursor = utf16_offset(&request.buffer, request.cursor);
+    dbx_core::sql::find_statement_at_cursor_for_database(&request.buffer, cursor, db_type)
+}
+
+/// dbx's result as ours. Each column's kind comes from the database's type
+/// name (`column_types`); a column dbx gives no type name for is `Other`. Every cell is NULL or text:
+/// numbers keep the digits dbx gave, never passing through a float.
+fn result_set(result: dbx_core::db::QueryResult, ran: String) -> ResultSet {
+    let columns = result
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            // No type name, no kind: the cells' JSON types change with the
+            // path dbx's driver took, so they cannot stand in for one.
+            let db_type = result.column_types.get(i).cloned().unwrap_or_default();
+            let kind = if db_type.is_empty() { CellKind::Other } else { kind_of_type(&db_type) };
+            Column { name: name.clone(), db_type, kind }
+        })
+        .collect();
+    let rows = result.rows.into_iter().map(|row| row.into_iter().map(cell).collect()).collect();
+    let messages = result.messages.into_iter().map(|m| format!("{}: {}", m.severity, m.message)).collect();
+    ResultSet {
+        columns,
+        rows,
+        truncated: result.truncated,
+        elapsed: std::time::Duration::from_millis(result.execution_time_ms.min(u64::MAX as u128) as u64),
+        messages,
+        affected: result.affected_rows,
+        ran,
+    }
+}
+
+/// One cell as text. dbx sends numbers it cannot hold exactly as strings
+/// already; a JSON number is printed as dbx parsed it, which for integers is
+/// exact and for floats is the shortest text that reads back the same.
+fn cell(value: serde_json::Value) -> Cell {
+    match value {
+        serde_json::Value::Null => Cell::Null,
+        serde_json::Value::String(s) => Cell::Value(s),
+        other => Cell::Value(other.to_string()),
+    }
+}
+
+/// A column's kind from the database's name for its type. Postgres names
+/// (`int4`, `timestamptz`) and the spelled-out SQL names other drivers use
+/// (`BIGINT UNSIGNED`, `DATETIME`) both count. Arrays and anything unknown
+/// are `Other`.
+fn kind_of_type(db_type: &str) -> CellKind {
+    let t = db_type.trim().to_ascii_lowercase();
+    if t.starts_with('_') || t.ends_with("[]") {
+        return CellKind::Other;
+    }
+    let base = t.split(['(', ' ']).next().unwrap_or("");
+    match base {
+        "int2" | "int4" | "int8" | "smallint" | "integer" | "int" | "bigint" | "tinyint" | "mediumint" | "serial"
+        | "bigserial" | "smallserial" | "oid" => CellKind::Integer,
+        "numeric" | "decimal" | "money" => CellKind::Decimal,
+        "float4" | "float8" | "real" | "double" | "float" => CellKind::Float,
+        // `bit` and `varbit` are bit strings (`101`), not truth values.
+        "bool" | "boolean" => CellKind::Bool,
+        "text" | "varchar" | "bpchar" | "char" | "character" | "name" | "citext" | "string" | "enum" | "set"
+        | "tinytext" | "mediumtext" | "longtext" => CellKind::Text,
+        "date" | "time" | "timetz" | "timestamp" | "timestamptz" | "interval" | "datetime" | "year" => CellKind::Temporal,
+        "json" | "jsonb" => CellKind::Json,
+        "bytea" | "blob" | "binary" | "varbinary" | "tinyblob" | "mediumblob" | "longblob" => CellKind::Binary,
+        _ => CellKind::Other,
+    }
+}
+
+
+/// A failed run as ours: the kind from dbx's error variant (a connection
+/// failure is `Connect` whatever variant carries it), dbx's message without
+/// the sentence saying it left the SQL out (we show the SQL), the password
+/// blanked out, and the statement that ran with the position dbx found in it.
+fn run_error(error: QueryExecutionError, statement: &str, secret: &str, timeout: Option<u64>) -> CoreError {
+    let (kind, position) = match &error {
+        QueryExecutionError::Canceled { .. } => (CoreErrorKind::Cancelled, None),
+        QueryExecutionError::Timeout(_) => (CoreErrorKind::Timeout, None),
+        QueryExecutionError::SqlWithPosition { position, .. } => {
+            (CoreErrorKind::Sql, Some(SqlPosition { line: position.line, column: position.column }))
+        }
+        QueryExecutionError::Sql(_) => (CoreErrorKind::Sql, None),
+        _ => (CoreErrorKind::Other, None),
+    };
+    let raw = error.into_legacy_string();
+    let kind = if kind != CoreErrorKind::Cancelled && dbx_core::query::is_connection_error(&raw) {
+        CoreErrorKind::Connect
+    } else {
+        kind
+    };
+    let message = match (kind, timeout) {
+        (CoreErrorKind::Timeout, Some(secs)) => format!(
+            "The statement ran longer than this connection's query timeout of {secs} s and was stopped. \
+             The limit is the connection's \"Query timeout\" setting, set in the dbx desktop app."
+        ),
+        _ => run_message(&raw, secret),
+    };
+    let mut e = CoreError::new(kind, message);
+    e.statement = Some(statement.to_string());
+    e.position = position;
+    e
+}
+
+/// The sentence dbx appends to a SQL error in place of the SQL.
+const SQL_OMITTED: &str = "SQL text omitted from user-facing error";
+
+/// dbx's words for a failed run: the omitted-SQL sentence dropped, the
+/// password blanked out, control characters replaced line by line (the
+/// server's DETAIL and HINT lines stay lines), and the length capped.
+fn run_message(raw: &str, secret: &str) -> String {
+    let mut text = match raw.find(SQL_OMITTED) {
+        Some(at) => raw[..at].to_string(),
+        None => raw.to_string(),
+    };
+    if !secret.is_empty() {
+        text = text.replace(secret, "••••");
+    }
+    let mut out: String = text.trim().lines().map(|l| display_safe(l.trim_end())).collect::<Vec<_>>().join("\n");
+    if out.chars().count() > 4_000 {
+        out = out.chars().take(3_999).collect::<String>() + "…";
+    }
+    out
+}
+
 #[async_trait]
 impl Core for DbxCore {
     async fn connections(&self) -> Result<Vec<Connection>, CoreError> {
@@ -801,12 +976,69 @@ impl Core for DbxCore {
         state.remove_pool_by_key(&format!("{}:{}", at.connection.0, at.database)).await;
         Ok(())
     }
-    async fn run(&self, _run: RunId, _request: RunRequest) -> Result<ResultSet, CoreError> {
-        not_yet("05")
+    /// Runs one statement on the tab's own database session (dbx's
+    /// `client_session_id`), so `SET`, temporary tables and transactions last
+    /// from one run of a tab to the next, and runs of one tab queue behind
+    /// each other. The run is registered with dbx's running-query list under
+    /// its `RunId`, so `cancel` can reach it; the registration ends on every
+    /// way out, including this future being dropped (`RegisteredQuery`'s
+    /// `Drop`).
+    async fn run(&self, run: RunId, request: RunRequest) -> Result<ResultSet, CoreError> {
+        let state = self.state().await?;
+        let config = state.configs.read().await.get(&request.connection.0).cloned();
+        let Some(config) = config else {
+            return Err(CoreError::new(CoreErrorKind::Other, "That connection is no longer saved."));
+        };
+        let statement = statement_to_run(&request, config.db_type);
+        if statement.trim().is_empty() {
+            return Err(CoreError::new(CoreErrorKind::Other, "There is no statement at the cursor to run."));
+        }
+        let database = request.database.clone().or_else(|| config.database.clone()).unwrap_or_default();
+        let session = session_id(request.tab);
+        let registered = state.running_queries.register_task(
+            run_key(run),
+            RunningTaskMetadata::query(request.connection.0.clone(), database.clone(), Some(session.clone())),
+        );
+        let timeout = query_timeout(&config);
+        let options = QueryExecutionOptions {
+            max_rows: Some(request.row_cap),
+            // 0 is dbx's "no limit"; absent would be its 30 s default.
+            timeout_secs: Some(timeout.unwrap_or(0)),
+            client_session_id: Some(session),
+            execution_id: Some(run_key(run)),
+            ..Default::default()
+        };
+        let result = execute_sql_statement_with_options_typed(
+            &state,
+            &request.connection.0,
+            &database,
+            &statement,
+            None,
+            Some(registered.token()),
+            options,
+        )
+        .await;
+        registered.finish_with_late_cancel(&result, false);
+        result.map(|r| result_set(r, statement.clone())).map_err(|e| run_error(e, &statement, &config.password, timeout))
     }
-    fn cancel(&self, _run: RunId) {}
-    async fn close_session(&self, _tab: TabId) -> Result<(), CoreError> {
-        Ok(())
+    fn cancel(&self, run: RunId) {
+        // Only a store that is open can have runs to cancel.
+        if let Some(state) = self.opened.get() {
+            state.running_queries.cancel(&run_key(run));
+        }
+    }
+    /// Closes the one server connection dbx keeps for this tab's session on
+    /// that database (its pool is keyed `<connection>:<database>:session:<id>`).
+    /// `release` never touches it: that removes only the database's shared
+    /// pool, keyed without the session, so collapsing a database in the
+    /// sidebar cannot end a tab's session, even mid-run.
+    async fn close_session(&self, tab: TabId, at: &DatabasePath) -> Result<(), CoreError> {
+        let state = self.state().await?;
+        state
+            .close_client_session_pool(&at.connection.0, Some(&at.database), &session_id(tab))
+            .await
+            .map(|_| ())
+            .map_err(|raw| CoreError::new(CoreErrorKind::Other, scrub(&raw, &[])))
     }
     async fn history(&self, _query: HistoryQuery) -> Result<Vec<HistoryEntry>, CoreError> {
         not_yet("18")
@@ -820,6 +1052,208 @@ mod tests {
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let owned: Vec<(String, OsString)> = pairs.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect();
         move |name| owned.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    }
+
+    fn request(buffer: &str, row: usize, col: usize) -> RunRequest {
+        RunRequest {
+            connection: ConnectionId("c".into()),
+            database: Some("d".into()),
+            tab: TabId(1),
+            buffer: buffer.into(),
+            cursor: Cursor { row, col },
+            selection: None,
+            row_cap: 1000,
+        }
+    }
+
+    /// What a statement is, ignoring the spaces and `;` around it.
+    fn bare(s: &str) -> &str {
+        s.trim().trim_end_matches(';').trim()
+    }
+
+    #[test]
+    fn the_statement_under_the_cursor_runs_not_the_whole_buffer() {
+        let buffer = "select 1;\nselect 2\n  from film;\nselect 3;";
+        for (row, col) in [(1, 0), (1, 4), (2, 5)] {
+            let ran = statement_to_run(&request(buffer, row, col), DatabaseType::Postgres);
+            assert_eq!(bare(&ran), "select 2\n  from film", "cursor at {row},{col}");
+        }
+        assert_eq!(bare(&statement_to_run(&request(buffer, 0, 3), DatabaseType::Postgres)), "select 1");
+        assert_eq!(bare(&statement_to_run(&request(buffer, 3, 9), DatabaseType::Postgres)), "select 3", "at the very end");
+    }
+
+    #[test]
+    fn a_cursor_after_a_multi_byte_character_still_picks_the_statement_it_is_in() {
+        // Counted in bytes, the cursor at the end of the first line would land
+        // inside the second statement; counted in characters, too early.
+        let buffer = "select '😀😀😀😀', 'éé';\nselect 2;";
+        let first = statement_to_run(&request(buffer, 0, 20), DatabaseType::Postgres);
+        assert_eq!(bare(&first), "select '😀😀😀😀', 'éé'");
+        let second = statement_to_run(&request(buffer, 1, 2), DatabaseType::Postgres);
+        assert_eq!(bare(&second), "select 2");
+    }
+
+    #[test]
+    fn a_selection_runs_exactly_the_selected_text() {
+        let mut r = request("select 1;\nselect title from film;", 1, 0);
+        r.selection = Some((Cursor { row: 1, col: 0 }, Cursor { row: 1, col: 12 }));
+        assert_eq!(statement_to_run(&r, DatabaseType::Postgres), "select title");
+    }
+
+    fn query_result(value: serde_json::Value) -> dbx_core::db::QueryResult {
+        serde_json::from_value(value).expect("a QueryResult")
+    }
+
+    #[test]
+    fn cells_are_null_or_exact_text_and_kinds_come_from_the_database_type_names() {
+        let r = query_result(serde_json::json!({
+            "columns": ["id", "big", "exact", "approx", "flag", "label", "at", "doc", "bin", "uid"],
+            "column_types": ["int4", "int8", "numeric", "float8", "bool", "text", "timestamptz", "jsonb", "bytea", "uuid"],
+            "rows": [
+                [1, "9007199254740993", "12345678901234567890.123456789", 0.1, true, "NULL", "2024-03-05T11:45:12+00:00", "{\"a\": 1}", "\\xdead", "a0ee"],
+                ["2", null, null, 0.30000000000000004, false, "", null, null, null, null]
+            ],
+            "affected_rows": 0,
+            "execution_time_ms": 12,
+            "truncated": true,
+            "messages": [{"severity": "NOTICE", "message": "hello"}]
+        }));
+        let set = result_set(r, "select ...".into());
+        let kinds: Vec<CellKind> = set.columns.iter().map(|c| c.kind).collect();
+        use CellKind::*;
+        assert_eq!(kinds, vec![Integer, Integer, Decimal, Float, Bool, Text, Temporal, Json, Binary, Other]);
+        assert_eq!(set.columns[1].name, "big");
+        assert_eq!(set.columns[1].db_type, "int8");
+        let v = |s: &str| Cell::Value(s.into());
+        assert_eq!(
+            set.rows[0],
+            vec![
+                v("1"),
+                v("9007199254740993"),
+                v("12345678901234567890.123456789"),
+                v("0.1"),
+                v("true"),
+                v("NULL"),
+                v("2024-03-05T11:45:12+00:00"),
+                v("{\"a\": 1}"),
+                v("\\xdead"),
+                v("a0ee")
+            ]
+        );
+        assert_eq!(set.rows[1][0], v("2"), "an integer that came as a string is the same text");
+        assert_eq!(set.rows[1][1], Cell::Null);
+        assert_eq!(set.rows[1][3], v("0.30000000000000004"));
+        assert_eq!(set.rows[1][5], v(""), "the empty string is not NULL");
+        assert!(set.truncated);
+        assert_eq!(set.elapsed, std::time::Duration::from_millis(12));
+        assert_eq!(set.messages, vec!["NOTICE: hello".to_string()]);
+        assert_eq!(set.ran, "select ...");
+    }
+
+    #[test]
+    fn without_column_types_every_kind_is_other_whatever_json_type_the_cells_have() {
+        // dbx's JSON types change with its protocol path, so they say nothing.
+        let r = query_result(serde_json::json!({
+            "columns": ["n", "s", "b", "nothing"],
+            "column_types": [],
+            "rows": [[null, "x", true, null], [3, "y", false, null]],
+            "affected_rows": 0,
+            "execution_time_ms": 1
+        }));
+        let set = result_set(r, String::new());
+        assert!(set.columns.iter().all(|c| c.kind == CellKind::Other && c.db_type.is_empty()), "{:?}", set.columns);
+        assert_eq!(set.rows[1][0], Cell::Value("3".into()));
+        // Types for only some columns: the ones without are `Other`.
+        let r = query_result(serde_json::json!({
+            "columns": ["a", "b"], "column_types": ["int4"], "rows": [[1, 2]], "affected_rows": 0, "execution_time_ms": 1
+        }));
+        let kinds: Vec<CellKind> = result_set(r, String::new()).columns.iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, vec![CellKind::Integer, CellKind::Other]);
+    }
+
+    #[test]
+    fn a_bit_string_is_not_a_boolean() {
+        for t in ["bit", "varbit", "bit(3)", "bit varying"] {
+            assert_eq!(kind_of_type(t), CellKind::Other, "{t}");
+        }
+        assert_eq!(kind_of_type("bool"), CellKind::Bool);
+        assert_eq!(kind_of_type("boolean"), CellKind::Bool);
+    }
+
+    #[test]
+    fn a_statement_without_a_result_set_reports_the_rows_it_changed() {
+        let r = query_result(serde_json::json!({ "columns": [], "rows": [], "affected_rows": 3, "execution_time_ms": 4 }));
+        let set = result_set(r, "delete from t".into());
+        assert!(set.columns.is_empty());
+        assert_eq!(set.affected, 3);
+    }
+
+    #[test]
+    fn a_sql_error_keeps_dbxs_position_and_the_statement_and_drops_the_omitted_sql_sentence() {
+        let position = dbx_core::sql_error_position::SqlErrorPosition { line: 2, column: 8, offset: 17 };
+        let raw = "ERROR: syntax error at or near \"form\"\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.";
+        let e = run_error(QueryExecutionError::SqlWithPosition { message: raw.into(), position }, "select 1\nselect form x", "", None);
+        assert_eq!(e.kind, CoreErrorKind::Sql);
+        assert_eq!(e.message, "ERROR: syntax error at or near \"form\"");
+        assert_eq!(e.position, Some(SqlPosition { line: 2, column: 8 }));
+        assert_eq!(e.statement.as_deref(), Some("select 1\nselect form x"));
+
+        let plain = run_error(QueryExecutionError::Sql("relation \"nope\" does not exist".into()), "select * from nope", "", None);
+        assert_eq!((plain.kind, plain.position), (CoreErrorKind::Sql, None));
+        assert_eq!(plain.statement.as_deref(), Some("select * from nope"));
+    }
+
+    #[test]
+    fn timeouts_cancels_and_lost_connections_keep_their_kind_and_never_show_the_password() {
+        assert_eq!(run_error(QueryExecutionError::Timeout("Query timed out after 30s".into()), "s", "", None).kind, CoreErrorKind::Timeout);
+        let cancelled = QueryExecutionError::Canceled {
+            stage: dbx_core::db::agent_driver::AgentErrorStage::Execute,
+            operation_outcome: dbx_core::db::agent_driver::AgentOperationOutcome::Unknown,
+        };
+        assert_eq!(run_error(cancelled, "s", "", None).kind, CoreErrorKind::Cancelled);
+        let lost = run_error(QueryExecutionError::Legacy("PostgreSQL connection failed: Connection refused (hunter2)".into()), "s", "hunter2", None);
+        assert_eq!(lost.kind, CoreErrorKind::Connect);
+        assert!(!lost.message.contains("hunter2") && !format!("{lost:?}").contains("hunter2"), "{lost:?}");
+        let other = run_error(QueryExecutionError::Legacy("something odd\u{1b}[31m".into()), "s", "", None);
+        assert_eq!(other.kind, CoreErrorKind::Other);
+        assert!(!other.message.chars().any(char::is_control), "{other:?}");
+    }
+
+    #[test]
+    fn a_run_has_no_time_limit_unless_the_connection_sets_its_own() {
+        let mut config = config_from_draft(
+            &ConnectionDraft {
+                id: None,
+                name: "c".into(),
+                kind: DbKind::Postgres,
+                host: "h".into(),
+                port: None,
+                database: None,
+                username: "u".into(),
+                password: None,
+                tls: false,
+                production: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.query_timeout_secs, 60, "dbx's default for a connection that never set one");
+        assert_eq!(query_timeout(&config), None, "dbx's default is not a choice the user made");
+        config.query_timeout_secs = 1;
+        assert_eq!(query_timeout(&config), Some(1));
+        config.query_timeout_secs = 600;
+        assert_eq!(query_timeout(&config), Some(600));
+        config.query_timeout_secs = 0;
+        assert_eq!(query_timeout(&config), None, "0 is the desktop app's 'no limit'");
+    }
+
+    #[test]
+    fn a_timeout_says_which_limit_applied_and_where_it_is_set() {
+        let e = run_error(QueryExecutionError::Timeout("Query timed out after 1s".into()), "select pg_sleep(5)", "", Some(1));
+        assert_eq!(e.kind, CoreErrorKind::Timeout);
+        assert!(e.message.contains("1 s") && e.message.contains("query timeout") && e.message.contains("connection"), "{}", e.message);
+        let e = run_error(QueryExecutionError::Timeout("Pool checkout timed out".into()), "s", "", None);
+        assert!(e.message.contains("Pool checkout timed out"), "dbx's own words when no limit of ours applied: {}", e.message);
     }
 
     #[test]
