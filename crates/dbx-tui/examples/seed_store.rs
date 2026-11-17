@@ -3,7 +3,9 @@
 //! would (encrypted with the key dbx resolves: set `DBX_SECRET_KEY_FILE`).
 //!
 //! Usage: seed_store DATA_DIR NAME KIND HOST PORT [DATABASE]
-//! KIND is postgres, mysql or sqlite. The password saved is a fixed dummy.
+//! KIND is postgres, mysql or sqlite. The password saved is a fixed dummy,
+//! unless `DBX_TUI_SEED_PASSWORD` is set (the journeys use it for the Docker
+//! fixture's well-known password).
 //! DATA_DIR must be under the system temp directory (or set
 //! `DBX_TUI_ALLOW_SEED=1`); the desktop app's store is always refused.
 
@@ -39,7 +41,7 @@ fn main() {
         port: args[4].parse().ok(),
         database: args.get(5).cloned(),
         username: "postgres".into(),
-        password: Some("seeded-dummy-password".into()),
+        password: Some(std::env::var("DBX_TUI_SEED_PASSWORD").unwrap_or_else(|_| "seeded-dummy-password".into())),
         tls: false,
         production: false,
     };

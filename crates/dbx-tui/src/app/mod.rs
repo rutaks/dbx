@@ -7,8 +7,10 @@ pub mod keys;
 pub mod layout;
 pub mod overlay;
 pub mod requests;
+pub mod sidebar;
 pub mod text_field;
 pub mod theme;
+pub mod tree;
 mod view;
 
 #[cfg(test)]
@@ -19,18 +21,22 @@ mod form_tests;
 pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tree_tests;
 
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 
-use crate::core::{Connection, ConnectionDraft, ConnectionId, CoreError, RunId};
+use crate::core::{Connection, ConnectionDraft, ConnectionId, CoreError, DatabasePath, RunId};
 use keys::{Action, KeyCombo, Keybinds};
-use layout::HitMap;
+use layout::{HintHit, HitMap};
 use overlay::{ErrorOverlay, FieldHit, Overlay, OverlayAction, OverlayButton};
 use requests::{RequestId, Requests, Target};
+use sidebar::{Active, SidebarUi};
 use theme::Palette;
+use tree::{Listing, NodeId, RowKey, SchemaCache, Slot};
 
 /// One of the fixed regions of the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,19 +75,17 @@ pub enum Loadable<T> {
 #[derive(Debug)]
 pub struct Model {
     pub connections: Loadable<Vec<Connection>>,
+    /// What the Core told us about each connection's databases, schemas,
+    /// tables and columns.
+    pub schema: SchemaCache,
+    /// The connection and database the cursor row is in: where the editor will
+    /// run (slice 05).
+    pub active: Option<Active>,
     pub requests: Requests,
 }
 
 /// Rows one notch of the mouse wheel scrolls.
 const WHEEL_ROWS: isize = 3;
-
-/// The sidebar's cursor and how far its list is scrolled, in rows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SidebarUi {
-    pub cursor: usize,
-    /// The first row on screen. `view` keeps the cursor inside the window.
-    pub scroll: usize,
-}
 
 /// A short message at the foot of the sidebar, for what does not deserve an
 /// overlay or must not disturb one that is open. Cleared by the next key the
@@ -107,6 +111,9 @@ pub struct Ui {
     pub overlay: Option<Overlay>,
     /// Filled by `view`.
     pub hits: HitMap,
+    /// The mode bar's hints as last drawn, each with what a click on it does.
+    /// Filled by `view`.
+    pub mode_hints: Vec<HintHit>,
     /// The open overlay's buttons as last drawn. Filled by `view`.
     pub overlay_buttons: Vec<OverlayButton>,
     /// The open form's rows as last drawn, for clicks. Filled by `view`.
@@ -133,6 +140,9 @@ pub enum CoreCall {
     TestConnection(ConnectionDraft),
     SaveConnection(ConnectionDraft),
     RemoveConnection(ConnectionId),
+    /// List one tree node's children: databases of a connection, schemas of a
+    /// database, tables of a schema, columns of a table.
+    List(NodeId),
 }
 
 /// The reply to a `CoreCall`.
@@ -142,6 +152,7 @@ pub enum CoreReply {
     Tested(Result<(), CoreError>),
     Saved(Result<Connection, CoreError>),
     Removed(Result<(), CoreError>),
+    Listed(Result<Listing, CoreError>),
 }
 
 #[derive(Debug)]
@@ -159,6 +170,12 @@ pub enum Event {
 pub enum Command {
     Core(RequestId, CoreCall),
     Cancel(RunId),
+    /// Stop waiting for a request: its reply will be dropped as stale, so the
+    /// shell may abort the call (a slow listing nobody wants any more).
+    Abandon(RequestId),
+    /// Let the Core drop the server connections it holds for one database
+    /// (its node collapsed). Fire and forget: nothing comes back.
+    Release(DatabasePath),
     Quit,
 }
 
@@ -177,7 +194,12 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         App {
-            model: Model { connections: Loadable::Loading, requests: Requests::default() },
+            model: Model {
+                connections: Loadable::Loading,
+                schema: SchemaCache::default(),
+                active: None,
+                requests: Requests::default(),
+            },
             ui: Ui {
                 focus: PaneId::Sidebar,
                 zoomed: false,
@@ -188,6 +210,7 @@ impl App {
                 keys: Keybinds::default(),
                 overlay: None,
                 hits: HitMap::default(),
+                mode_hints: Vec::new(),
                 overlay_buttons: Vec::new(),
                 overlay_fields: Vec::new(),
                 next_form_serial: 1,
@@ -201,8 +224,8 @@ impl App {
     /// the earlier request's reply becomes stale.
     pub fn start(&mut self) -> Effects {
         let id = self.model.requests.begin(Target::Connections);
-        if let Some(selected) = self.selected_connection().map(|c| c.id.clone()) {
-            self.ui.reload_anchor = Some(selected);
+        if let Some(row) = self.cursor_row() {
+            self.ui.reload_anchor = Some(row.node.connection().clone());
         }
         self.model.connections = Loadable::Loading;
         Effects { repaint: true, commands: vec![Command::Core(id, CoreCall::Connections)] }
@@ -210,6 +233,7 @@ impl App {
 
     pub fn update(&mut self, event: Event, now: Instant) -> Effects {
         let mut fx = Effects::default();
+        self.ensure_rows();
         self.expire_prefix(now, &mut fx);
         // Anything but a key press ends prefix mode, so a click or a paste
         // cannot be followed by a stray command key. Plain pointer movement
@@ -229,11 +253,12 @@ impl App {
             Event::Mouse(mouse) if self.ui.overlay.is_some() => self.on_overlay_mouse(mouse, &mut fx),
             Event::Paste(text) if self.ui.overlay.is_some() => self.on_overlay_paste(&text, &mut fx),
             Event::Key(key) => self.on_key(key, now, &mut fx),
-            Event::Mouse(mouse) => self.on_mouse(mouse, &mut fx),
+            Event::Mouse(mouse) => self.on_mouse(mouse, now, &mut fx),
             Event::Resize(..) => fx.repaint = true,
             Event::Core(id, reply) => self.on_reply(id, reply, &mut fx),
             Event::Paste(_) | Event::Timer => {}
         }
+        self.ensure_rows();
         fx
     }
 
@@ -282,32 +307,6 @@ impl App {
         }
     }
 
-    /// The sidebar takes navigation keys directly: it accepts no text.
-    fn on_sidebar_key(&mut self, combo: KeyCombo, fx: &mut Effects) {
-        if self.ui.note.take().is_some() {
-            fx.repaint = true;
-        }
-        let Loadable::Ready(list) = &self.model.connections else { return };
-        if combo.mods.is_empty() && !list.is_empty() {
-            match combo.code {
-                KeyCode::Char('e') => return self.open_edit_form(fx),
-                KeyCode::Char('d') | KeyCode::Delete => return self.open_remove_confirm(fx),
-                _ => {}
-            }
-        }
-        let last = list.len().saturating_sub(1);
-        let cursor = &mut self.ui.sidebar.cursor;
-        let moved = match combo.code {
-            KeyCode::Char('j') | KeyCode::Down if combo.mods.is_empty() => (*cursor + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up if combo.mods.is_empty() => cursor.saturating_sub(1),
-            _ => return,
-        };
-        if moved != *cursor {
-            *cursor = moved;
-            fx.repaint = true;
-        }
-    }
-
     fn perform(&mut self, action: Action, fx: &mut Effects) {
         use PaneId::*;
         let target = match (action, self.ui.focus) {
@@ -334,7 +333,7 @@ impl App {
         }
     }
 
-    fn on_mouse(&mut self, mouse: MouseEvent, fx: &mut Effects) {
+    fn on_mouse(&mut self, mouse: MouseEvent, now: Instant, fx: &mut Effects) {
         let at = (mouse.column, mouse.row).into();
         match mouse.kind {
             // The wheel scrolls what is under the pointer, focused or not.
@@ -343,37 +342,21 @@ impl App {
                 self.scroll_sidebar(if down { WHEEL_ROWS } else { -WHEEL_ROWS }, fx);
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // A hint in the mode bar does what its key does.
+                if let Some(hit) = self.ui.mode_hints.iter().find(|h| h.rect.contains(at)).copied() {
+                    return self.click_hint(hit.action, now, fx);
+                }
                 if let Some(pane) = self.ui.hits.pane_at(mouse.column, mouse.row) {
                     if pane != self.ui.focus {
                         self.ui.focus = pane;
                         fx.repaint = true;
                     }
                 }
-                let list = self.ui.hits.sidebar_list;
-                if list.contains(at) {
-                    let row = self.ui.sidebar.scroll + (mouse.row - list.y) as usize;
-                    if row != self.ui.sidebar.cursor {
-                        self.ui.sidebar.cursor = row;
-                        fx.repaint = true;
-                    }
+                if self.ui.hits.sidebar_list.contains(at) {
+                    self.click_sidebar_row(mouse.column, mouse.row, now, fx);
                 }
             }
             _ => {}
-        }
-    }
-
-    /// Moves the sidebar's window by `rows`, and the cursor with it when it
-    /// would leave the window, so the cursor row always stays on screen.
-    fn scroll_sidebar(&mut self, rows: isize, fx: &mut Effects) {
-        let Loadable::Ready(list) = &self.model.connections else { return };
-        let room = self.ui.hits.sidebar_list.height.max(1) as usize;
-        let sb = &mut self.ui.sidebar;
-        let max = list.len().saturating_sub(room);
-        let scroll = sb.scroll.saturating_add_signed(rows).min(max);
-        let cursor = sb.cursor.clamp(scroll, scroll + room - 1).min(list.len().saturating_sub(1));
-        if (scroll, cursor) != (sb.scroll, sb.cursor) {
-            (sb.scroll, sb.cursor) = (scroll, cursor);
-            fx.repaint = true;
         }
     }
 
@@ -450,25 +433,32 @@ impl App {
         // A stale reply is dropped without touching state or repainting.
         let Some(target) = self.model.requests.finish(id) else { return };
         match (target, reply) {
-            (Target::Connections, CoreReply::Connections(result)) => self.on_connections(result),
+            (Target::Connections, CoreReply::Connections(result)) => self.on_connections(result, fx),
             (Target::TestConnection(serial), CoreReply::Tested(result)) => self.on_tested(serial, result),
-            (Target::SaveConnection(serial), CoreReply::Saved(result)) => self.on_saved(serial, result),
-            (Target::RemoveConnection(id), CoreReply::Removed(result)) => self.on_removed(id, result),
+            (Target::SaveConnection(serial), CoreReply::Saved(result)) => self.on_saved(serial, result, fx),
+            (Target::RemoveConnection(id), CoreReply::Removed(result)) => self.on_removed(id, result, fx),
+            (Target::Children(node), CoreReply::Listed(result)) => {
+                if !self.on_listed(node, result, fx) {
+                    return;
+                }
+            }
             _ => return,
         }
         fx.repaint = true;
     }
 
-    fn on_connections(&mut self, result: Result<Vec<Connection>, CoreError>) {
+    fn on_connections(&mut self, result: Result<Vec<Connection>, CoreError>, fx: &mut Effects) {
         self.model.connections = match result {
             Ok(list) => {
                 // The cursor stays on the same connection, wherever it moved to.
-                let keep = self.ui.reload_anchor.take().or_else(|| self.selected_connection().map(|c| c.id.clone()));
-                let sidebar = &mut self.ui.sidebar;
-                sidebar.cursor = keep
-                    .and_then(|id| list.iter().position(|c| c.id == id))
-                    .unwrap_or(sidebar.cursor)
-                    .min(list.len().saturating_sub(1));
+                let keep = self.ui.reload_anchor.take().or_else(|| self.cursor_row().map(|r| r.node.connection().clone()));
+                if let Some(id) = keep {
+                    self.ui.sidebar.cursor_key = Some(RowKey { node: NodeId::Connection(id), slot: Slot::Node });
+                }
+                // A connection that is no longer saved takes its tree with it.
+                for gone in self.model.schema.connections().into_iter().filter(|c| !list.iter().any(|k| &k.id == c)) {
+                    self.forget_connection(&gone, fx);
+                }
                 Loadable::Ready(list)
             }
             Err(e) => {
@@ -480,5 +470,6 @@ impl App {
                 Loadable::Failed(e)
             }
         };
+        self.touch_rows();
     }
 }

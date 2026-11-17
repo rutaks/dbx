@@ -6,18 +6,10 @@ use crossterm::event::KeyEvent;
 use super::form::{ConnectionForm, FormKey, FormStatus};
 use super::overlay::{ConfirmRemove, FailureOverlay, FieldHit, Overlay};
 use super::requests::Target;
-use super::{App, Command, CoreCall, Effects, Loadable, Mode, SidebarNote};
+use super::{App, Command, CoreCall, Effects, Loadable, Mode};
 use crate::core::{sort_connections, Connection, ConnectionId, CoreError, DbKind};
 
 impl App {
-    /// The connection under the sidebar's cursor.
-    pub(super) fn selected_connection(&self) -> Option<&Connection> {
-        match &self.model.connections {
-            Loadable::Ready(list) => list.get(self.ui.sidebar.cursor),
-            _ => None,
-        }
-    }
-
     fn next_serial(&mut self) -> u64 {
         let serial = self.ui.next_form_serial;
         self.ui.next_form_serial += 1;
@@ -35,10 +27,7 @@ impl App {
         // The form has Postgres's fields and nothing else's: another kind of
         // connection would be saved with the wrong shape.
         if connection.kind != DbKind::Postgres {
-            self.ui.note = Some(SidebarNote {
-                text: format!("Edit it in the dbx app ({} is not handled by this form).", connection.kind.label()),
-                failure: false,
-            });
+            self.say(format!("Edit it in the dbx app ({} is not handled by this form).", connection.kind.label()), false);
             fx.repaint = true;
             return;
         }
@@ -159,13 +148,13 @@ impl App {
         }
     }
 
-    pub(super) fn on_saved(&mut self, serial: u64, result: Result<Connection, CoreError>) {
+    pub(super) fn on_saved(&mut self, serial: u64, result: Result<Connection, CoreError>, fx: &mut Effects) {
         let open = self.form().is_some_and(|f| f.serial == serial);
         match result {
             Ok(connection) => {
                 // Saved is saved, even if the form was closed meanwhile: the
                 // sidebar lists it. Only the form itself is the reply's to close.
-                self.upsert_connection(connection);
+                self.upsert_connection(connection, fx);
                 if open {
                     self.ui.overlay = None;
                 }
@@ -178,19 +167,21 @@ impl App {
         }
     }
 
-    pub(super) fn on_removed(&mut self, id: ConnectionId, result: Result<(), CoreError>) {
+    pub(super) fn on_removed(&mut self, id: ConnectionId, result: Result<(), CoreError>, fx: &mut Effects) {
+        // The request is done either way: it need not be remembered.
+        self.model.requests.forget(&super::requests::Target::RemoveConnection(id.clone()));
         match result {
             Ok(()) => {
                 if let Loadable::Ready(list) = &mut self.model.connections {
                     list.retain(|c| c.id != id);
-                    let sidebar = &mut self.ui.sidebar;
-                    sidebar.cursor = sidebar.cursor.min(list.len().saturating_sub(1));
                 }
+                // Its tree, and any listing still on its way, go with it.
+                self.forget_connection(&id, fx);
             }
             Err(e) if self.ui.overlay.is_some() => {
                 // Whatever is open (a form with typed text, say) is not ours
                 // to replace: say it at the foot of the sidebar instead.
-                self.ui.note = Some(SidebarNote { text: format!("Could not remove: {}", e.message), failure: true });
+                self.say(format!("Could not remove: {}", e.message), true);
             }
             Err(e) => {
                 self.ui.overlay = Some(Overlay::Failure(FailureOverlay {
@@ -204,18 +195,28 @@ impl App {
 
     /// Puts a saved connection in the list (replacing its old self if it was
     /// an edit), in the order the Core lists them, with the cursor on it.
-    fn upsert_connection(&mut self, connection: Connection) {
+    pub(super) fn upsert_connection(&mut self, connection: Connection, fx: &mut Effects) {
         let id = connection.id.clone();
         let mut list = match std::mem::replace(&mut self.model.connections, Loadable::Loading) {
             Loadable::Ready(list) => list,
             _ => Vec::new(),
         };
         match list.iter_mut().find(|c| c.id == id) {
-            Some(existing) => *existing = connection,
+            Some(existing) => {
+                // What was loaded came from the old settings: if they changed
+                // where the connection points, it may no longer be true.
+                let moved = (&existing.kind, &existing.host, existing.port, &existing.database, &existing.username, existing.tls)
+                    != (&connection.kind, &connection.host, connection.port, &connection.database, &connection.username, connection.tls);
+                *existing = connection;
+                if moved {
+                    self.forget_connection(&id, fx);
+                }
+            }
             None => list.push(connection),
         }
         sort_connections(&mut list);
-        self.ui.sidebar.cursor = list.iter().position(|c| c.id == id).unwrap_or(0);
         self.model.connections = Loadable::Ready(list);
+        self.ui.sidebar.cursor_key = Some(super::tree::RowKey { node: super::tree::NodeId::Connection(id), slot: super::tree::Slot::Node });
+        self.touch_rows();
     }
 }

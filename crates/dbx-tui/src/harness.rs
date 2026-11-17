@@ -11,7 +11,7 @@ use crate::app::requests::RequestId;
 use crate::app::testing::base;
 use crate::app::{App, CoreReply, Effects, Event};
 use crate::core::{Core, FakeCore};
-use crate::shell::execute;
+use crate::shell::{execute, Tasks};
 
 pub struct Harness {
     pub app: App,
@@ -19,6 +19,7 @@ pub struct Harness {
     core: Arc<dyn Core>,
     tx: mpsc::UnboundedSender<(RequestId, CoreReply)>,
     rx: mpsc::UnboundedReceiver<(RequestId, CoreReply)>,
+    pub tasks: Tasks,
     pub quit: bool,
 }
 
@@ -28,7 +29,7 @@ impl Harness {
         let fake = Arc::new(fake);
         let core: Arc<dyn Core> = fake.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut h = Harness { app: App::new(), fake, core, tx, rx, quit: false };
+        let mut h = Harness { app: App::new(), fake, core, tx, rx, tasks: Tasks::default(), quit: false };
         let fx = h.app.start();
         h.run(fx);
         h
@@ -36,7 +37,7 @@ impl Harness {
 
     /// Runs the commands in `fx`, as the shell does.
     pub fn run(&mut self, fx: Effects) {
-        self.quit |= execute(fx.commands, &self.core, &self.tx);
+        self.quit |= execute(fx.commands, &self.core, &self.tx, &self.tasks);
     }
 
     /// Lets spawned Core calls finish that are ready now, and feeds every reply

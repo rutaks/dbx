@@ -273,6 +273,61 @@ impl DbxCore {
         .map_err(|e| CoreError::new(CoreErrorKind::Connect, e.to_string()))
     }
 
+    /// Runs one of dbx's metadata calls for connection `id`.
+    ///
+    /// dbx's metadata functions take no cancel token. The work runs on a
+    /// blocking-pool thread (16 MiB stack, and a slow driver cannot hold a
+    /// runtime worker), inside a `select!` against a token held by this future:
+    /// when the caller stops waiting (the task is aborted, the future dropped)
+    /// the token fires, dbx's future is dropped, and the thread is released.
+    /// Without that, an abandoned listing of an unreachable server would keep a
+    /// thread until the driver's own connect timeout.
+    async fn metadata<T, Fut>(
+        &self,
+        id: &ConnectionId,
+        work: impl FnOnce(Arc<AppState>) -> Fut + Send + 'static,
+    ) -> Result<T, CoreError>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        let state = self.state().await?;
+        // Known secrets, to blank out of whatever dbx says about a failure.
+        let secret = state.configs.read().await.get(&id.0).map(|c| c.password.clone()).unwrap_or_default();
+        let (token, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::runtime::Handle::current();
+        let task = tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                tokio::select! {
+                    biased;
+                    // The sender is only ever dropped, never sent on.
+                    _ = cancelled => Err(CoreError::new(CoreErrorKind::Cancelled, "cancelled")),
+                    result = work(state) => result.map_err(|raw| metadata_error(&raw, &secret)),
+                }
+            })
+        });
+        let result = task
+            .await
+            .map_err(|e| CoreError::new(CoreErrorKind::Other, format!("the schema call stopped unexpectedly: {e}")))?;
+        drop(token);
+        result
+    }
+
+    /// dbx answers a schema call on most other kinds with an empty list, which
+    /// the tree would show as "(no schemas)": say plainly that it is not
+    /// supported yet, without calling dbx.
+    async fn ensure_browsable(&self, id: &ConnectionId) -> Result<(), CoreError> {
+        let state = self.state().await?;
+        let kind = state.configs.read().await.get(&id.0).map(|c| kind_of(c.db_type));
+        match kind {
+            Some(kind) if kind != DbKind::Postgres => {
+                Err(CoreError::new(CoreErrorKind::Other, format!("Browsing {} is not supported yet.", kind.display_name())))
+            }
+            // Postgres, or no such connection (dbx says so itself).
+            _ => Ok(()),
+        }
+    }
+
     fn store_failure(&self, doing: &str, raw: &str) -> CoreError {
         let source = self.options.as_ref().map(|o| o.key_source).unwrap_or(KeySource::Platform);
         classify(raw, source).unwrap_or_else(|| store_error(self.data_dir(), doing, raw))
@@ -518,10 +573,14 @@ fn config_from_draft(draft: &ConnectionDraft, existing: Option<ConnectionConfig>
 /// dbx's words for a failed connection, with every secret we know of blanked
 /// out and the length capped. Drivers can echo more than they should.
 fn scrub(message: &str, secrets: &[&str]) -> String {
-    let mut out = display_safe(message.trim());
+    // The secrets go first, as they were typed: cleaning the text first would
+    // change a password that holds a control character, and it would no longer
+    // be found.
+    let mut out = message.trim().to_string();
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         out = out.replace(secret, "••••");
     }
+    let mut out = display_safe(&out);
     if out.chars().count() > 600 {
         out = out.chars().take(599).collect::<String>() + "…";
     }
@@ -562,6 +621,30 @@ impl Drop for Probe {
             runtime.spawn(async move { Probe::release(&state, &id, &config).await });
         }
     }
+}
+
+// ---- schema ------------------------------------------------------------------
+
+/// Schemas that belong to the server, not to the user's data.
+fn is_system_schema(name: &str) -> bool {
+    name == "information_schema" || name == "pg_catalog" || name.starts_with("pg_toast") || name.starts_with("pg_temp_")
+}
+
+/// dbx's `table_type` for a relation. Postgres says `BASE TABLE`, `VIEW`,
+/// `MATERIALIZED_VIEW` and `FOREIGN TABLE`; other drivers say `TABLE`.
+fn table_kind(table_type: &str) -> TableKind {
+    match table_type.to_ascii_uppercase().replace(' ', "_").as_str() {
+        "VIEW" => TableKind::View,
+        "MATERIALIZED_VIEW" => TableKind::MaterializedView,
+        "FOREIGN_TABLE" => TableKind::Foreign,
+        _ => TableKind::Table,
+    }
+}
+
+/// A failed metadata call as the tree shows it: dbx's own words, cleaned.
+fn metadata_error(raw: &str, secret: &str) -> CoreError {
+    let kind = if dbx_core::query::is_connection_error(raw) { CoreErrorKind::Connect } else { CoreErrorKind::Other };
+    CoreError::new(kind, scrub(raw, &[secret]))
 }
 
 fn not_yet<T>(slice: &str) -> Result<T, CoreError> {
@@ -640,17 +723,83 @@ impl Core for DbxCore {
         result.map(|_| ()).map_err(|raw| CoreError::new(CoreErrorKind::Connect, scrub(&raw, &[&secret])))
     }
 
-    async fn databases(&self, _id: &ConnectionId) -> Result<Vec<String>, CoreError> {
-        not_yet("04")
+    async fn databases(&self, id: &ConnectionId) -> Result<Vec<String>, CoreError> {
+        self.ensure_browsable(id).await?;
+        let conn = id.0.clone();
+        let list = self
+            .metadata(id, move |state| async move { dbx_core::schema::list_databases_core(&state, &conn).await })
+            .await?;
+        // Names stay exactly as the server has them: they are the paths of the
+        // nodes below, and the painter makes whatever is drawn safe.
+        Ok(list.into_iter().map(|d| d.name).collect())
     }
-    async fn schemas(&self, _at: &DatabasePath) -> Result<Vec<String>, CoreError> {
-        not_yet("04")
+    async fn schemas(&self, at: &DatabasePath) -> Result<Vec<String>, CoreError> {
+        self.ensure_browsable(&at.connection).await?;
+        let (conn, database) = (at.connection.0.clone(), at.database.clone());
+        let list = self
+            .metadata(&at.connection, move |state| async move {
+                dbx_core::schema::list_schemas_core(&state, &conn, &database).await
+            })
+            .await?;
+        Ok(list.into_iter().filter(|name| !is_system_schema(name)).collect())
     }
-    async fn tables(&self, _at: &SchemaPath) -> Result<Vec<Table>, CoreError> {
-        not_yet("04")
+    async fn tables(&self, at: &SchemaPath) -> Result<Vec<Table>, CoreError> {
+        self.ensure_browsable(&at.database.connection).await?;
+        let (conn, database, schema) = (at.database.connection.0.clone(), at.database.database.clone(), at.schema.clone());
+        let list = self
+            .metadata(&at.database.connection, move |state| async move {
+                dbx_core::schema::list_tables_core(&state, &conn, &database, &schema, None, None, None, None, None).await
+            })
+            .await?;
+        // A table with several INHERITS parents comes back once per parent: one
+        // row per name, the first, or two rows would share one node identity.
+        let mut seen = std::collections::HashSet::new();
+        Ok(list
+            .into_iter()
+            // A partition of a partitioned table has its parent named; the
+            // parent is listed, and its partitions would bury everything else.
+            .filter(|t| t.parent_name.is_none())
+            .filter(|t| seen.insert(t.name.clone()))
+            .map(|t| Table { kind: table_kind(&t.table_type), name: t.name })
+            .collect())
     }
-    async fn columns(&self, _at: &TablePath) -> Result<Vec<ColumnInfo>, CoreError> {
-        not_yet("04")
+    async fn columns(&self, at: &TablePath) -> Result<Vec<ColumnInfo>, CoreError> {
+        self.ensure_browsable(&at.schema.database.connection).await?;
+        let schema = &at.schema;
+        let (conn, database, schema_name, table) =
+            (schema.database.connection.0.clone(), schema.database.database.clone(), schema.schema.clone(), at.table.clone());
+        let list = self
+            .metadata(&schema.database.connection, move |state| async move {
+                dbx_core::schema::get_columns_core(&state, &conn, &database, &schema_name, &table).await
+            })
+            .await?;
+        Ok(list
+            .into_iter()
+            .map(|c| ColumnInfo {
+                name: c.name,
+                db_type: c.data_type,
+                nullable: c.is_nullable,
+                primary_key: c.is_primary_key,
+                default: c.column_default,
+            })
+            .collect())
+    }
+    async fn release(&self, at: &DatabasePath) -> Result<(), CoreError> {
+        let state = self.state().await?;
+        let postgres = state.configs.read().await.get(&at.connection.0).is_some_and(|c| kind_of(c.db_type) == DbKind::Postgres);
+        if !postgres {
+            return Ok(());
+        }
+        // dbx keeps one pool per (connection, database) for a Postgres
+        // connection, under the key "<connection id>:<database>"
+        // (`base_pool_key_for_with_catalog` in dbx-core's connection module),
+        // and `remove_pool_by_key` closes that one pool and its bookkeeping
+        // (keepalive task, activity, cancel context) and waits for the close.
+        // The connection's own pool, under the bare connection id, and the
+        // pools of other databases are not touched. A key with no pool is a
+        // no-op.
+        state.remove_pool_by_key(&format!("{}:{}", at.connection.0, at.database)).await;
+        Ok(())
     }
     async fn run(&self, _run: RunId, _request: RunRequest) -> Result<ResultSet, CoreError> {
         not_yet("05")
@@ -711,6 +860,46 @@ mod tests {
         assert!(check_seed_dir(&real, Some(Path::new("/Users/x")), true).is_err());
         // Even when HOME points elsewhere, a desktop-named directory is refused.
         assert!(check_seed_dir(&real, Some(&home), true).is_err(), "HOME moved, override set");
+    }
+
+    #[test]
+    fn system_schemas_are_told_from_the_users_even_when_dbx_lists_them() {
+        for hidden in ["pg_catalog", "information_schema", "pg_toast", "pg_toast_temp_1", "pg_temp_3"] {
+            assert!(is_system_schema(hidden), "{hidden}");
+        }
+        // Lookalikes are the user's: matching is exact, or by the toast and temp prefixes.
+        for shown in ["public", "pg_catalog2", "my_information_schema", "pg_tools", "Pg_Catalog", "other"] {
+            assert!(!is_system_schema(shown), "{shown}");
+        }
+    }
+
+    #[test]
+    fn dbxs_relation_types_map_to_our_kinds() {
+        for (dbx, kind) in [
+            ("BASE TABLE", TableKind::Table),
+            ("TABLE", TableKind::Table),
+            ("VIEW", TableKind::View),
+            ("MATERIALIZED_VIEW", TableKind::MaterializedView),
+            ("FOREIGN TABLE", TableKind::Foreign),
+            ("something new", TableKind::Table),
+        ] {
+            assert_eq!(table_kind(dbx), kind, "{dbx}");
+        }
+    }
+
+    #[test]
+    fn a_metadata_failure_hides_the_password_and_connection_errors_are_told_from_others() {
+        let e = metadata_error("PostgreSQL connection failed: password authentication failed (hunter2)\u{1b}[31m", "hunter2");
+        assert!(!e.message.contains("hunter2") && !e.message.chars().any(char::is_control), "{e:?}");
+        assert_eq!(e.kind, CoreErrorKind::Connect);
+        assert_eq!(metadata_error("relation \"x\" does not exist", "").kind, CoreErrorKind::Other);
+    }
+
+    #[test]
+    fn a_password_with_a_control_character_in_it_is_still_hidden() {
+        let shown = scrub("auth failed for pw\u{1b}[31mx and then pw\u{1b}[31mx again", &["pw\u{1b}[31mx"]);
+        assert!(!shown.contains("pw") && !shown.contains('['), "{shown}");
+        assert_eq!(shown, "auth failed for •••• and then •••• again");
     }
 
     #[test]

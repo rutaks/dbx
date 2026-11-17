@@ -42,6 +42,16 @@ pub enum DbKind {
 }
 
 impl DbKind {
+    /// The kind as a person writes it.
+    pub fn display_name(&self) -> &str {
+        match self {
+            DbKind::Postgres => "PostgreSQL",
+            DbKind::MySql => "MySQL",
+            DbKind::Sqlite => "SQLite",
+            DbKind::Other(name) => name,
+        }
+    }
+
     /// The short name the sidebar shows.
     pub fn label(&self) -> &str {
         match self {
@@ -150,6 +160,22 @@ pub struct TablePath {
 pub enum TableKind {
     Table,
     View,
+    MaterializedView,
+    /// A table whose rows live in another server.
+    Foreign,
+}
+
+impl TableKind {
+    /// What the tree says next to a name that is not a plain table, or `None`
+    /// for a plain table (a table is the default and needs no label).
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            TableKind::Table => None,
+            TableKind::View => Some("view"),
+            TableKind::MaterializedView => Some("matview"),
+            TableKind::Foreign => Some("foreign"),
+        }
+    }
 }
 
 /// A column of a table, as the schema tree shows it. Not to be confused with
@@ -293,6 +319,11 @@ pub trait Core: Send + Sync {
     async fn schemas(&self, at: &DatabasePath) -> Result<Vec<String>, CoreError>;
     async fn tables(&self, at: &SchemaPath) -> Result<Vec<Table>, CoreError>;
     async fn columns(&self, at: &TablePath) -> Result<Vec<ColumnInfo>, CoreError>;
+    /// Lets go of the server connections the schema calls opened on one
+    /// database (the tree collapsed it), so browsing many databases does not
+    /// hold a slot on the server for each. Nothing is lost: the next call on
+    /// that database opens what it needs again.
+    async fn release(&self, at: &DatabasePath) -> Result<(), CoreError>;
 
     /// Runs until done, failed, or `cancel(run)` is called. After a cancel it
     /// returns `CoreErrorKind::Cancelled` promptly.

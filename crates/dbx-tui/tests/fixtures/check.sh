@@ -17,7 +17,7 @@ check pagila "select count(*) from information_schema.tables where table_schema 
 check pagila "select count(*) from film" 1000
 check pagila "select title from film where film_id = 1" "ACADEMY DINOSAUR"
 check edge "select string_agg(table_schema || '.' || table_name, ',' order by table_schema || '.' || table_name collate \"C\") from information_schema.tables where table_schema in ('public', 'other')" \
-  "other.things,public.Mixed Case,public.composite_key,public.empty_table,public.no_pk,public.numbers,public.other_types,public.temporal,public.text_values"
+  "other.things,public.Mixed Case,public.composite_key,public.empty_table,public.inherit_child,public.inherit_parent_a,public.inherit_parent_b,public.no_pk,public.numbers,public.other_types,public.temporal,public.text_values"
 check edge "select string_agg(id || ':' || coalesce('[' || v || ']', 'NULL'), ',' order by id) from text_values where id <= 4" "1:NULL,2:[],3:[NULL],4:[ ]"
 check edge "select big::text from numbers where id = 1" 9007199254740993
 check edge "select exact::text from numbers where id = 1" 12345678901234567890.123456789
@@ -25,5 +25,6 @@ check edge "select approx::text from numbers where id in (3, 4) order by id" "Na
 Infinity"
 check edge "select v from text_values where id = 7" "日本語 😀 👨‍👩‍👧 ａｂｃ"
 check edge "select count(*) from empty_table" 0
+check edge "select count(*) from pg_inherits where inhrelid = 'inherit_child'::regclass" 2
 check edge "select \"select\" from \"Mixed Case\"" reserved
 echo "OK fixtures: $n checks"

@@ -63,6 +63,8 @@ impl KeyCombo {
             "home" => KeyCode::Home,
             "end" => KeyCode::End,
             "backtab" => KeyCode::BackTab,
+            "pageup" => KeyCode::PageUp,
+            "pagedown" => KeyCode::PageDown,
             "up" => KeyCode::Up,
             "down" => KeyCode::Down,
             "left" => KeyCode::Left,
@@ -98,6 +100,8 @@ impl fmt::Display for KeyCombo {
             KeyCode::Home => f.write_str("home"),
             KeyCode::End => f.write_str("end"),
             KeyCode::BackTab => f.write_str("backtab"),
+            KeyCode::PageUp => f.write_str("pageup"),
+            KeyCode::PageDown => f.write_str("pagedown"),
             KeyCode::Char(c) => write!(f, "{c}"),
             KeyCode::F(n) => write!(f, "f{n}"),
             KeyCode::Up => f.write_str("up"),
@@ -107,6 +111,14 @@ impl fmt::Display for KeyCombo {
             other => write!(f, "{other:?}"),
         }
     }
+}
+
+/// Where an action's keys are read: after the prefix, or directly by the
+/// sidebar when it has focus (it accepts no text, so it needs no prefix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Prefix,
+    Sidebar,
 }
 
 /// A named thing the client can do, to which keys are bound.
@@ -119,6 +131,21 @@ pub enum Action {
     Zoom,
     NewConnection,
     Quit,
+    /// Press the prefix key. Has no binding of its own: the prefix is a key
+    /// (`Keybinds::prefix`); this is what a click on its hint does.
+    OpenPrefix,
+    // The sidebar's own keys.
+    MoveDown,
+    MoveUp,
+    Expand,
+    Collapse,
+    PageDown,
+    PageUp,
+    First,
+    Last,
+    Refresh,
+    EditConnection,
+    RemoveConnection,
 }
 
 impl Action {
@@ -130,19 +157,45 @@ impl Action {
             Action::Zoom => "zoom",
             Action::NewConnection => "new",
             Action::Quit => "quit",
+            Action::OpenPrefix => "prefix",
+            Action::MoveDown | Action::MoveUp => "move",
+            Action::Expand => "expand",
+            Action::Collapse => "collapse",
+            Action::PageDown | Action::PageUp => "page",
+            Action::First => "top",
+            Action::Last => "bottom",
+            Action::Refresh => "refresh",
+            Action::EditConnection => "edit",
+            Action::RemoveConnection => "remove",
+        }
+    }
+
+    pub fn scope(self) -> Scope {
+        match self {
+            Action::FocusLeft
+            | Action::FocusDown
+            | Action::FocusUp
+            | Action::FocusRight
+            | Action::Zoom
+            | Action::NewConnection
+            | Action::Quit
+            | Action::OpenPrefix => Scope::Prefix,
+            _ => Scope::Sidebar,
         }
     }
 }
 
-/// The prefix key and the keys that follow it.
+/// The prefix key and the keys that follow it, and the sidebar's own keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keybinds {
     pub prefix: KeyCombo,
     bindings: Vec<(KeyCombo, Action)>,
+    sidebar: Vec<(KeyCombo, Action)>,
 }
 
 impl Default for Keybinds {
     fn default() -> Self {
+        let key = |s: &str| KeyCombo::parse(s).expect("a default key parses");
         let plain = |c| KeyCombo::new(KeyCode::Char(c), KeyModifiers::NONE);
         Self {
             // Not ctrl+b: this client will often run inside herdr or tmux.
@@ -156,6 +209,29 @@ impl Default for Keybinds {
                 (plain('z'), Action::Zoom),
                 (plain('q'), Action::Quit),
             ],
+            sidebar: vec![
+                (key("j"), Action::MoveDown),
+                (key("down"), Action::MoveDown),
+                (key("k"), Action::MoveUp),
+                (key("up"), Action::MoveUp),
+                (key("enter"), Action::Expand),
+                (key("l"), Action::Expand),
+                (key("right"), Action::Expand),
+                (key("h"), Action::Collapse),
+                (key("left"), Action::Collapse),
+                (key("pagedown"), Action::PageDown),
+                (key("ctrl+d"), Action::PageDown),
+                (key("pageup"), Action::PageUp),
+                (key("ctrl+u"), Action::PageUp),
+                (key("g"), Action::First),
+                (key("home"), Action::First),
+                (key("G"), Action::Last),
+                (key("end"), Action::Last),
+                (key("r"), Action::Refresh),
+                (key("e"), Action::EditConnection),
+                (key("d"), Action::RemoveConnection),
+                (key("delete"), Action::RemoveConnection),
+            ],
         }
     }
 }
@@ -166,34 +242,66 @@ impl Keybinds {
         self.bindings.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
 
-    /// The key bound to `action`, as shown, if any.
-    pub fn key_for(&self, action: Action) -> Option<String> {
-        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.to_string())
+    /// The action the sidebar binds to `key`.
+    pub fn lookup_sidebar(&self, key: &KeyCombo) -> Option<Action> {
+        self.sidebar.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
 
-    /// Replaces every key bound to `action` with `key`. Returns false, and
-    /// changes nothing, if `key` does not parse.
+    fn table(&self, scope: Scope) -> &[(KeyCombo, Action)] {
+        match scope {
+            Scope::Prefix => &self.bindings,
+            Scope::Sidebar => &self.sidebar,
+        }
+    }
+
+    /// The key bound to `action`, as shown, if any. When several keys do the
+    /// same thing, the first.
+    pub fn key_for(&self, action: Action) -> Option<String> {
+        self.table(action.scope()).iter().find(|(_, a)| *a == action).map(|(k, _)| k.to_string())
+    }
+
+    /// Replaces every key bound to `action` with `key`, taking the key from
+    /// whatever else it did in the same scope. Returns false, and changes
+    /// nothing, if `key` does not parse.
     pub fn rebind(&mut self, action: Action, key: &str) -> bool {
         let Some(combo) = KeyCombo::parse(key) else { return false };
-        self.bindings.retain(|(k, a)| *a != action && *k != combo);
-        self.bindings.push((combo, action));
+        let table = match action.scope() {
+            Scope::Prefix => &mut self.bindings,
+            Scope::Sidebar => &mut self.sidebar,
+        };
+        table.retain(|(k, a)| *a != action && *k != combo);
+        table.push((combo, action));
         true
     }
 
-    /// `(keys, description)` pairs for the mode bar, from the live bindings.
-    pub fn hints(&self) -> Vec<(String, &'static str)> {
-        let mut out: Vec<(String, &'static str)> = Vec::new();
+    /// The hints for the mode bar after the prefix, from the live bindings:
+    /// keys that do the same kind of thing share one (`h/j/k/l focus`).
+    pub fn prefix_hints(&self) -> Vec<Hint> {
+        let mut out: Vec<Hint> = Vec::new();
         for (key, action) in &self.bindings {
-            match out.iter_mut().find(|(_, label)| *label == action.label()) {
-                Some((keys, _)) => {
-                    keys.push('/');
-                    keys.push_str(&key.to_string());
-                }
-                None => out.push((key.to_string(), action.label())),
+            match out.iter_mut().find(|h| h.desc == action.label()) {
+                Some(hint) => hint.keys.push((key.to_string(), *action)),
+                None => out.push(Hint { keys: vec![(key.to_string(), *action)], desc: action.label() }),
             }
         }
         out
     }
+
+    /// `(keys, description)` pairs, as text.
+    pub fn hints(&self) -> Vec<(String, &'static str)> {
+        self.prefix_hints()
+            .into_iter()
+            .map(|h| (h.keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join("/"), h.desc))
+            .collect()
+    }
+}
+
+/// One hint in the mode bar: the keys (each with the action it does, so a click
+/// on it can do that) and what they do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hint {
+    pub keys: Vec<(String, Action)>,
+    pub desc: &'static str,
 }
 
 #[cfg(test)]

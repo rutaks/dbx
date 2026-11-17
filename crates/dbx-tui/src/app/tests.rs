@@ -319,11 +319,12 @@ fn a_long_connection_list_stays_inside_the_sidebar_and_off_the_mode_bar() {
     let mut app = ready_app();
     app.model.connections = Loadable::Ready(many);
     let rows = frame_rows(&mut app, 60, 12);
-    assert_eq!(rows[11].trim_end(), " SIDEBAR   ctrl+g prefix  j/k move  e edit  d remove", "only mode bar text on the mode bar row");
+    assert_eq!(rows[11].trim_end(), " SIDEBAR   enter expand  e edit  d remove  r refresh", "only mode bar text on the mode bar row, and only hints that fit whole");
     assert!(rows[10].contains("conn-"), "the list fills the sidebar down to its last row");
     // Nothing from the list leaks right of the sidebar either.
     let sep = app.ui.hits.sidebar_separator.x as usize;
-    assert!(rows.iter().all(|r| !r.chars().skip(sep + 1).collect::<String>().contains("conn-")));
+    // (The editor's title names the selected connection, so look below it.)
+    assert!(rows.iter().skip(1).all(|r| !r.chars().skip(sep + 1).collect::<String>().contains("conn-")));
 }
 
 #[test]

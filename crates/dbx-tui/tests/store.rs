@@ -16,7 +16,7 @@ mod common;
 use std::path::Path;
 
 use common::*;
-use dbx_tui::core::{Connection, ConnectionDraft, Core, CoreErrorKind, DbKind, DbxCore, StoreOptions};
+use dbx_tui::core::{Connection, ConnectionDraft, Core, CoreErrorKind, DatabasePath, DbKind, DbxCore, SchemaPath, StoreOptions, TablePath};
 
 #[tokio::test]
 async fn an_empty_directory_opens_and_returns_zero_connections() {
@@ -552,5 +552,73 @@ async fn a_save_and_a_remove_of_the_same_connection_never_leave_the_runtime_and_
         for c in &runtime {
             core.remove_connection(&c.id).await.unwrap();
         }
+    }
+}
+
+// ---- slice 04: abandoning a metadata call -----------------------------------
+
+#[test]
+fn abandoning_a_listing_that_hangs_stops_dbxs_work_at_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncReadExt;
+    let s = Scratch::new();
+    let core = Arc::new(s.core());
+    // The client's own runtime, so the blocking threads have the stack dbx needs.
+    let rt = dbx_tui::shell::runtime().expect("runtime");
+    rt.block_on(async {
+        // A server that accepts, never answers, and counts the sockets still open.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted, open) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (a, o) = (accepted.clone(), open.clone());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                a.fetch_add(1, SeqCst);
+                o.fetch_add(1, SeqCst);
+                let o = o.clone();
+                tokio::spawn(async move {
+                    let mut sink = [0u8; 256];
+                    while matches!(socket.read(&mut sink).await, Ok(n) if n > 0) {}
+                    o.fetch_sub(1, SeqCst);
+                });
+            }
+        });
+        let id = core.save_connection(&ConnectionDraft { port: Some(port), ..draft("hangs") }).await.unwrap().id;
+
+        // The server never answers: the listing waits. Give up on it.
+        let waited = tokio::time::timeout(Duration::from_millis(500), core.databases(&id)).await;
+        assert!(waited.is_err(), "the listing is still waiting after 500 ms");
+        assert!(accepted.load(SeqCst) >= 1, "dbx reached the server");
+
+        // Dropping the future must stop dbx's work: its sockets close. Left to
+        // run, it would keep them until dbx's own connect timeout (10 s).
+        let gave_up = Instant::now();
+        while open.load(SeqCst) > 0 && gave_up.elapsed() < Duration::from_secs(3) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(open.load(SeqCst), 0, "{} socket(s) still open 3 s after the listing was abandoned", open.load(SeqCst));
+        server.abort();
+    });
+}
+
+#[tokio::test]
+async fn a_connection_that_is_not_postgres_says_it_cannot_be_browsed_yet_and_dbx_is_not_asked() {
+    let s = Scratch::new();
+    let core = s.core();
+    // Nothing listens on port 1: a call that reached dbx would fail to connect.
+    for (kind, name) in [(DbKind::MySql, "MySQL"), (DbKind::Sqlite, "SQLite")] {
+        let draft = ConnectionDraft { kind: kind.clone(), port: Some(1), ..draft("other") };
+        let id = core.save_connection(&draft).await.expect("save").id;
+        let expected = format!("Browsing {name} is not supported yet.");
+        let at = DatabasePath { connection: id.clone(), database: "x".into() };
+        let schema = SchemaPath { database: at.clone(), schema: "s".into() };
+        let table = TablePath { schema: schema.clone(), table: "t".into() };
+        assert_eq!(core.databases(&id).await.unwrap_err().message, expected);
+        assert_eq!(core.schemas(&at).await.unwrap_err().message, expected);
+        assert_eq!(core.tables(&schema).await.unwrap_err().message, expected);
+        assert_eq!(core.columns(&table).await.unwrap_err().message, expected);
+        core.release(&at).await.expect("releasing nothing is fine");
     }
 }

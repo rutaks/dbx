@@ -5,7 +5,15 @@
 
 use ratatui::layout::Rect;
 
+use super::keys::Action;
 use super::PaneId;
+
+/// A hint in the mode bar as drawn: where it is, and what a click on it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HintHit {
+    pub rect: Rect,
+    pub action: Action,
+}
 
 /// Every clickable or measurable rectangle of the last frame. A rectangle that
 /// is not on screen (a hidden pane when another is zoomed) is empty.
@@ -25,8 +33,11 @@ pub struct HitMap {
     pub mode_bar: Rect,
 }
 
-const SIDEBAR_WIDTH: u16 = 26;
-const WIDE: u16 = 60;
+/// The sidebar and its separator take about 30% of the width, between these
+/// (wide enough for a column row a few levels down: `◆ film_id` and
+/// `mpaa_rating ?`), so a narrow terminal keeps a usable editor.
+const SIDEBAR_MIN: u16 = 26;
+const SIDEBAR_MAX: u16 = 34;
 
 impl HitMap {
     pub fn compute(area: Rect, focus: PaneId, zoomed: bool) -> HitMap {
@@ -46,7 +57,8 @@ impl HitMap {
         }
 
         // Sidebar column plus its separator; none if there is no room for both.
-        let total = if main.width >= WIDE { SIDEBAR_WIDTH } else { main.width / 3 };
+        // Never more than half the screen, whatever the minimum says.
+        let total = (main.width * 30 / 100).clamp(SIDEBAR_MIN, SIDEBAR_MAX).min(main.width / 2);
         let total = if total >= 2 { total } else { 0 };
         let right_x = main.x + total;
         if total > 0 {

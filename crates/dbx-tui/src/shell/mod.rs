@@ -5,20 +5,49 @@
 
 mod terminal;
 
+use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossterm::event::{Event as TermEvent, EventStream, KeyEventKind};
 use futures::StreamExt;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 use crate::app::requests::RequestId;
+use crate::app::tree::{Listing, NodeId};
 use crate::app::{App, Command, CoreCall, CoreReply, Effects, Event};
 use crate::core::Core;
 
 pub use terminal::TerminalGuard;
+
+/// The Core calls in flight, by request, so the app can abandon one: aborting
+/// the task drops the Core's future, which is what stops a slow listing.
+#[derive(Clone, Default)]
+pub struct Tasks(Arc<Mutex<HashMap<RequestId, AbortHandle>>>);
+
+impl Tasks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, AbortHandle>> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// How many calls are in flight.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn abandon(&self, id: RequestId) {
+        if let Some(handle) = self.lock().remove(&id) {
+            handle.abort();
+        }
+    }
+}
 
 /// Stack size for the runtime's threads. dbx's metadata and export futures
 /// overflow tokio's 2 MiB default; dbx's own heads use 16 MiB
@@ -43,13 +72,14 @@ pub async fn run(core: Arc<dyn Core>) -> io::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<(RequestId, CoreReply)>();
     let mut events = EventStream::new();
     let mut app = App::new();
+    let tasks = Tasks::default();
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
 
     let mut effects = app.start();
     loop {
-        if execute(effects.commands, &core, &tx) {
+        if execute(effects.commands, &core, &tx, &tasks) {
             return Ok(());
         }
         if effects.repaint {
@@ -89,27 +119,53 @@ pub(crate) fn execute(
     commands: Vec<Command>,
     core: &Arc<dyn Core>,
     tx: &mpsc::UnboundedSender<(RequestId, CoreReply)>,
+    tasks: &Tasks,
 ) -> bool {
     let mut quit = false;
     for command in commands {
         match command {
             Command::Quit => quit = true,
             Command::Cancel(run) => core.cancel(run),
-            Command::Core(id, call) => {
-                let (core, tx) = (core.clone(), tx.clone());
+            Command::Abandon(id) => tasks.abandon(id),
+            Command::Release(at) => {
+                let core = core.clone();
+                // Nothing waits for it, and a failure leaves only an idle
+                // connection the server will time out.
                 tokio::spawn(async move {
+                    let _ = core.release(&at).await;
+                });
+            }
+            Command::Core(id, call) => {
+                let (core, tx, done) = (core.clone(), tx.clone(), tasks.clone());
+                // Held while spawning, so a call that finishes at once cannot
+                // forget itself before it has been remembered.
+                let mut running = tasks.lock();
+                let task = tokio::spawn(async move {
                     let reply = match call {
                         CoreCall::Connections => CoreReply::Connections(core.connections().await),
                         CoreCall::TestConnection(draft) => CoreReply::Tested(core.test_connection(&draft).await),
                         CoreCall::SaveConnection(draft) => CoreReply::Saved(core.save_connection(&draft).await),
                         CoreCall::RemoveConnection(id) => CoreReply::Removed(core.remove_connection(&id).await),
+                        CoreCall::List(node) => CoreReply::Listed(list(core.as_ref(), node).await),
                     };
+                    done.lock().remove(&id);
                     let _ = tx.send((id, reply));
                 });
+                running.insert(id, task.abort_handle());
             }
         }
     }
     quit
+}
+
+/// The Core call that lists `node`'s children.
+async fn list(core: &dyn Core, node: NodeId) -> Result<Listing, crate::core::CoreError> {
+    match node {
+        NodeId::Connection(id) => core.databases(&id).await.map(Listing::Databases),
+        NodeId::Database(at) => core.schemas(&at).await.map(Listing::Schemas),
+        NodeId::Schema(at) => core.tables(&at).await.map(Listing::Tables),
+        NodeId::Table(at) => core.columns(&at).await.map(Listing::Columns),
+    }
 }
 
 /// Terminal events the app understands. Key releases are dropped.
@@ -135,9 +191,59 @@ mod tests {
         let fake = Arc::new(FakeCore::new());
         let core: Arc<dyn Core> = fake.clone();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let quit = execute(vec![Command::Cancel(RunId(1)), Command::Quit, Command::Cancel(RunId(2))], &core, &tx);
+        let quit = execute(vec![Command::Cancel(RunId(1)), Command::Quit, Command::Cancel(RunId(2))], &core, &tx, &Tasks::default());
         assert!(quit);
         assert_eq!(fake.calls(), vec![Call::Cancel(RunId(1)), Call::Cancel(RunId(2))]);
+    }
+
+    #[tokio::test]
+    async fn a_release_command_reaches_the_core_and_waits_for_nothing() {
+        use crate::core::{ConnectionId, DatabasePath};
+        let fake = Arc::new(FakeCore::new());
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let at = DatabasePath { connection: ConnectionId("c".into()), database: "edge".into() };
+        let quit = execute(vec![Command::Release(at.clone())], &core, &tx, &Tasks::default());
+        assert!(!quit);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fake.calls(), vec![Call::Release(at)]);
+        assert!(rx.try_recv().is_err(), "no reply comes back");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_request_is_aborted_so_its_reply_never_arrives_and_a_finished_one_forgets_itself() {
+        use crate::core::{ConnectionId, Scripted};
+        use std::time::Duration;
+        let fake = Arc::new(FakeCore::new());
+        fake.script_databases(Scripted::ok(vec!["slow".into()]).after(Duration::from_secs(5)));
+        fake.script_databases(Scripted::ok(vec!["quick".into()]));
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tasks = Tasks::default();
+        let list = |n: u64| Command::Core(RequestId(n), CoreCall::List(NodeId::Connection(ConnectionId("c".into()))));
+
+        execute(vec![list(1)], &core, &tx, &tasks);
+        tokio::task::yield_now().await;
+        assert_eq!(tasks.len(), 1, "in flight");
+        execute(vec![Command::Abandon(RequestId(1))], &core, &tx, &tasks);
+        assert!(tasks.is_empty(), "abandoning forgets it");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "the aborted call sent no reply");
+
+        execute(vec![list(2)], &core, &tx, &tasks);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let (id, reply) = rx.try_recv().expect("the second call replied");
+        assert_eq!(id, RequestId(2));
+        assert!(matches!(reply, CoreReply::Listed(Ok(Listing::Databases(v))) if v == vec!["quick".to_string()]));
+        assert!(tasks.is_empty(), "a finished call forgets itself");
+        execute(vec![Command::Abandon(RequestId(99))], &core, &tx, &tasks); // unknown: nothing happens
     }
 
     #[test]

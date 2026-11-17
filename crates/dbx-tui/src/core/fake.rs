@@ -48,6 +48,7 @@ pub enum Call {
     Schemas(DatabasePath),
     Tables(SchemaPath),
     Columns(TablePath),
+    Release(DatabasePath),
     Run(RunId),
     Cancel(RunId),
     CloseSession(TabId),
@@ -192,6 +193,11 @@ impl Core for FakeCore {
     async fn columns(&self, at: &TablePath) -> Result<Vec<ColumnInfo>, CoreError> {
         self.record(Call::Columns(at.clone()));
         reply(&self.columns, || unscripted("columns")).await
+    }
+
+    async fn release(&self, at: &DatabasePath) -> Result<(), CoreError> {
+        self.record(Call::Release(at.clone()));
+        Ok(())
     }
 
     async fn run(&self, run: RunId, _request: RunRequest) -> Result<ResultSet, CoreError> {

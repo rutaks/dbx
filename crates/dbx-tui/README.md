@@ -20,6 +20,48 @@ directory keeps dbx from even looking for its per-user key file. Without
 (`~/Library/Application Support/com.dbx.app` on macOS) and its key from the
 login keychain.
 
+## The schema tree (sidebar)
+
+Connection, database, schema, table or view, column, each level loaded on
+demand through `Core::databases`, `schemas`, `tables` and `columns` and cached
+per node (`src/app/tree.rs`). Every database on the server is listed, not only
+the one the connection was saved with. System schemas (`pg_catalog`,
+`information_schema`, `pg_toast*`) and the partitions of a partitioned table
+are left out.
+
+| Key | Does |
+|---|---|
+| `enter` `l` `right` | open the node (loads it once); on an open node, go to its first child |
+| `h` `left` | close the node; on a closed node or a leaf, go to the parent |
+| `j` `k` `down` `up` | move |
+| `pagedown` `ctrl+d` `pageup` `ctrl+u` | a page |
+| `g` `home` / `G` `end` | first / last row |
+| `r` | reload the node under the cursor, which keeps showing what it had until the new listing arrives (on an error line, the node that failed); on a closed node it only drops what was cached, so the next open asks again |
+| `e` `d` `delete` | edit / remove the connection (on a connection row) |
+
+The keys are the sidebar's own (no prefix) and come from `Keybinds`, like the
+mode bar's hints, which are clickable and do what their key does. Mouse: click
+selects, a click on the arrow or a double-click toggles, the wheel scrolls.
+
+Rows: `▸`/`▾`, two columns of indent per level, a state glyph on connections
+(`○` before any call, yellow `●` while the first call runs, green `●` once a
+call worked, red `●` when the last one failed), `view`/`matview`/`foreign` after
+a name that is not a plain table, and for columns `◆` before a primary key's
+name, the type right-aligned in `overlay0`, and `?` after it when the column
+may be NULL. Errors are drawn under the node that failed (up to eight lines),
+followed by `press <key> to retry`, the key taken from the live bindings. A
+node that is loading or reloading has a yellow arrow, and a connection's glyph
+is yellow while a call on it runs, even right after a failure.
+A `▕` scrollbar appears when the list is longer than the pane. Only PostgreSQL
+connections can be browsed so far: any other kind shows "Browsing MySQL is not
+supported yet." under it and asks dbx nothing. The sidebar is about 30% of the
+width, between 26 and 34 columns (with its separator). Closing a database
+node, or a connection, tells the Core to `release` the databases it opened
+(`Core::release`: dbx's `remove_pool_by_key` for `<connection id>:<database>`),
+except the connection's saved default database, so browsing many databases
+does not hold a server connection slot for each. Selecting a row
+sets `Model.active` (connection and database) and the editor's title.
+
 ## Tests
 
 Run every command from the dbx workspace root.
@@ -30,7 +72,7 @@ Run every command from the dbx workspace root.
 | Store: `DbxCore` on scratch stores (layer 1) | `cargo test -p dbx-tui --test store -- --test-threads=1` | nothing external; temp dirs, key files, a local TCP port |
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl |
+| Journeys: the built binary in tmux (layer 5; `add-connection` and `browse-pagila` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live
@@ -53,7 +95,7 @@ without a scratch key, and the one test that needs "no key at all" uses
 `with_managed_keys`, whose key policy never looks at the keychain. Journeys
 do the same through `lib.sh` (`$CLIENT` runs the binary on a scratch store
 with a scratch key); captures go to `$JOURNEY_OUT`, or a temp directory
-printed at the end. The `add-connection` journey needs the fixtures.
+printed at the end. `browse-pagila` also starts a throwaway local socket that accepts and never answers (a listing that hangs, collapsed, and then in flight while the client quits). `examples/seed_store` takes the password from `DBX_TUI_SEED_PASSWORD` when set.
 
 ### Fixture databases
 

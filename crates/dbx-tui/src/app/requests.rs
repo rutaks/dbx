@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use super::tree::NodeId;
 use crate::core::{ConnectionId, TabId};
 
 /// Identifies one Core call from issue to reply.
@@ -18,7 +19,7 @@ pub enum Target {
     /// A query tab's run.
     Run(TabId),
     /// The children of one sidebar node, addressed by path.
-    Children(Vec<String>),
+    Children(NodeId),
     /// A test of the connection form with this serial (one form at a time, but
     /// a closed form's reply must not reach the next one).
     TestConnection(u64),
@@ -50,6 +51,32 @@ impl Requests {
     /// anything new (cancel, closing a tab).
     pub fn supersede(&mut self, target: Target) {
         self.bump(&target);
+    }
+
+    /// Stops tracking `target`: its generation is dropped and every request
+    /// still in flight for it becomes unknown, so its reply is dropped as
+    /// stale. Returns those requests, for the caller to abandon. Used when a
+    /// node collapses or its connection goes away, so the table does not grow
+    /// with every node ever opened. (A later `begin` starts from generation 1
+    /// again, which is safe because no request of the old life is left.)
+    pub fn forget(&mut self, target: &Target) -> Vec<RequestId> {
+        self.forget_where(|t| t == target)
+    }
+
+    /// `forget` for every tracked target `gone` is true of.
+    pub fn forget_where(&mut self, gone: impl Fn(&Target) -> bool) -> Vec<RequestId> {
+        self.generations.retain(|t, _| !gone(t));
+        let mut dropped: Vec<RequestId> = self.pending.iter().filter(|(_, (t, _))| gone(t)).map(|(id, _)| *id).collect();
+        dropped.sort_by_key(|id| id.0);
+        for id in &dropped {
+            self.pending.remove(id);
+        }
+        dropped
+    }
+
+    /// How many targets have a generation: what the table is holding on to.
+    pub fn tracked(&self) -> usize {
+        self.generations.len()
     }
 
     /// Takes a reply's request off the table. Returns its target when the
@@ -100,10 +127,11 @@ mod tests {
         let mut t = Requests::default();
         let run1 = t.begin(Target::Run(TabId(1)));
         let _run2 = t.begin(Target::Run(TabId(2)));
-        let children = t.begin(Target::Children(vec!["pg".into()]));
+        let node = Target::Children(NodeId::Connection(ConnectionId("pg".into())));
+        let children = t.begin(node.clone());
         t.supersede(Target::Run(TabId(2)));
         assert_eq!(t.finish(run1), Some(Target::Run(TabId(1))));
-        assert_eq!(t.finish(children), Some(Target::Children(vec!["pg".into()])));
+        assert_eq!(t.finish(children), Some(node));
     }
 
     #[test]
@@ -119,5 +147,43 @@ mod tests {
     fn request_ids_are_unique() {
         let mut t = Requests::default();
         assert_ne!(t.begin(Target::Connections), t.begin(Target::Connections));
+    }
+
+    fn node(name: &str) -> Target {
+        Target::Children(NodeId::Connection(ConnectionId(name.into())))
+    }
+
+    #[test]
+    fn forgetting_a_target_drops_its_generation_and_makes_its_reply_stale() {
+        let mut t = Requests::default();
+        let id = t.begin(node("a"));
+        let other = t.begin(node("b"));
+        assert_eq!(t.tracked(), 2);
+        assert_eq!(t.forget(&node("a")), vec![id], "the request that was in flight is handed back");
+        assert_eq!(t.tracked(), 1, "its generation is gone");
+        assert_eq!(t.finish(id), None);
+        assert_eq!(t.finish(other), Some(node("b")), "other targets are untouched");
+    }
+
+    #[test]
+    fn a_target_forgotten_and_begun_again_does_not_accept_the_old_reply() {
+        // Generations restart at 1 after a forget: the old request must not be
+        // mistaken for the new one.
+        let mut t = Requests::default();
+        let old = t.begin(node("a"));
+        t.forget(&node("a"));
+        let new = t.begin(node("a"));
+        assert_eq!(t.finish(old), None);
+        assert_eq!(t.finish(new), Some(node("a")));
+    }
+
+    #[test]
+    fn forgetting_by_predicate_drops_every_matching_target() {
+        let mut t = Requests::default();
+        let (a1, a2, b) = (t.begin(node("a")), t.begin(Target::Run(TabId(1))), t.begin(node("b")));
+        let dropped = t.forget_where(|target| matches!(target, Target::Children(_)));
+        assert_eq!(dropped, vec![a1, b]);
+        assert_eq!(t.tracked(), 1);
+        assert_eq!(t.finish(a2), Some(Target::Run(TabId(1))));
     }
 }
