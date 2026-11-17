@@ -7,7 +7,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 use super::Painter;
+use crate::core::display_safe;
 use crate::app::overlay::{ButtonSpec, OverlayButton};
 use crate::app::theme::Role;
 
@@ -103,36 +107,41 @@ pub(super) fn buttons(p: &Painter, buf: &mut Buffer, inner: Rect, y: u16, specs:
     out
 }
 
-/// Greedy word wrap by characters. A word longer than the width is cut.
+/// Greedy word wrap by display width (wide characters take two columns). A
+/// word longer than the width is cut; text with no spaces, as Japanese is
+/// written, is cut at the width. Control characters are replaced.
 pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     if width == 0 {
         return lines;
     }
     for para in text.split('\n') {
-        let mut line = String::new();
+        let para = display_safe(para);
+        let (mut line, mut line_w) = (String::new(), 0usize);
         for word in para.split_whitespace() {
-            let mut word: String = word.to_string();
+            let mut word = word.to_string();
             loop {
-                let len = line.chars().count();
-                let wlen = word.chars().count();
-                if len == 0 && wlen <= width {
+                let w = UnicodeWidthStr::width(word.as_str());
+                if line_w == 0 && w <= width {
                     line = word;
+                    line_w = w;
                     break;
                 }
-                if len > 0 && len + 1 + wlen <= width {
+                if line_w > 0 && line_w + 1 + w <= width {
                     line.push(' ');
                     line.push_str(&word);
+                    line_w += 1 + w;
                     break;
                 }
-                if len > 0 {
+                if line_w > 0 {
                     lines.push(std::mem::take(&mut line));
+                    line_w = 0;
                     continue;
                 }
-                // A single word wider than a line: cut it.
-                let head: String = word.chars().take(width).collect();
-                word = word.chars().skip(width).collect();
+                // A single word wider than a line: cut it at the width.
+                let (head, rest) = split_at_width(&word, width);
                 lines.push(head);
+                word = rest;
                 if word.is_empty() {
                     break;
                 }
@@ -141,6 +150,22 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+/// The first part of `word` that fits `width` columns (at least one grapheme),
+/// and the rest.
+fn split_at_width(word: &str, width: usize) -> (String, String) {
+    let mut used = 0;
+    let mut end = 0;
+    for g in word.graphemes(true) {
+        let w = UnicodeWidthStr::width(g);
+        if used + w > width && end > 0 {
+            break;
+        }
+        used += w;
+        end += g.len();
+    }
+    (word[..end].to_string(), word[end..].to_string())
 }
 
 #[cfg(test)]

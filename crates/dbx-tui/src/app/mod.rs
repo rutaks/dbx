@@ -1,15 +1,20 @@
 //! The pure part of the client: state, `update(event) -> effects`, and
 //! `view(frame)`. No tokio, no terminal I/O, no dbx types.
 
+mod connection_ui;
+pub mod form;
 pub mod keys;
 pub mod layout;
 pub mod overlay;
 pub mod requests;
+pub mod text_field;
 pub mod theme;
 mod view;
 
 #[cfg(test)]
 mod connections_tests;
+#[cfg(test)]
+mod form_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
@@ -20,10 +25,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 
-use crate::core::{Connection, CoreError, RunId};
+use crate::core::{Connection, ConnectionDraft, ConnectionId, CoreError, RunId};
 use keys::{Action, KeyCombo, Keybinds};
 use layout::HitMap;
-use overlay::{ErrorOverlay, Overlay, OverlayAction, OverlayButton};
+use overlay::{ErrorOverlay, FieldHit, Overlay, OverlayAction, OverlayButton};
 use requests::{RequestId, Requests, Target};
 use theme::Palette;
 
@@ -78,6 +83,16 @@ pub struct SidebarUi {
     pub scroll: usize,
 }
 
+/// A short message at the foot of the sidebar, for what does not deserve an
+/// overlay or must not disturb one that is open. Cleared by the next key the
+/// sidebar takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarNote {
+    pub text: String,
+    /// Something the user asked for failed (red), rather than a hint (yellow).
+    pub failure: bool,
+}
+
 /// Presentation only.
 #[derive(Debug)]
 pub struct Ui {
@@ -94,6 +109,14 @@ pub struct Ui {
     pub hits: HitMap,
     /// The open overlay's buttons as last drawn. Filled by `view`.
     pub overlay_buttons: Vec<OverlayButton>,
+    /// The open form's rows as last drawn, for clicks. Filled by `view`.
+    pub overlay_fields: Vec<FieldHit>,
+    /// The serial the next form gets.
+    pub next_form_serial: u64,
+    /// The connection the cursor was on when a reload began, so it can be put
+    /// back on the same one (by id) when the new list arrives.
+    pub reload_anchor: Option<ConnectionId>,
+    pub note: Option<SidebarNote>,
 }
 
 #[derive(Debug)]
@@ -106,12 +129,19 @@ pub struct App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreCall {
     Connections,
+    /// Try a connection without saving it. Carries the password the form holds.
+    TestConnection(ConnectionDraft),
+    SaveConnection(ConnectionDraft),
+    RemoveConnection(ConnectionId),
 }
 
 /// The reply to a `CoreCall`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreReply {
     Connections(Result<Vec<Connection>, CoreError>),
+    Tested(Result<(), CoreError>),
+    Saved(Result<Connection, CoreError>),
+    Removed(Result<(), CoreError>),
 }
 
 #[derive(Debug)]
@@ -159,6 +189,10 @@ impl App {
                 overlay: None,
                 hits: HitMap::default(),
                 overlay_buttons: Vec::new(),
+                overlay_fields: Vec::new(),
+                next_form_serial: 1,
+                reload_anchor: None,
+                note: None,
             },
         }
     }
@@ -167,6 +201,9 @@ impl App {
     /// the earlier request's reply becomes stale.
     pub fn start(&mut self) -> Effects {
         let id = self.model.requests.begin(Target::Connections);
+        if let Some(selected) = self.selected_connection().map(|c| c.id.clone()) {
+            self.ui.reload_anchor = Some(selected);
+        }
         self.model.connections = Loadable::Loading;
         Effects { repaint: true, commands: vec![Command::Core(id, CoreCall::Connections)] }
     }
@@ -190,7 +227,7 @@ impl App {
             // Routing order: overlay, then prefix mode, then the focused pane.
             Event::Key(key) if self.ui.overlay.is_some() => self.on_overlay_key(key, &mut fx),
             Event::Mouse(mouse) if self.ui.overlay.is_some() => self.on_overlay_mouse(mouse, &mut fx),
-            Event::Paste(_) if self.ui.overlay.is_some() => {}
+            Event::Paste(text) if self.ui.overlay.is_some() => self.on_overlay_paste(&text, &mut fx),
             Event::Key(key) => self.on_key(key, now, &mut fx),
             Event::Mouse(mouse) => self.on_mouse(mouse, &mut fx),
             Event::Resize(..) => fx.repaint = true,
@@ -247,7 +284,17 @@ impl App {
 
     /// The sidebar takes navigation keys directly: it accepts no text.
     fn on_sidebar_key(&mut self, combo: KeyCombo, fx: &mut Effects) {
+        if self.ui.note.take().is_some() {
+            fx.repaint = true;
+        }
         let Loadable::Ready(list) = &self.model.connections else { return };
+        if combo.mods.is_empty() && !list.is_empty() {
+            match combo.code {
+                KeyCode::Char('e') => return self.open_edit_form(fx),
+                KeyCode::Char('d') | KeyCode::Delete => return self.open_remove_confirm(fx),
+                _ => {}
+            }
+        }
         let last = list.len().saturating_sub(1);
         let cursor = &mut self.ui.sidebar.cursor;
         let moved = match combo.code {
@@ -270,6 +317,10 @@ impl App {
             (Action::FocusUp, Results) => Some(Editor),
             (Action::Zoom, _) => {
                 self.ui.zoomed = !self.ui.zoomed;
+                None
+            }
+            (Action::NewConnection, _) => {
+                self.open_new_form();
                 None
             }
             (Action::Quit, _) => {
@@ -334,7 +385,13 @@ impl App {
         let Some(overlay) = &self.ui.overlay else { return };
         let action = overlay.buttons().iter().find(|b| KeyCombo::parse(b.key) == Some(combo)).map(|b| b.action);
         if let Some(action) = action {
-            self.overlay_action(action, fx);
+            return self.overlay_action(action, fx);
+        }
+        match overlay {
+            Overlay::Form(form) if !form.confirm_discard => self.on_form_key(&key, fx),
+            // Backing out one level always works, button or not.
+            Overlay::Failure(_) if combo.code == KeyCode::Esc => self.overlay_action(OverlayAction::Dismiss, fx),
+            _ => {}
         }
     }
 
@@ -342,9 +399,23 @@ impl App {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
         }
-        let hit = self.ui.overlay_buttons.iter().find(|b| b.rect.contains((mouse.column, mouse.row).into()));
+        let at = (mouse.column, mouse.row).into();
+        let hit = self.ui.overlay_buttons.iter().find(|b| b.rect.contains(at));
         if let Some(action) = hit.map(|b| b.action) {
-            self.overlay_action(action, fx);
+            return self.overlay_action(action, fx);
+        }
+        // Anything else outside the buttons and the form's rows does nothing:
+        // not even to the panes behind the overlay.
+        if let Some(hit) = self.ui.overlay_fields.iter().find(|f| f.rect.contains(at)).copied() {
+            self.on_form_click(hit, mouse.column - hit.rect.x, fx);
+        }
+    }
+
+    fn on_overlay_paste(&mut self, text: &str, fx: &mut Effects) {
+        if let Some(Overlay::Form(form)) = &mut self.ui.overlay {
+            if !form.confirm_discard && form.paste(text) {
+                self.form_edited(fx);
+            }
         }
     }
 
@@ -357,17 +428,47 @@ impl App {
                 fx.repaint = true;
             }
             OverlayAction::Quit => fx.commands.push(Command::Quit),
+            OverlayAction::FormSave => self.begin_save(fx),
+            OverlayAction::FormTest => self.begin_test(fx),
+            OverlayAction::FormClose => self.request_close_form(fx),
+            OverlayAction::DiscardYes => self.close_form(fx),
+            OverlayAction::DiscardNo => {
+                if let Some(Overlay::Form(form)) = &mut self.ui.overlay {
+                    form.confirm_discard = false;
+                }
+                fx.repaint = true;
+            }
+            OverlayAction::RemoveYes => self.confirm_remove(fx),
+            OverlayAction::Dismiss => {
+                self.ui.overlay = None;
+                fx.repaint = true;
+            }
         }
     }
 
     fn on_reply(&mut self, id: RequestId, reply: CoreReply, fx: &mut Effects) {
         // A stale reply is dropped without touching state or repainting.
         let Some(target) = self.model.requests.finish(id) else { return };
-        let (Target::Connections, CoreReply::Connections(result)) = (target, reply) else { return };
+        match (target, reply) {
+            (Target::Connections, CoreReply::Connections(result)) => self.on_connections(result),
+            (Target::TestConnection(serial), CoreReply::Tested(result)) => self.on_tested(serial, result),
+            (Target::SaveConnection(serial), CoreReply::Saved(result)) => self.on_saved(serial, result),
+            (Target::RemoveConnection(id), CoreReply::Removed(result)) => self.on_removed(id, result),
+            _ => return,
+        }
+        fx.repaint = true;
+    }
+
+    fn on_connections(&mut self, result: Result<Vec<Connection>, CoreError>) {
         self.model.connections = match result {
             Ok(list) => {
+                // The cursor stays on the same connection, wherever it moved to.
+                let keep = self.ui.reload_anchor.take().or_else(|| self.selected_connection().map(|c| c.id.clone()));
                 let sidebar = &mut self.ui.sidebar;
-                sidebar.cursor = sidebar.cursor.min(list.len().saturating_sub(1));
+                sidebar.cursor = keep
+                    .and_then(|id| list.iter().position(|c| c.id == id))
+                    .unwrap_or(sidebar.cursor)
+                    .min(list.len().saturating_sub(1));
                 Loadable::Ready(list)
             }
             Err(e) => {
@@ -379,6 +480,5 @@ impl App {
                 Loadable::Failed(e)
             }
         };
-        fx.repaint = true;
     }
 }

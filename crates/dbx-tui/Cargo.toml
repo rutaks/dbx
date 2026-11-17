@@ -14,7 +14,7 @@ name = "dbx-tui"
 path = "src/main.rs"
 
 [features]
-# Test and fixture helpers on the production adapter (`DbxCore::seed_connection`).
+# Test and fixture helpers on the production adapter (`DbxCore::seed_config`, ...).
 # Never enabled in the client binary; tests get it through the self
 # dev-dependency below.
 test-support = []
@@ -31,6 +31,11 @@ ratatui = "0.30"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+# Single-line text fields: grapheme clusters for the cursor, display widths for
+# scrolling and clicks. Both are already in the workspace lock.
+unicode-segmentation = "1"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 dbx-tui = { path = ".", features = ["test-support"] }
@@ -46,3 +51,8 @@ path = "tests/store.rs"
 [[example]]
 name = "seed_store"
 required-features = ["test-support"]
+
+# Layer 1 against the Docker fixtures (tests/fixtures/up.sh), also serial.
+[[test]]
+name = "live"
+path = "tests/live.rs"

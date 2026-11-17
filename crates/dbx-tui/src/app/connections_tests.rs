@@ -14,12 +14,14 @@ pub fn conn(name: &str, kind: DbKind) -> Connection {
         host: "localhost".into(),
         port: Some(5432),
         database: None,
+        username: "postgres".into(),
+        tls: false,
         production: false,
     }
 }
 
 /// The sidebar's text, one string per screen row, without the separator.
-fn sidebar_rows(h: &mut Harness, w: u16, rows: u16) -> Vec<String> {
+pub(super) fn sidebar_rows(h: &mut Harness, w: u16, rows: u16) -> Vec<String> {
     let screen = frame_rows(&mut h.app, w, rows);
     let r = h.app.ui.hits.sidebar;
     screen
@@ -51,16 +53,15 @@ async fn three_connections_from_the_core_render_as_three_rows_with_name_and_kind
 }
 
 #[tokio::test]
-async fn zero_connections_render_the_empty_state_saying_what_to_do_and_naming_no_dead_key() {
+async fn zero_connections_render_the_empty_state_saying_what_to_do_and_naming_the_key_that_does_it() {
     let mut h = Harness::start(FakeCore::empty());
     h.settle().await;
     let text = sidebar_rows(&mut h, 100, 30).join("\n");
     assert!(text.contains("No connections yet."), "{text}");
-    // Adding a connection arrives in slice 03; until then the sidebar points to
-    // where one can be added and shows no key that would do nothing
-    // (design sections 12 and 13).
-    assert!(text.contains("Add one in the dbx"), "{text}");
-    assert!(!text.contains("ctrl+g"), "{text}");
+    // Adding a connection exists now (slice 03), so the sidebar names its key,
+    // read from the live bindings (design sections 12 and 13).
+    assert!(text.contains("Add one with ctrl+g n"), "{text}");
+    assert!(!text.contains("dbx app"), "{text}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -200,7 +201,7 @@ async fn a_store_error_opens_the_overlay_but_other_failures_stay_in_the_sidebar(
     }
 }
 
-async fn listed(names: &[&str]) -> Harness {
+pub(super) async fn listed(names: &[&str]) -> Harness {
     let fake = FakeCore::new();
     fake.script_connections(Scripted::ok(names.iter().map(|n| conn(n, DbKind::Postgres)).collect()));
     let mut h = Harness::start(fake);
@@ -209,7 +210,7 @@ async fn listed(names: &[&str]) -> Harness {
 }
 
 /// The screen row of the sidebar's cursor (the row drawn on `selection_bg`).
-fn cursor_row(h: &mut Harness) -> Option<String> {
+pub(super) fn cursor_row(h: &mut Harness) -> Option<String> {
     use super::theme::Role;
     let rows = frame_rows(&mut h.app, 100, 30);
     let r = h.app.ui.hits.sidebar;

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::TabId;
+use crate::core::{ConnectionId, TabId};
 
 /// Identifies one Core call from issue to reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,6 +19,13 @@ pub enum Target {
     Run(TabId),
     /// The children of one sidebar node, addressed by path.
     Children(Vec<String>),
+    /// A test of the connection form with this serial (one form at a time, but
+    /// a closed form's reply must not reach the next one).
+    TestConnection(u64),
+    /// A save from the connection form with this serial.
+    SaveConnection(u64),
+    /// The removal of one saved connection.
+    RemoveConnection(ConnectionId),
 }
 
 #[derive(Debug, Default)]

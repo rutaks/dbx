@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dbx_core::connection::AppState;
+use dbx_core::connection::{
+    connection_configs_pool_equivalent, connection_configs_session_credentials_compatible, AppState,
+};
+use dbx_core::runtime_config::{is_transient_runtime_config_id, TEST_PROBE_ID_PREFIX};
 use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::persistence::secret_codec::SecretKeyPolicy;
 use dbx_core::storage::{MigrationPreflight, Storage};
@@ -156,20 +159,42 @@ fn resolved(path: &Path) -> PathBuf {
 pub struct DbxCore {
     options: Result<StoreOptions, CoreError>,
     state: Mutex<Option<Arc<AppState>>>,
+    policy: SecretKeyPolicy,
+    /// Held for the whole of a save or a remove: each reads the saved config,
+    /// writes the store and then updates dbx's runtime list, and two of them
+    /// interleaved can leave the runtime and the store disagreeing.
+    mutations: Mutex<()>,
+}
+
+/// Runs a future on a blocking-pool thread. dbx's store calls can block (the
+/// macOS keychain read on a first password save waits for as long as its
+/// prompt is up), and must not hold a runtime worker while they do.
+async fn blocking<T: Send + 'static>(fut: impl std::future::Future<Output = T> + Send + 'static) -> Result<T, CoreError> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || handle.block_on(fut))
+        .await
+        .map_err(|e| CoreError::new(CoreErrorKind::Other, format!("the store call stopped unexpectedly: {e}")))
 }
 
 impl DbxCore {
     pub fn new(options: StoreOptions) -> Self {
-        DbxCore { options: Ok(options), state: Mutex::new(None) }
+        DbxCore { options: Ok(options), state: Mutex::new(None), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()) }
     }
 
     /// The client's DbxCore: the store named by the environment. If that
     /// cannot be worked out, every call fails with the reason.
     pub fn from_env() -> Self {
-        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None) }
+        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()) }
     }
 
+    /// Keys only from the environment or the data directory, never the OS
+    /// keychain (dbx-web's `ManagedDataDir` policy). Tests only: it is how a
+    /// test reaches "no key available" without asking the keychain.
     #[cfg(feature = "test-support")]
+    pub fn with_managed_keys(options: StoreOptions) -> Self {
+        DbxCore { policy: SecretKeyPolicy::ManagedDataDir, ..Self::new(options) }
+    }
+
     fn data_dir(&self) -> &Path {
         self.options.as_ref().map(|o| o.data_dir.as_path()).unwrap_or(Path::new(""))
     }
@@ -184,30 +209,73 @@ impl DbxCore {
         // as its access prompt is up, and dbx sleeps between WAL retries. Run
         // it on a blocking-pool thread (16 MiB stack, like every runtime
         // thread) so timers, the event loop and signals never stall.
-        let (dir, create, source) = (options.data_dir.clone(), options.create_if_missing, options.key_source);
+        let (dir, create, source, policy) =
+            (options.data_dir.clone(), options.create_if_missing, options.key_source, self.policy);
         let handle = tokio::runtime::Handle::current();
-        let state = tokio::task::spawn_blocking(move || handle.block_on(open(&dir, create, source))).await.map_err(|e| {
+        let state = tokio::task::spawn_blocking(move || handle.block_on(open(&dir, create, source, policy))).await.map_err(|e| {
             CoreError::new(CoreErrorKind::Other, format!("opening the store stopped unexpectedly: {e}"))
         })??;
         *slot = Some(state.clone());
         Ok(state)
     }
 
-    /// Saves a connection straight to the store, for tests and fixtures only
-    /// (feature `test-support`).
-    /// Adding connections properly, with dbx's runtime bookkeeping, is slice
-    /// 03's `save_connection`.
+    /// Saves a connection config exactly as given, as another dbx head would
+    /// have written it (one with SSH layers or options this client does not
+    /// edit). Tests only (feature `test-support`).
     #[cfg(feature = "test-support")]
-    pub async fn seed_connection(&self, draft: &ConnectionDraft) -> Result<Connection, CoreError> {
+    pub async fn seed_config(&self, config: serde_json::Value) -> Result<ConnectionId, CoreError> {
         let state = self.state().await?;
-        let config = config_from_draft(draft)?;
-        state.storage.save_connections(std::slice::from_ref(&config)).await.map_err(|raw| {
-            let source = self.options.as_ref().map(|o| o.key_source).unwrap_or(KeySource::Platform);
-            classify(&raw, source).unwrap_or_else(|| store_error(self.data_dir(), "save a connection", &raw))
-        })?;
-        let connection = to_connection(&config);
+        let config: ConnectionConfig = serde_json::from_value(config)
+            .map_err(|e| CoreError::new(CoreErrorKind::Other, format!("dbx rejected the connection: {e}")))?;
+        state.storage.save_connections(std::slice::from_ref(&config)).await.map_err(|raw| self.store_failure("seed a connection", &raw))?;
+        let id = ConnectionId(config.id.clone());
         state.configs.write().await.insert(config.id.clone(), config);
-        Ok(connection)
+        Ok(id)
+    }
+
+    /// dbx's runtime copy of a connection as JSON, password included. Tests
+    /// only: it is how a test sees which fields an edit kept.
+    #[cfg(feature = "test-support")]
+    pub async fn runtime_config(&self, id: &ConnectionId) -> Option<serde_json::Value> {
+        let state = self.state().await.ok()?;
+        let configs = state.configs.read().await;
+        configs.get(&id.0).and_then(|c| serde_json::to_value(c).ok())
+    }
+
+    /// Every id in dbx's runtime connection list, temporary ones included.
+    /// Tests only: `connections()` hides the temporary ones.
+    #[cfg(feature = "test-support")]
+    pub async fn runtime_config_ids(&self) -> Vec<String> {
+        let Ok(state) = self.state().await else { return Vec::new() };
+        let mut ids: Vec<String> = state.configs.read().await.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Runs `select 1` on a saved connection through dbx's pool, until `run`
+    /// exists (slice 05). Tests only: it proves a stored password decrypts
+    /// and that a connection's current settings are the ones in use.
+    #[cfg(feature = "test-support")]
+    pub async fn probe_select_one(&self, id: &ConnectionId) -> Result<(), CoreError> {
+        let state = self.state().await?;
+        let database = state.configs.read().await.get(&id.0).and_then(|c| c.database.clone()).unwrap_or_default();
+        dbx_core::query::execute_sql_statement_with_options_typed(
+            &state,
+            &id.0,
+            &database,
+            "select 1",
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| CoreError::new(CoreErrorKind::Connect, e.to_string()))
+    }
+
+    fn store_failure(&self, doing: &str, raw: &str) -> CoreError {
+        let source = self.options.as_ref().map(|o| o.key_source).unwrap_or(KeySource::Platform);
+        classify(raw, source).unwrap_or_else(|| store_error(self.data_dir(), doing, raw))
     }
 }
 
@@ -219,7 +287,7 @@ impl DbxCore {
 /// EXISTS` and added columns), exactly as every dbx head does on start. On a
 /// store already at this dbx version those statements change nothing. It
 /// never migrates legacy data: a store that needs that is refused.
-async fn open(dir: &Path, create_if_missing: bool, source: KeySource) -> Result<Arc<AppState>, CoreError> {
+async fn open(dir: &Path, create_if_missing: bool, source: KeySource, policy: SecretKeyPolicy) -> Result<Arc<AppState>, CoreError> {
     if !create_if_missing && !dir.is_dir() {
         return Err(CoreError::new(
             CoreErrorKind::Store,
@@ -234,7 +302,7 @@ async fn open(dir: &Path, create_if_missing: bool, source: KeySource) -> Result<
     let storage = Storage::open_unmigrated(&dir.join("dbx.db"))
         .await
         .map_err(|raw| store_error(dir, "open the store", &raw))?
-        .with_secret_key_policy(SecretKeyPolicy::PlatformDefault)
+        .with_secret_key_policy(policy)
         .with_secret_key_creation(true);
     let preflight = storage.inspect_data_migration().await.map_err(|raw| store_error(dir, "inspect the store", &raw))?;
     if !preflight.is_ready() {
@@ -336,7 +404,7 @@ fn key_error(code: &str, dbx_says: Option<&str>, source: KeySource) -> CoreError
 fn store_error(dir: &Path, doing: &str, raw: &str) -> CoreError {
     // dbx's text for a store failure is SQLite's or the file system's; cap it
     // so a pathological message cannot fill the screen.
-    let raw: String = raw.trim().trim_end_matches('.').chars().take(300).collect();
+    let raw: String = display_safe(raw.trim().trim_end_matches('.')).chars().take(300).collect();
     CoreError::new(
         CoreErrorKind::Store,
         format!(
@@ -378,7 +446,6 @@ fn kind_of(db_type: DatabaseType) -> DbKind {
     }
 }
 
-#[cfg(feature = "test-support")]
 fn db_type_name(kind: &DbKind) -> &str {
     match kind {
         DbKind::Postgres => DatabaseType::Postgres.as_str(),
@@ -394,44 +461,107 @@ fn db_type_name(kind: &DbKind) -> &str {
 fn to_connection(c: &ConnectionConfig) -> Connection {
     Connection {
         id: ConnectionId(c.id.clone()),
-        name: c.name.clone(),
+        name: display_safe(&c.name),
         kind: kind_of(c.db_type),
-        host: c.host.clone(),
+        host: display_safe(&c.host),
         port: (c.port != 0).then_some(c.port),
-        database: c.database.clone().filter(|d| !d.is_empty()),
+        database: c.database.as_deref().filter(|d| !d.is_empty()).map(display_safe),
+        username: display_safe(&c.username),
+        tls: c.ssl,
         production: c.is_production,
     }
 }
 
-#[cfg(feature = "test-support")]
-fn config_from_draft(draft: &ConnectionDraft) -> Result<ConnectionConfig, CoreError> {
-    let id = match &draft.id {
-        Some(id) => id.0.clone(),
-        None => new_id(),
+/// The config to store for `draft`: the saved one with only the form's fields
+/// changed, so whatever the form does not show (SSH layers, URL parameters,
+/// notes, colours, timeouts) survives an edit made here. A new connection is
+/// built from dbx's defaults. A blank password keeps the stored one.
+fn config_from_draft(draft: &ConnectionDraft, existing: Option<ConnectionConfig>) -> Result<ConnectionConfig, CoreError> {
+    let mut config = match existing {
+        Some(config) => config,
+        None => {
+            let id = draft.id.as_ref().map_or_else(|| uuid::Uuid::new_v4().to_string(), |id| id.0.clone());
+            let value = serde_json::json!({
+                "id": id,
+                "name": "",
+                "db_type": db_type_name(&draft.kind),
+                "host": "",
+                "port": 0,
+                "username": "",
+                "password": "",
+                "database": null,
+                "ssl": false,
+                "driver_profile": null,
+            });
+            // The error text is serde's and names the field, never its value.
+            serde_json::from_value(value)
+                .map_err(|e| CoreError::new(CoreErrorKind::Other, format!("dbx rejected the connection: {e}")))?
+        }
     };
-    let value = serde_json::json!({
-        "id": id,
-        "name": draft.name,
-        "db_type": db_type_name(&draft.kind),
-        "host": draft.host,
-        "port": draft.port.unwrap_or(0),
-        "username": draft.username,
-        "password": draft.password.clone().unwrap_or_default(),
-        "database": draft.database,
-        "ssl": false,
-        "driver_profile": null,
-        "is_production": draft.production,
+    config.name = draft.name.trim().to_string();
+    config.host = draft.host.trim().to_string();
+    config.port = draft.port.unwrap_or(match config.db_type {
+        DatabaseType::Postgres => 5432,
+        DatabaseType::Mysql => 3306,
+        _ => 0,
     });
-    // The error text is serde's and names the field, never its value.
-    serde_json::from_value(value)
-        .map_err(|e| CoreError::new(CoreErrorKind::Other, format!("dbx rejected the connection: {e}")))
+    config.username = draft.username.trim().to_string();
+    config.database = draft.database.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
+    config.ssl = draft.tls;
+    config.is_production = draft.production;
+    if let Some(password) = draft.password.as_ref().filter(|p| !p.is_empty()) {
+        config.password = password.clone();
+    }
+    Ok(config.canonicalized())
 }
 
-#[cfg(feature = "test-support")]
-fn new_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    format!("dbx-tui-{nanos:x}")
+/// dbx's words for a failed connection, with every secret we know of blanked
+/// out and the length capped. Drivers can echo more than they should.
+fn scrub(message: &str, secrets: &[&str]) -> String {
+    let mut out = display_safe(message.trim());
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        out = out.replace(secret, "••••");
+    }
+    if out.chars().count() > 600 {
+        out = out.chars().take(599).collect::<String>() + "…";
+    }
+    out
+}
+
+/// A temporary runtime entry for testing a connection that is not saved. Its
+/// cleanup runs on every way out: `cleanup().await` on the normal paths, and
+/// from `Drop` (as a spawned task) when the future is dropped mid-test.
+struct Probe {
+    state: Arc<AppState>,
+    id: String,
+    config: ConnectionConfig,
+    armed: bool,
+}
+
+impl Probe {
+    async fn release(state: &AppState, id: &str, config: &ConnectionConfig) {
+        state.remove_connection_pools(id).await;
+        state.reset_connection_transport_for_config(id, config).await;
+        state.configs.write().await.remove(id);
+        state.session_credentials.clear_connection(id);
+    }
+
+    async fn cleanup(&mut self) {
+        Self::release(&self.state, &self.id, &self.config).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (state, id, config) = (self.state.clone(), self.id.clone(), self.config.clone());
+            runtime.spawn(async move { Probe::release(&state, &id, &config).await });
+        }
+    }
 }
 
 fn not_yet<T>(slice: &str) -> Result<T, CoreError> {
@@ -443,19 +573,73 @@ impl Core for DbxCore {
     async fn connections(&self) -> Result<Vec<Connection>, CoreError> {
         let state = self.state().await?;
         let configs = state.configs.read().await;
-        let mut list: Vec<Connection> = configs.values().map(to_connection).collect();
-        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id.cmp(&b.id)));
+        // A connection being tested is in dbx's runtime list under a temporary
+        // id for as long as the test runs; it is not a saved connection.
+        let mut list: Vec<Connection> =
+            configs.iter().filter(|(id, _)| !is_transient_runtime_config_id(id)).map(|(_, c)| to_connection(c)).collect();
+        sort_connections(&mut list);
         Ok(list)
     }
-    async fn save_connection(&self, _draft: &ConnectionDraft) -> Result<Connection, CoreError> {
-        not_yet("03")
+
+    async fn save_connection(&self, draft: &ConnectionDraft) -> Result<Connection, CoreError> {
+        let state = self.state().await?;
+        let _one_at_a_time = self.mutations.lock().await;
+        let existing = match &draft.id {
+            Some(id) => state.configs.read().await.get(&id.0).cloned(),
+            None => None,
+        };
+        let config = config_from_draft(draft, existing)?;
+        // The store first: if it refuses (no key, a locked file), the runtime
+        // list must not move ahead of it.
+        let (st, to_store) = (state.clone(), config.clone());
+        blocking(async move { st.storage.save_connections(std::slice::from_ref(&to_store)).await })
+            .await?
+            .map_err(|raw| self.store_failure("save the connection", &raw))?;
+        // dbx does not re-sync its runtime from the store: do what its own
+        // heads do after a save (`dbx-web/src/routes/connection.rs`).
+        let old = state.configs.write().await.insert(config.id.clone(), config.clone());
+        if let Some(old) = old {
+            if !connection_configs_session_credentials_compatible(&old, &config) {
+                state.session_credentials.clear_connection(&config.id);
+            }
+            if !connection_configs_pool_equivalent(&old, &config) {
+                // Pools opened with the old host, port or password must not serve the next run.
+                let _ = state.remove_connection_pools_detached_checked(&config.id).await;
+            }
+        }
+        Ok(to_connection(&config))
     }
-    async fn remove_connection(&self, _id: &ConnectionId) -> Result<(), CoreError> {
-        not_yet("03")
+
+    async fn remove_connection(&self, id: &ConnectionId) -> Result<(), CoreError> {
+        let state = self.state().await?;
+        let _one_at_a_time = self.mutations.lock().await;
+        let (st, gone) = (state.clone(), id.0.clone());
+        blocking(async move { st.storage.delete_connections(std::slice::from_ref(&gone)).await })
+            .await?
+            .map_err(|raw| self.store_failure("remove the connection", &raw))?;
+        state.configs.write().await.remove(&id.0);
+        state.session_credentials.clear_connection(&id.0);
+        let _ = state.remove_connection_pools_detached_checked(&id.0).await;
+        Ok(())
     }
-    async fn test_connection(&self, _draft: &ConnectionDraft) -> Result<(), CoreError> {
-        not_yet("03")
+
+    async fn test_connection(&self, draft: &ConnectionDraft) -> Result<(), CoreError> {
+        let state = self.state().await?;
+        let existing = match &draft.id {
+            Some(id) => state.configs.read().await.get(&id.0).cloned(),
+            None => None,
+        };
+        let mut config = config_from_draft(draft, existing)?;
+        let secret = config.password.clone();
+        config.id = format!("{TEST_PROBE_ID_PREFIX}{}", uuid::Uuid::new_v4());
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let database = config.database.clone();
+        let mut probe = Probe { state: state.clone(), id: config.id.clone(), config, armed: true };
+        let result = state.get_or_create_pool(&probe.id, database.as_deref()).await;
+        probe.cleanup().await;
+        result.map(|_| ()).map_err(|raw| CoreError::new(CoreErrorKind::Connect, scrub(&raw, &[&secret])))
     }
+
     async fn databases(&self, _id: &ConnectionId) -> Result<Vec<String>, CoreError> {
         not_yet("04")
     }
@@ -527,6 +711,21 @@ mod tests {
         assert!(check_seed_dir(&real, Some(Path::new("/Users/x")), true).is_err());
         // Even when HOME points elsewhere, a desktop-named directory is refused.
         assert!(check_seed_dir(&real, Some(&home), true).is_err(), "HOME moved, override set");
+    }
+
+    #[test]
+    fn a_connection_failure_message_never_carries_the_password_and_never_runs_long() {
+        let raw = "error connecting to postgres://u:hunter2@db:5432/x: password authentication failed (hunter2)";
+        let shown = scrub(raw, &["hunter2", ""]);
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("password authentication failed"), "the reason stays: {shown}");
+        assert_eq!(scrub("  spaces trimmed \n", &[]), "spaces trimmed");
+        let hostile = scrub("bad \u{1b}]52;c;AAAA\u{7} text \u{9b}", &[]);
+        assert!(!hostile.chars().any(char::is_control), "{hostile:?}");
+        assert!(hostile.contains("bad") && hostile.contains("text"));
+        let long = scrub(&"x".repeat(5_000), &[]);
+        assert_eq!(long.chars().count(), 600);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

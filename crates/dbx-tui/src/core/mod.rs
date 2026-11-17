@@ -63,8 +63,32 @@ pub struct Connection {
     pub port: Option<u16>,
     /// The database the connection opens by default, if it names one.
     pub database: Option<String>,
+    pub username: String,
+    /// TLS on or off, as the form shows it.
+    pub tls: bool,
     /// dbx marks the connection as production: writes need confirming.
     pub production: bool,
+}
+
+/// `s` made safe to draw: control characters (which a terminal would act on,
+/// as escape sequences) become `�`, tabs and line breaks become spaces, and
+/// the bidirectional overrides that reorder what is shown are dropped. Names,
+/// hosts and server messages come from other programs and other people.
+pub fn display_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        .map(|c| match c {
+            '\t' | '\n' | '\r' => ' ',
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+/// The connection list in the order the sidebar shows it: by name without
+/// regard to case, then by id.
+pub fn sort_connections(list: &mut [Connection]) {
+    list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id.cmp(&b.id)));
 }
 
 /// What the connection form edits. `id` is `None` for a new connection.
@@ -77,7 +101,10 @@ pub struct ConnectionDraft {
     pub port: Option<u16>,
     pub database: Option<String>,
     pub username: String,
+    /// `None` keeps the stored password of the connection `id` names (and is
+    /// an empty password for a new one). The form never loads the stored one.
     pub password: Option<String>,
+    pub tls: bool,
     pub production: bool,
 }
 
@@ -93,6 +120,7 @@ impl fmt::Debug for ConnectionDraft {
             .field("database", &self.database)
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("tls", &self.tls)
             .field("production", &self.production)
             .finish()
     }

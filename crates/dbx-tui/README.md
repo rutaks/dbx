@@ -27,24 +27,33 @@ Run every command from the dbx workspace root.
 | What | Command | Needs |
 |---|---|---|
 | Fast: app, view, keys, FakeCore (layer 2) | `cargo test -p dbx-tui --lib --test no_colour_literals` | nothing |
-| Store: `DbxCore` on scratch stores (layer 1) | `cargo test -p dbx-tui --test store -- --test-threads=1` | nothing external; temp dirs and key files |
+| Store: `DbxCore` on scratch stores (layer 1) | `cargo test -p dbx-tui --test store -- --test-threads=1` | nothing external; temp dirs, key files, a local TCP port |
+| Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
 | Journeys: the built binary in tmux (layer 5) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
-`cargo test -p dbx-tui` runs the fast and store tests together. Test helpers on
-the production adapter (`DbxCore::seed_connection`, `check_seed_dir`) sit
-behind the `test-support` feature, which tests and examples get through a self
-dev-dependency; the client binary is built without it. `examples/seed_store`
-refuses any directory outside the system temp directory unless
-`DBX_TUI_ALLOW_SEED=1`, and always refuses the desktop app's store.
+`cargo test -p dbx-tui` runs the fast, store and live tests together (the live
+ones fail, saying so, when the fixtures are not up). Test helpers on the
+production adapter (`DbxCore::seed_config`, `runtime_config`,
+`runtime_config_ids`, `probe_select_one`, `with_managed_keys`,
+`check_seed_dir`) sit behind the `test-support` feature, which tests and
+examples get through a self dev-dependency; the client binary is built
+without it. Saving a connection is the real `Core::save_connection`, used by
+the tests and by `examples/seed_store`, which refuses any directory outside
+the system temp directory unless `DBX_TUI_ALLOW_SEED=1`, and always refuses
+the desktop app's store.
 
-The store tests set `DBX_SECRET_KEY_FILE` for the whole process, so they live
-in their own test binary and hold one lock each; `--test-threads=1` makes that
-explicit. Every one uses its own temporary data directory and a scratch `HOME`, and
-never reaches the keychain or the real store. Journeys do the same through `lib.sh`
-(`$CLIENT` runs the binary on a scratch store with a scratch key); captures go
-to `$JOURNEY_OUT`, or a temp directory printed at the end.
+The store and live tests set `DBX_SECRET_KEY_FILE` (or `DBX_SECRET_KEY`) for
+the whole process, so they live in their own test binaries and hold one lock
+each (`tests/common/mod.rs`); `--test-threads=1` makes that explicit. Every one
+uses its own temporary data directory and a scratch `HOME`, and never reaches
+the keychain or the real store: `Scratch::core()` refuses to build a client
+without a scratch key, and the one test that needs "no key at all" uses
+`with_managed_keys`, whose key policy never looks at the keychain. Journeys
+do the same through `lib.sh` (`$CLIENT` runs the binary on a scratch store
+with a scratch key); captures go to `$JOURNEY_OUT`, or a temp directory
+printed at the end. The `add-connection` journey needs the fixtures.
 
 ### Fixture databases
 

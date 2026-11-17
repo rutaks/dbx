@@ -40,6 +40,7 @@ fn main() {
         database: args.get(5).cloned(),
         username: "postgres".into(),
         password: Some("seeded-dummy-password".into()),
+        tls: false,
         production: false,
     };
     dbx_tui::shell::install_crypto_provider();
@@ -59,7 +60,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    match rt.block_on(core.seed_connection(&draft)) {
+    match rt.block_on(dbx_tui::core::Core::save_connection(&core, &draft)) {
         Ok(c) => println!("seeded {} ({})", c.name, c.id.0),
         Err(e) => {
             eprintln!("seed_store: {e}");

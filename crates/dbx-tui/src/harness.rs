@@ -54,6 +54,23 @@ impl Harness {
         }
     }
 
+    /// Like `press`, and returns the commands the keys produced.
+    pub fn press_fx(&mut self, keys: &str) -> Vec<crate::app::Command> {
+        let fx = crate::app::testing::press(&mut self.app, keys);
+        let commands = fx.commands.clone();
+        self.run(fx);
+        commands
+    }
+
+    /// Types `text` one character at a time, as a person would.
+    pub fn type_text(&mut self, text: &str) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for c in text.chars() {
+            let fx = self.app.update(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)), base());
+            self.run(fx);
+        }
+    }
+
     /// Sends keys (see `testing::press`) and runs what they ask for.
     pub fn press(&mut self, keys: &str) -> bool {
         let fx = crate::app::testing::press(&mut self.app, keys);

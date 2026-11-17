@@ -58,6 +58,11 @@ impl KeyCombo {
             "enter" => KeyCode::Enter,
             "tab" => KeyCode::Tab,
             "space" => KeyCode::Char(' '),
+            "backspace" => KeyCode::Backspace,
+            "delete" => KeyCode::Delete,
+            "home" => KeyCode::Home,
+            "end" => KeyCode::End,
+            "backtab" => KeyCode::BackTab,
             "up" => KeyCode::Up,
             "down" => KeyCode::Down,
             "left" => KeyCode::Left,
@@ -88,6 +93,11 @@ impl fmt::Display for KeyCombo {
             KeyCode::Enter => f.write_str("enter"),
             KeyCode::Tab => f.write_str("tab"),
             KeyCode::Char(' ') => f.write_str("space"),
+            KeyCode::Backspace => f.write_str("backspace"),
+            KeyCode::Delete => f.write_str("delete"),
+            KeyCode::Home => f.write_str("home"),
+            KeyCode::End => f.write_str("end"),
+            KeyCode::BackTab => f.write_str("backtab"),
             KeyCode::Char(c) => write!(f, "{c}"),
             KeyCode::F(n) => write!(f, "f{n}"),
             KeyCode::Up => f.write_str("up"),
@@ -107,6 +117,7 @@ pub enum Action {
     FocusUp,
     FocusRight,
     Zoom,
+    NewConnection,
     Quit,
 }
 
@@ -117,6 +128,7 @@ impl Action {
         match self {
             Action::FocusLeft | Action::FocusDown | Action::FocusUp | Action::FocusRight => "focus",
             Action::Zoom => "zoom",
+            Action::NewConnection => "new",
             Action::Quit => "quit",
         }
     }
@@ -140,6 +152,7 @@ impl Default for Keybinds {
                 (plain('j'), Action::FocusDown),
                 (plain('k'), Action::FocusUp),
                 (plain('l'), Action::FocusRight),
+                (plain('n'), Action::NewConnection),
                 (plain('z'), Action::Zoom),
                 (plain('q'), Action::Quit),
             ],
@@ -151,6 +164,11 @@ impl Keybinds {
     /// The action bound to `key` after the prefix.
     pub fn lookup(&self, key: &KeyCombo) -> Option<Action> {
         self.bindings.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+    }
+
+    /// The key bound to `action`, as shown, if any.
+    pub fn key_for(&self, action: Action) -> Option<String> {
+        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.to_string())
     }
 
     /// Replaces every key bound to `action` with `key`. Returns false, and

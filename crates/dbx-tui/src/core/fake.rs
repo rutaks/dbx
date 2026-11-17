@@ -248,7 +248,7 @@ mod tests {
     use super::*;
 
     fn conn(name: &str) -> Connection {
-        Connection { id: ConnectionId(name.into()), name: name.into(), kind: DbKind::Postgres, host: "localhost".into(), port: None, database: None, production: false }
+        Connection { id: ConnectionId(name.into()), name: name.into(), kind: DbKind::Postgres, host: "localhost".into(), port: None, database: None, username: String::new(), tls: false, production: false }
     }
 
     fn draft() -> ConnectionDraft {
@@ -261,6 +261,7 @@ mod tests {
             database: Some("d".into()),
             username: "u".into(),
             password: None,
+            tls: false,
             production: false,
         }
     }

@@ -100,6 +100,9 @@ pub(crate) fn execute(
                 tokio::spawn(async move {
                     let reply = match call {
                         CoreCall::Connections => CoreReply::Connections(core.connections().await),
+                        CoreCall::TestConnection(draft) => CoreReply::Tested(core.test_connection(&draft).await),
+                        CoreCall::SaveConnection(draft) => CoreReply::Saved(core.save_connection(&draft).await),
+                        CoreCall::RemoveConnection(id) => CoreReply::Removed(core.remove_connection(&id).await),
                     };
                     let _ = tx.send((id, reply));
                 });

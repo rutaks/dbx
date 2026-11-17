@@ -1,16 +1,37 @@
 //! Overlays: boxes drawn over the panes that take all input until dismissed
 //! (design section 3). One at a time, as `Ui.overlay: Option<Overlay>`; each
-//! variant carries its own state. Slice 02 brings the first, `Error`.
+//! variant carries its own state. Slice 02 brought `Error`; slice 03 adds the
+//! connection form, the removal question and a plain failure notice.
 
 use ratatui::layout::Rect;
 
-use crate::core::{CoreError, CoreErrorKind};
+use super::form::{ConnectionForm, Field};
+use crate::core::{ConnectionId, CoreError, CoreErrorKind};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Overlay {
     /// A failure the client cannot work around, such as a store it cannot
     /// open. Blocking: the panes behind it take no input.
     Error(ErrorOverlay),
+    /// Add or edit a connection.
+    Form(Box<ConnectionForm>),
+    /// "Remove this connection?", naming it.
+    ConfirmRemove(ConfirmRemove),
+    /// Something the user asked for failed and there is nothing to retry from
+    /// here: say why, and let them go on.
+    Failure(FailureOverlay),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmRemove {
+    pub id: ConnectionId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureOverlay {
+    pub title: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +60,24 @@ pub enum OverlayAction {
     /// Ask the Core again for what failed.
     Retry,
     Quit,
+    /// The form: save, test, and `esc` (close, asking first if it was changed).
+    FormSave,
+    FormTest,
+    FormClose,
+    /// The "discard changes?" question: discard, or keep editing.
+    DiscardYes,
+    DiscardNo,
+    /// The removal question: remove.
+    RemoveYes,
+    /// Close a notice or a question without doing anything.
+    Dismiss,
+}
+
+/// Where a form row was drawn, for clicks. Filled by `view`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldHit {
+    pub rect: Rect,
+    pub field: Field,
 }
 
 /// A button as drawn: where it is, and what it does. Filled by `view`.
@@ -57,17 +96,39 @@ pub struct ButtonSpec {
     pub action: OverlayAction,
 }
 
+const fn button(key_label: &'static str, key: &'static str, label: &'static str, action: OverlayAction) -> ButtonSpec {
+    ButtonSpec { key_label, key, label, action }
+}
+
+// No `esc` on the startup error: a store the client cannot open leaves nothing
+// behind the overlay to go back to, so the choices are retry or quit.
+const ERROR_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "retry", OverlayAction::Retry), button("q", "q", "quit", OverlayAction::Quit)];
+const FORM_BUTTONS: &[ButtonSpec] = &[
+    button("ctrl+t", "ctrl+t", "test", OverlayAction::FormTest),
+    button("↵", "enter", "save", OverlayAction::FormSave),
+    button("esc", "esc", "cancel", OverlayAction::FormClose),
+];
+const DISCARD_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "discard", OverlayAction::DiscardYes), button("esc", "esc", "keep editing", OverlayAction::DiscardNo)];
+const REMOVE_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "remove", OverlayAction::RemoveYes), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
+// `esc` also closes a failure notice (see `App::on_overlay_key`): backing out
+// one level always works.
+const FAILURE_BUTTONS: &[ButtonSpec] = &[button("↵", "enter", "close", OverlayAction::Dismiss)];
+
 impl Overlay {
     /// The buttons along the bottom of the overlay, left to right. Their keys
-    /// are the only keys the overlay answers to.
+    /// are the only keys the overlay answers to (the form also takes text).
     pub fn buttons(&self) -> &'static [ButtonSpec] {
         match self {
-            // No `esc`: a store the client cannot open leaves nothing behind
-            // the overlay to go back to, so the choices are retry or quit.
-            Overlay::Error(_) => &[
-                ButtonSpec { key_label: "↵", key: "enter", label: "retry", action: OverlayAction::Retry },
-                ButtonSpec { key_label: "q", key: "q", label: "quit", action: OverlayAction::Quit },
-            ],
+            Overlay::Error(_) => ERROR_BUTTONS,
+            // A form that is saving takes no input, and offers no keys.
+            Overlay::Form(form) if form.locked() => &[],
+            Overlay::Form(form) if form.confirm_discard => DISCARD_BUTTONS,
+            Overlay::Form(_) => FORM_BUTTONS,
+            Overlay::ConfirmRemove(_) => REMOVE_BUTTONS,
+            Overlay::Failure(_) => FAILURE_BUTTONS,
         }
     }
 }

@@ -11,91 +11,12 @@
 //! the scratch directory as well, so dbx never looks at the real user's
 //! compatibility key file (`~/Library/Application Support/dbx/secret.key`).
 
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+mod common;
 
+use std::path::Path;
+
+use common::*;
 use dbx_tui::core::{Connection, ConnectionDraft, Core, CoreErrorKind, DbKind, DbxCore, StoreOptions};
-
-const PASSWORD: &str = "pw-Zq8!never-shown-4471";
-const KEY_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-const KEY_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-
-static ENV: Mutex<()> = Mutex::new(());
-
-/// A scratch data directory plus key files, with the process locked to it.
-struct Scratch {
-    _env: MutexGuard<'static, ()>,
-    tmp: tempfile::TempDir,
-}
-
-impl Scratch {
-    fn new() -> Self {
-        let env = ENV.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        for (name, key) in [("key-a", KEY_A), ("key-b", KEY_B)] {
-            std::fs::write(tmp.path().join(name), key).expect("key file");
-        }
-        // HOME too: dbx looks for a compatibility key file under HOME before
-        // the keychain. With HOME scratch, it never even looks at the real one.
-        let home = tmp.path().join("home");
-        std::fs::create_dir_all(&home).expect("scratch home");
-        std::env::set_var("HOME", &home);
-        let s = Scratch { _env: env, tmp };
-        s.use_key("key-a");
-        s
-    }
-
-    /// Points dbx at one of the scratch key files. No test runs without one.
-    fn use_key(&self, name: &str) {
-        std::env::remove_var("DBX_SECRET_KEY");
-        std::env::set_var("DBX_SECRET_KEY_FILE", self.tmp.path().join(name));
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.tmp.path().join("store")
-    }
-
-    fn core(&self) -> DbxCore {
-        let key = std::env::var_os("DBX_SECRET_KEY_FILE").expect("a scratch key is always set");
-        assert!(Path::new(&key).starts_with(self.tmp.path()), "the key must be a scratch key");
-        let home = std::env::var_os("HOME").expect("HOME");
-        assert!(Path::new(&home).starts_with(self.tmp.path()), "HOME must be scratch");
-        std::fs::create_dir_all(self.data_dir()).expect("scratch data dir");
-        DbxCore::new(self.options(self.data_dir().as_os_str().to_str().unwrap()))
-    }
-
-    /// Options as the client builds them, with `DBX_DATA_DIR` set to `value`.
-    fn options(&self, value: &str) -> StoreOptions {
-        let home = self.tmp.path().join("home");
-        let vars = [("DBX_DATA_DIR", value.to_string()), ("HOME", home.to_string_lossy().into_owned())];
-        StoreOptions::from_vars(|name| {
-            vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.into()).or_else(|| std::env::var_os(name))
-        })
-            .expect("valid options")
-    }
-}
-
-fn draft(name: &str) -> ConnectionDraft {
-    ConnectionDraft {
-        id: None,
-        name: name.into(),
-        kind: DbKind::Postgres,
-        host: "127.0.0.1".into(),
-        port: Some(55433),
-        database: Some("pagila".into()),
-        username: "postgres".into(),
-        password: Some(PASSWORD.into()),
-        production: true,
-    }
-}
-
-fn assert_no_secret(c: &Connection) {
-    let fields = [c.id.0.as_str(), c.name.as_str(), c.host.as_str(), c.database.as_deref().unwrap_or("")];
-    for f in fields {
-        assert!(!f.contains(PASSWORD), "password in a field: {f:?}");
-    }
-    assert!(!format!("{c:?}").contains(PASSWORD), "password in Debug output");
-}
 
 #[tokio::test]
 async fn an_empty_directory_opens_and_returns_zero_connections() {
@@ -114,9 +35,9 @@ async fn an_empty_directory_opens_and_returns_zero_connections() {
 }
 
 #[tokio::test]
-async fn a_store_seeded_with_one_connection_returns_it_without_its_password() {
+async fn a_saved_connection_is_listed_after_a_reopen_without_its_password() {
     let s = Scratch::new();
-    let seeded = s.core().seed_connection(&draft("local pg")).await.expect("seed");
+    let seeded = s.core().save_connection(&draft("local pg")).await.expect("seed");
     assert_no_secret(&seeded);
 
     // A fresh DbxCore, as a later start of the client would be.
@@ -130,6 +51,7 @@ async fn a_store_seeded_with_one_connection_returns_it_without_its_password() {
     assert_eq!(c.port, Some(55433));
     assert_eq!(c.database.as_deref(), Some("pagila"));
     assert!(c.production);
+    assert_eq!((c.username.as_str(), c.tls), ("postgres", false));
     assert_no_secret(c);
 
     // And dbx stored it encrypted: the plain password is nowhere in the files.
@@ -146,8 +68,8 @@ async fn a_store_seeded_with_one_connection_returns_it_without_its_password() {
 #[tokio::test]
 async fn with_dbx_secret_key_file_set_a_store_written_under_that_key_reopens() {
     let s = Scratch::new();
-    s.core().seed_connection(&draft("one")).await.expect("seed under key A");
-    s.core().seed_connection(&draft("two")).await.expect("second write under key A");
+    s.core().save_connection(&draft("one")).await.expect("seed under key A");
+    s.core().save_connection(&draft("two")).await.expect("second write under key A");
     // Loading decrypts every saved password, so this fails under any other key.
     let names: Vec<String> = s.core().connections().await.expect("reopen").into_iter().map(|c| c.name).collect();
     assert_eq!(names, vec!["one".to_string(), "two".to_string()]);
@@ -156,7 +78,7 @@ async fn with_dbx_secret_key_file_set_a_store_written_under_that_key_reopens() {
 #[tokio::test]
 async fn a_store_opened_under_a_different_key_is_a_key_error_that_names_no_secret() {
     let s = Scratch::new();
-    s.core().seed_connection(&draft("one")).await.expect("seed under key A");
+    s.core().save_connection(&draft("one")).await.expect("seed under key A");
     s.use_key("key-b");
     let err = s.core().connections().await.expect_err("key B cannot decrypt key A's store");
     assert_eq!(err.kind, CoreErrorKind::Key, "{err:?}");
@@ -180,7 +102,7 @@ async fn a_store_file_that_is_not_a_database_is_a_store_error() {
 #[tokio::test]
 async fn a_failed_start_is_retried_on_the_next_call() {
     let s = Scratch::new();
-    s.core().seed_connection(&draft("one")).await.expect("seed under key A");
+    s.core().save_connection(&draft("one")).await.expect("seed under key A");
     s.use_key("key-b");
     let core = s.core();
     assert_eq!(core.connections().await.unwrap_err().kind, CoreErrorKind::Key);
@@ -242,7 +164,7 @@ impl Drop for LockHolder {
 async fn while_the_store_is_slow_to_open_the_runtime_keeps_running() {
     use std::time::{Duration, Instant};
     let s = Scratch::new();
-    s.core().seed_connection(&draft("one")).await.expect("seed");
+    s.core().save_connection(&draft("one")).await.expect("seed");
     let lock = LockHolder::hold(&s.data_dir().join("dbx.db"));
 
     let core = std::sync::Arc::new(s.core());
@@ -288,4 +210,347 @@ async fn a_dbx_data_dir_that_does_not_exist_is_reported_not_created() {
     assert!(err.message.contains("does not exist"), "{}", err.message);
     assert!(err.message.contains("no-such-dir"), "{}", err.message);
     assert!(!missing.exists(), "nothing was created");
+}
+
+// ---- slice 03: save, edit, remove, test -------------------------------------------
+
+/// A connection as the desktop app writes it: SSH tunnel, options and
+/// preferences the TUI form has no fields for.
+fn desktop_config(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": "from desktop",
+        "db_type": "postgres",
+        "host": "db.internal",
+        "port": 5432,
+        "username": "app",
+        "password": PASSWORD,
+        "database": "shop",
+        "ssl": true,
+        "note": "owned by the data team",
+        "color": "#ff8800",
+        "url_params": "application_name=desktop",
+        "read_only": true,
+        "visible_databases": ["shop", "shop_test"],
+        "show_system_schemas": true,
+        "connect_timeout_secs": 7,
+        "is_production": false,
+        "production_databases": ["shop"],
+        "transport_layers": [{
+            "type": "ssh", "id": "layer-1", "name": "bastion", "enabled": true,
+            "host": "bastion.example.com", "port": 2222, "user": "jump",
+            "password": "ssh-secret-91", "key_path": "/keys/id_ed25519",
+        }],
+    })
+}
+
+fn only(list: Vec<Connection>) -> Connection {
+    assert_eq!(list.len(), 1, "{list:?}");
+    list.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn saving_a_new_connection_returns_it_without_its_password_and_lists_it_at_once() {
+    let s = Scratch::new();
+    let core = s.core();
+    let saved = core.save_connection(&draft("local pg")).await.expect("save");
+    assert_no_secret(&saved);
+    assert!(!saved.id.0.is_empty(), "a new connection gets an id");
+    assert_eq!(core.connections().await.unwrap(), vec![saved.clone()], "no restart needed to see it");
+    assert_eq!(core.runtime_config_ids().await, vec![saved.id.0.clone()], "dbx's runtime list holds it too");
+    // Two saves of new connections are two connections.
+    let other = core.save_connection(&draft("second")).await.expect("save");
+    assert_ne!(other.id, saved.id);
+    assert_eq!(core.connections().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn the_first_password_save_on_a_fresh_store_with_a_key_file_creates_no_key_and_decrypts_on_reopen() {
+    let s = Scratch::new();
+    assert_eq!(std::fs::read_dir(s.data_dir().parent().unwrap()).unwrap().filter(|e| e.as_ref().unwrap().file_name() == "store").count(), 0);
+    let saved = s.core().save_connection(&draft("fresh")).await.expect("first save that carries a password");
+    // A new process: the password is read back and decrypted with the same key.
+    let reopened = s.core();
+    assert_eq!(only(reopened.connections().await.expect("reopen")), saved);
+    let stored = reopened.runtime_config(&saved.id).await.expect("runtime config");
+    assert_eq!(stored["password"], PASSWORD, "the password decrypted to what was typed");
+    // dbx wrote no key of its own next to the store: the environment's key was used.
+    for entry in std::fs::read_dir(s.data_dir()).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with("dbx.db"), "unexpected {name:?} in the store directory");
+    }
+}
+
+#[tokio::test]
+async fn the_first_password_save_with_a_key_given_as_a_value_decrypts_on_reopen_under_that_key_only() {
+    let s = Scratch::new();
+    s.use_key_value(KEY_B);
+    let saved = s.core().save_connection(&draft("fresh")).await.expect("save under an environment key");
+    let reopened = s.core();
+    assert_eq!(only(reopened.connections().await.expect("reopen")), saved);
+    assert_eq!(reopened.runtime_config(&saved.id).await.unwrap()["password"], PASSWORD);
+    s.use_key_value(KEY_A);
+    let err = s.core().connections().await.expect_err("another key cannot open it");
+    assert_eq!(err.kind, CoreErrorKind::Key);
+    assert!(!err.message.contains(KEY_A) && !err.message.contains(KEY_B) && !err.message.contains(PASSWORD));
+}
+
+#[tokio::test]
+async fn editing_changes_only_the_fields_the_form_shows_and_keeps_every_other_one() {
+    let s = Scratch::new();
+    let core = s.core();
+    let id = core.seed_config(desktop_config("desk-1")).await.expect("seed a desktop connection");
+    let before = core.runtime_config(&id).await.unwrap();
+
+    // The form edits the name and nothing else.
+    let listed = only(core.connections().await.unwrap());
+    assert_eq!((listed.username.as_str(), listed.tls), ("app", true), "the form is filled from the connection");
+    let edit = ConnectionDraft {
+        id: Some(id.clone()),
+        name: "renamed".into(),
+        kind: listed.kind.clone(),
+        host: listed.host.clone(),
+        port: listed.port,
+        database: listed.database.clone(),
+        username: listed.username.clone(),
+        password: None,
+        tls: listed.tls,
+        production: listed.production,
+    };
+    let saved = core.save_connection(&edit).await.expect("edit");
+    assert_eq!((saved.id.clone(), saved.name.as_str()), (id.clone(), "renamed"));
+
+    for store in [core.runtime_config(&id).await.unwrap(), s.core().runtime_config(&id).await.unwrap()] {
+        let mut want = before.clone();
+        want["name"] = "renamed".into();
+        assert_eq!(store, want, "only the name changed, in dbx's runtime copy and in the store");
+        assert_eq!(store["transport_layers"][0]["host"], "bastion.example.com");
+        assert_eq!(store["transport_layers"][0]["password"], "ssh-secret-91", "the tunnel's secret survived");
+        assert_eq!(store["note"], "owned by the data team");
+        assert_eq!(store["read_only"], true);
+    }
+    assert_eq!(core.connections().await.unwrap().len(), 1, "an edit is not an add");
+}
+
+#[tokio::test]
+async fn editing_with_a_blank_password_keeps_the_stored_one_and_a_typed_one_replaces_it() {
+    let s = Scratch::new();
+    let core = s.core();
+    let saved = core.save_connection(&draft("pg")).await.unwrap();
+    let edit = |name: &str, password: Option<&str>| ConnectionDraft {
+        id: Some(saved.id.clone()),
+        name: name.into(),
+        password: password.map(Into::into),
+        ..draft("pg")
+    };
+    core.save_connection(&edit("pg 2", None)).await.unwrap();
+    core.save_connection(&edit("pg 3", Some(""))).await.unwrap();
+    for c in [&core, &s.core()] {
+        assert_eq!(c.runtime_config(&saved.id).await.unwrap()["password"], PASSWORD, "blank means unchanged");
+    }
+    core.save_connection(&edit("pg 4", Some("a-new-password"))).await.unwrap();
+    assert_eq!(s.core().runtime_config(&saved.id).await.unwrap()["password"], "a-new-password");
+}
+
+#[tokio::test]
+async fn removing_a_connection_deletes_it_from_the_store_and_from_dbxs_runtime_list() {
+    let s = Scratch::new();
+    let core = s.core();
+    let keep = core.save_connection(&draft("keep")).await.unwrap();
+    let gone = core.save_connection(&draft("gone")).await.unwrap();
+    core.remove_connection(&gone.id).await.expect("remove");
+    assert_eq!(core.connections().await.unwrap(), vec![keep.clone()]);
+    assert_eq!(core.runtime_config_ids().await, vec![keep.id.0.clone()]);
+    assert_eq!(s.core().connections().await.unwrap(), vec![keep], "gone after a restart too");
+    // Removing what is already gone is not an error: another dbx head may have beaten us to it.
+    core.remove_connection(&gone.id).await.expect("idempotent");
+}
+
+#[tokio::test]
+async fn a_store_that_holds_encrypted_data_but_has_no_key_refuses_the_save_as_a_key_error_and_writes_nothing() {
+    let s = Scratch::new();
+    // A connection with a password, saved under key A, in a store whose keys are
+    // only ever read from the environment or the data directory.
+    let core = s.managed_core();
+    let existing = core.save_connection(&draft("existing")).await.expect("save under key A");
+
+    // The key goes missing while the client runs: the variable is unset. (dbx
+    // notices, because the set of places a key can come from has changed.)
+    // A store like this cannot be opened by the client in the first place, so
+    // this is the only way a save meets it: the key vanishing mid-session.
+    s.use_no_key();
+    let err = core.save_connection(&draft("new one")).await.expect_err("no key, encrypted data present");
+    assert_eq!(err.kind, CoreErrorKind::Key, "{err:?}");
+    assert!(err.message.contains("ENCRYPTED_DATA_KEY_MISSING"), "dbx's code is shown: {}", err.message);
+    for secret in [PASSWORD, KEY_A, KEY_B] {
+        assert!(!err.message.contains(secret), "secret in {:?}", err.message);
+    }
+    assert!(!s.data_dir().join(".dbx/secret.key").exists(), "no key was made to get past it");
+
+    // Nothing was written, and nothing is listed that is not stored.
+    assert_eq!(core.connections().await.unwrap(), vec![existing.clone()], "the runtime list did not change");
+    s.use_key("key-a");
+    assert_eq!(s.managed_core().connections().await.unwrap(), vec![existing], "the store did not change");
+}
+
+/// A TCP server that accepts connections and never says a word: a database
+/// that is up but will not answer.
+async fn silent_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn a_failed_test_reports_the_reason_and_leaves_no_temporary_entry_behind() {
+    let s = Scratch::new();
+    let core = s.core();
+    let kept = core.save_connection(&draft("kept")).await.unwrap();
+    // Nothing listens on port 1.
+    let unreachable = ConnectionDraft { port: Some(1), ..draft("unsaved") };
+    let err = core.test_connection(&unreachable).await.expect_err("nothing listens there");
+    assert_eq!(err.kind, CoreErrorKind::Connect, "{err:?}");
+    assert!(!err.message.is_empty());
+    assert!(!err.message.contains(PASSWORD), "{}", err.message);
+    assert_eq!(core.runtime_config_ids().await, vec![kept.id.0.clone()], "the temporary entry is gone");
+    assert_eq!(core.connections().await.unwrap(), vec![kept.clone()], "and the test saved nothing");
+    assert_eq!(s.core().connections().await.unwrap(), vec![kept], "not in the store either");
+}
+
+#[tokio::test]
+async fn a_test_that_is_abandoned_while_it_waits_still_cleans_up_its_temporary_entry() {
+    use std::time::{Duration, Instant};
+    let s = Scratch::new();
+    let core = s.core();
+    let (addr, server) = silent_server().await;
+    let hanging = ConnectionDraft { host: addr.ip().to_string(), port: Some(addr.port()), ..draft("hangs") };
+
+    // The caller gives up and drops the future mid-test (a cancelled task, a timeout).
+    let gave_up = tokio::time::timeout(Duration::from_millis(500), core.test_connection(&hanging)).await;
+    assert!(gave_up.is_err(), "the server never answers, so the test is still waiting");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let ids = core.runtime_config_ids().await;
+        if ids.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the temporary entry was never cleaned up: {ids:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_test_in_flight_is_not_listed_as_a_connection_while_it_runs() {
+    use std::time::Duration;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    let (addr, server) = silent_server().await;
+    let hanging = ConnectionDraft { host: addr.ip().to_string(), port: Some(addr.port()), ..draft("hangs") };
+    let task = tokio::spawn({
+        let core = core.clone();
+        async move { core.test_connection(&hanging).await }
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let ids = core.runtime_config_ids().await;
+    assert_eq!(ids.len(), 1, "the probe is in dbx's runtime list while it runs: {ids:?}");
+    assert!(ids[0].starts_with("__test_"), "{ids:?}");
+    assert_eq!(core.connections().await.unwrap(), vec![], "but the client never lists it");
+    task.abort();
+    let _ = task.await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_edit_keeps_init_script_connection_secrets_and_save_password_false() {
+    let s = Scratch::new();
+    let core = s.core();
+    let mut config = desktop_config("desk-2");
+    config["init_script"] = "SET search_path = shop".into();
+    config["connection_secrets"] = serde_json::json!({"extra": "tunnel-token-77"});
+    config["save_password"] = false.into();
+    config["password"] = "".into();
+    let id = core.seed_config(config).await.expect("seed");
+    let before = core.runtime_config(&id).await.unwrap();
+    let listed = only(core.connections().await.unwrap());
+    let edit = ConnectionDraft {
+        id: Some(id.clone()),
+        name: "renamed".into(),
+        kind: listed.kind,
+        host: listed.host,
+        port: listed.port,
+        database: listed.database,
+        username: listed.username,
+        password: None,
+        tls: listed.tls,
+        production: listed.production,
+    };
+    core.save_connection(&edit).await.expect("edit");
+    for store in [core.runtime_config(&id).await.unwrap(), s.core().runtime_config(&id).await.unwrap()] {
+        assert_eq!(store["init_script"], "SET search_path = shop");
+        assert_eq!(store["connection_secrets"]["extra"], "tunnel-token-77");
+        assert_eq!(store["save_password"], false);
+        assert_eq!(store["name"], "renamed");
+        assert_eq!(store["transport_layers"], before["transport_layers"]);
+    }
+}
+
+#[tokio::test]
+async fn control_characters_in_a_stored_name_or_host_never_reach_the_client() {
+    let s = Scratch::new();
+    let core = s.core();
+    let mut config = desktop_config("evil-1");
+    config["name"] = "evil\u{1b}]52;c;AAAA\u{7}name".into();
+    config["host"] = "h\u{1b}[2Jost".into();
+    config["username"] = "u\u{7}ser".into();
+    config["database"] = "d\u{1b}b".into();
+    core.seed_config(config).await.unwrap();
+    let c = only(core.connections().await.unwrap());
+    for text in [&c.name, &c.host, &c.username, c.database.as_ref().unwrap()] {
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+    }
+    assert!(c.name.contains("evil") && c.name.contains("name"), "{:?}", c.name);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_and_a_remove_of_the_same_connection_never_leave_the_runtime_and_the_store_disagreeing() {
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    for round in 0..300 {
+        let saved = core.save_connection(&draft("target")).await.unwrap();
+        let edit = ConnectionDraft { id: Some(saved.id.clone()), name: format!("edit {round}"), password: None, ..draft("target") };
+        let (a, b) = tokio::join!(
+            {
+                let core = core.clone();
+                let edit = edit.clone();
+                tokio::spawn(async move {
+                    // Several edits, so one of them is likely to straddle the remove.
+                    let mut last = Ok(());
+                    for _ in 0..3 {
+                        last = core.save_connection(&edit).await.map(|_| ());
+                    }
+                    last
+                })
+            },
+            {
+                let core = core.clone();
+                let id = saved.id.clone();
+                tokio::spawn(async move { core.remove_connection(&id).await })
+            },
+        );
+        a.unwrap().ok();
+        b.unwrap().expect("remove");
+        let runtime = core.connections().await.unwrap();
+        let stored = s.core().connections().await.unwrap();
+        assert_eq!(runtime, stored, "round {round}: runtime and store disagree");
+        for c in &runtime {
+            core.remove_connection(&c.id).await.unwrap();
+        }
+    }
 }
