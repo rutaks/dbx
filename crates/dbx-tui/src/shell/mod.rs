@@ -20,6 +20,23 @@ use crate::core::Core;
 
 pub use terminal::TerminalGuard;
 
+/// Stack size for the runtime's threads. dbx's metadata and export futures
+/// overflow tokio's 2 MiB default; dbx's own heads use 16 MiB
+/// (`dbx_core::scheduled_backup::worker_runtime`).
+const THREAD_STACK: usize = 16 * 1024 * 1024;
+
+/// The client's tokio runtime: multi-threaded, with a 16 MiB stack per thread.
+pub fn runtime() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(THREAD_STACK).build()
+}
+
+/// Installs rustls's process-wide crypto provider, which dbx's TLS needs.
+/// Call once at startup; a second call changes nothing.
+pub fn install_crypto_provider() {
+    // Err only means a provider is already installed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Runs the client until the user quits. The terminal is restored on return.
 pub async fn run(core: Arc<dyn Core>) -> io::Result<()> {
     let mut guard = TerminalGuard::enter()?;
@@ -68,7 +85,7 @@ pub async fn run(core: Arc<dyn Core>) -> io::Result<()> {
 
 /// Starts everything the app asked for, then reports whether it asked to
 /// quit. Quit does not cut the list short: a Cancel next to it still runs.
-fn execute(
+pub(crate) fn execute(
     commands: Vec<Command>,
     core: &Arc<dyn Core>,
     tx: &mpsc::UnboundedSender<(RequestId, CoreReply)>,
@@ -118,6 +135,30 @@ mod tests {
         let quit = execute(vec![Command::Cancel(RunId(1)), Command::Quit, Command::Cancel(RunId(2))], &core, &tx);
         assert!(quit);
         assert_eq!(fake.calls(), vec![Call::Cancel(RunId(1)), Call::Cancel(RunId(2))]);
+    }
+
+    #[test]
+    fn the_runtime_gives_worker_threads_a_16_mib_stack() {
+        // dbx's metadata futures overflow tokio's default 2 MiB stack. A task
+        // that needs 8 MiB of stack runs here; on a default runtime it would
+        // crash this test binary.
+        let rt = runtime().expect("runtime");
+        let used = rt.block_on(async {
+            tokio::spawn(async {
+                let big = std::hint::black_box([7u8; 8 << 20]);
+                big.iter().map(|&b| b as usize).sum::<usize>()
+            })
+            .await
+            .expect("task")
+        });
+        assert_eq!(used, 7 * (8 << 20));
+    }
+
+    #[test]
+    fn the_crypto_provider_is_installed_once_and_a_second_install_is_harmless() {
+        install_crypto_provider();
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
     #[test]

@@ -6,3 +6,6 @@
 pub mod app;
 pub mod core;
 pub mod shell;
+
+#[cfg(test)]
+mod harness;

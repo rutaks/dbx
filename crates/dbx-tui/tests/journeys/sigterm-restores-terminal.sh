@@ -5,9 +5,10 @@
 . "$(dirname "$0")/lib.sh"
 
 build_bin
+scratch_store
 for sig in TERM HUP; do
   start_shell
-  tm send-keys -t "$SESSION" "$BIN; echo EXIT=\$?" Enter
+  tm send-keys -t "$SESSION" "$CLIENT; echo EXIT=\$?" Enter
   wait_for "20-running-$sig" 'No connections yet'
   pane_pid="$(tm display -p -t "$SESSION" '#{pane_pid}')"
   client_pid="$(pgrep -P "$pane_pid" -f dbx-tui | head -n 1)"

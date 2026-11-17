@@ -2873,8 +2873,13 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "crossterm",
+ "dbx-core",
+ "dbx-tui",
  "futures",
  "ratatui",
+ "rustls 0.23.43",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

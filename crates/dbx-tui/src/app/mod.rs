@@ -3,23 +3,27 @@
 
 pub mod keys;
 pub mod layout;
+pub mod overlay;
 pub mod requests;
 pub mod theme;
 mod view;
 
 #[cfg(test)]
-mod testing;
+mod connections_tests;
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 
 use crate::core::{Connection, CoreError, RunId};
 use keys::{Action, KeyCombo, Keybinds};
 use layout::HitMap;
+use overlay::{ErrorOverlay, Overlay, OverlayAction, OverlayButton};
 use requests::{RequestId, Requests, Target};
 use theme::Palette;
 
@@ -63,17 +67,33 @@ pub struct Model {
     pub requests: Requests,
 }
 
+/// Rows one notch of the mouse wheel scrolls.
+const WHEEL_ROWS: isize = 3;
+
+/// The sidebar's cursor and how far its list is scrolled, in rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SidebarUi {
+    pub cursor: usize,
+    /// The first row on screen. `view` keeps the cursor inside the window.
+    pub scroll: usize,
+}
+
 /// Presentation only.
 #[derive(Debug)]
 pub struct Ui {
     pub focus: PaneId,
     pub zoomed: bool,
     pub mode: Mode,
+    pub sidebar: SidebarUi,
     pub prefix_timeout: Duration,
     pub theme: Palette,
     pub keys: Keybinds,
+    /// At most one overlay; while it is open it takes all input.
+    pub overlay: Option<Overlay>,
     /// Filled by `view`.
     pub hits: HitMap,
+    /// The open overlay's buttons as last drawn. Filled by `view`.
+    pub overlay_buttons: Vec<OverlayButton>,
 }
 
 #[derive(Debug)]
@@ -132,10 +152,13 @@ impl App {
                 focus: PaneId::Sidebar,
                 zoomed: false,
                 mode: Mode::Normal,
+                sidebar: SidebarUi::default(),
                 prefix_timeout: Duration::from_secs(3),
                 theme: Palette::default_theme(),
                 keys: Keybinds::default(),
+                overlay: None,
                 hits: HitMap::default(),
+                overlay_buttons: Vec::new(),
             },
         }
     }
@@ -164,6 +187,10 @@ impl App {
             fx.repaint = true;
         }
         match event {
+            // Routing order: overlay, then prefix mode, then the focused pane.
+            Event::Key(key) if self.ui.overlay.is_some() => self.on_overlay_key(key, &mut fx),
+            Event::Mouse(mouse) if self.ui.overlay.is_some() => self.on_overlay_mouse(mouse, &mut fx),
+            Event::Paste(_) if self.ui.overlay.is_some() => {}
             Event::Key(key) => self.on_key(key, now, &mut fx),
             Event::Mouse(mouse) => self.on_mouse(mouse, &mut fx),
             Event::Resize(..) => fx.repaint = true,
@@ -204,6 +231,8 @@ impl App {
                 if combo == self.ui.keys.prefix {
                     self.ui.mode = Mode::Prefix { expires: now + self.ui.prefix_timeout };
                     fx.repaint = true;
+                } else if self.ui.focus == PaneId::Sidebar {
+                    self.on_sidebar_key(combo, fx);
                 }
             }
             Mode::Prefix { .. } => {
@@ -213,6 +242,22 @@ impl App {
                     self.perform(action, fx);
                 }
             }
+        }
+    }
+
+    /// The sidebar takes navigation keys directly: it accepts no text.
+    fn on_sidebar_key(&mut self, combo: KeyCombo, fx: &mut Effects) {
+        let Loadable::Ready(list) = &self.model.connections else { return };
+        let last = list.len().saturating_sub(1);
+        let cursor = &mut self.ui.sidebar.cursor;
+        let moved = match combo.code {
+            KeyCode::Char('j') | KeyCode::Down if combo.mods.is_empty() => (*cursor + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up if combo.mods.is_empty() => cursor.saturating_sub(1),
+            _ => return,
+        };
+        if moved != *cursor {
+            *cursor = moved;
+            fx.repaint = true;
         }
     }
 
@@ -239,14 +284,79 @@ impl App {
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent, fx: &mut Effects) {
+        let at = (mouse.column, mouse.row).into();
+        match mouse.kind {
+            // The wheel scrolls what is under the pointer, focused or not.
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if self.ui.hits.sidebar.contains(at) => {
+                let down = mouse.kind == MouseEventKind::ScrollDown;
+                self.scroll_sidebar(if down { WHEEL_ROWS } else { -WHEEL_ROWS }, fx);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(pane) = self.ui.hits.pane_at(mouse.column, mouse.row) {
+                    if pane != self.ui.focus {
+                        self.ui.focus = pane;
+                        fx.repaint = true;
+                    }
+                }
+                let list = self.ui.hits.sidebar_list;
+                if list.contains(at) {
+                    let row = self.ui.sidebar.scroll + (mouse.row - list.y) as usize;
+                    if row != self.ui.sidebar.cursor {
+                        self.ui.sidebar.cursor = row;
+                        fx.repaint = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves the sidebar's window by `rows`, and the cursor with it when it
+    /// would leave the window, so the cursor row always stays on screen.
+    fn scroll_sidebar(&mut self, rows: isize, fx: &mut Effects) {
+        let Loadable::Ready(list) = &self.model.connections else { return };
+        let room = self.ui.hits.sidebar_list.height.max(1) as usize;
+        let sb = &mut self.ui.sidebar;
+        let max = list.len().saturating_sub(room);
+        let scroll = sb.scroll.saturating_add_signed(rows).min(max);
+        let cursor = sb.cursor.clamp(scroll, scroll + room - 1).min(list.len().saturating_sub(1));
+        if (scroll, cursor) != (sb.scroll, sb.cursor) {
+            (sb.scroll, sb.cursor) = (scroll, cursor);
+            fx.repaint = true;
+        }
+    }
+
+    fn on_overlay_key(&mut self, key: KeyEvent, fx: &mut Effects) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let combo = KeyCombo::from_event(&key);
+        let Some(overlay) = &self.ui.overlay else { return };
+        let action = overlay.buttons().iter().find(|b| KeyCombo::parse(b.key) == Some(combo)).map(|b| b.action);
+        if let Some(action) = action {
+            self.overlay_action(action, fx);
+        }
+    }
+
+    fn on_overlay_mouse(&mut self, mouse: MouseEvent, fx: &mut Effects) {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
         }
-        if let Some(pane) = self.ui.hits.pane_at(mouse.column, mouse.row) {
-            if pane != self.ui.focus {
-                self.ui.focus = pane;
+        let hit = self.ui.overlay_buttons.iter().find(|b| b.rect.contains((mouse.column, mouse.row).into()));
+        if let Some(action) = hit.map(|b| b.action) {
+            self.overlay_action(action, fx);
+        }
+    }
+
+    fn overlay_action(&mut self, action: OverlayAction, fx: &mut Effects) {
+        match action {
+            OverlayAction::Retry => {
+                self.ui.overlay = None;
+                let again = self.start();
+                fx.commands.extend(again.commands);
                 fx.repaint = true;
             }
+            OverlayAction::Quit => fx.commands.push(Command::Quit),
         }
     }
 
@@ -255,8 +365,19 @@ impl App {
         let Some(target) = self.model.requests.finish(id) else { return };
         let (Target::Connections, CoreReply::Connections(result)) = (target, reply) else { return };
         self.model.connections = match result {
-            Ok(list) => Loadable::Ready(list),
-            Err(e) => Loadable::Failed(e),
+            Ok(list) => {
+                let sidebar = &mut self.ui.sidebar;
+                sidebar.cursor = sidebar.cursor.min(list.len().saturating_sub(1));
+                Loadable::Ready(list)
+            }
+            Err(e) => {
+                // A store or key failure blocks everything: it gets the overlay.
+                if let Some(overlay) = ErrorOverlay::for_startup(&e) {
+                    self.ui.overlay = Some(Overlay::Error(overlay));
+                    self.ui.mode = Mode::Normal;
+                }
+                Loadable::Failed(e)
+            }
         };
         fx.repaint = true;
     }

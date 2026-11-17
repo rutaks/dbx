@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-pub use dbx::DbxCore;
+pub use dbx::{DbxCore, KeySource, StoreOptions};
+#[cfg(feature = "test-support")]
+pub use dbx::check_seed_dir;
 pub use fake::{Call, FakeCore, Scripted};
 
 // ---- identifiers -----------------------------------------------------------
@@ -37,6 +39,18 @@ pub enum DbKind {
     Sqlite,
     /// Any other kind dbx supports, by dbx's name for it.
     Other(String),
+}
+
+impl DbKind {
+    /// The short name the sidebar shows.
+    pub fn label(&self) -> &str {
+        match self {
+            DbKind::Postgres => "postgres",
+            DbKind::MySql => "mysql",
+            DbKind::Sqlite => "sqlite",
+            DbKind::Other(name) => name,
+        }
+    }
 }
 
 /// A saved, named way to reach one database server.

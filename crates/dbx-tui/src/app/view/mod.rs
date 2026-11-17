@@ -1,6 +1,8 @@
 //! Drawing. Every colour is a palette role; every width counts one column per
 //! character, which holds for everything drawn so far (ASCII and box glyphs).
 
+mod panel;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -8,7 +10,9 @@ use ratatui::Frame;
 
 use super::layout::HitMap;
 use super::theme::{Palette, Role};
+use super::overlay::{ErrorOverlay, Overlay, OverlayButton};
 use super::{App, Loadable, Mode, PaneId};
+use crate::core::Connection;
 
 pub fn draw(app: &mut App, frame: &mut Frame) {
     let hits = HitMap::compute(frame.area(), app.ui.focus, app.ui.zoomed);
@@ -21,6 +25,32 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     draw_editor(app, &p, buf, &hits);
     draw_results(app, &p, buf, &hits);
     draw_mode_bar(app, &p, buf, &hits);
+    // The overlay comes last, over everything else dimmed.
+    app.ui.overlay_buttons = match &app.ui.overlay {
+        Some(overlay) => {
+            panel::dim(buf, buf.area);
+            draw_overlay(overlay, &p, buf)
+        }
+        None => Vec::new(),
+    };
+}
+
+fn draw_overlay(overlay: &Overlay, p: &Painter, buf: &mut Buffer) -> Vec<OverlayButton> {
+    match overlay {
+        Overlay::Error(e) => {
+            let width = 64.min(buf.area.width.saturating_sub(4)).max(24);
+            let text_rows = panel::wrap(&e.message, width.saturating_sub(4) as usize).len() as u16;
+            // Border, message, a blank row, the buttons, border.
+            let rect = panel::centred(buf.area, width, text_rows + 4);
+            let inner = panel::panel(p, buf, rect, &e.title, Role::Accent, Role::Red);
+            if inner.is_empty() {
+                return Vec::new();
+            }
+            let text_area = Rect { height: inner.height.saturating_sub(2), ..inner };
+            panel::paragraph(p, buf, text_area, &e.message, Role::Text);
+            panel::buttons(p, buf, inner, inner.bottom() - 1, overlay.buttons())
+        }
+    }
 }
 
 /// Draws within `bounds`: the frame at first, then one pane. Nothing written
@@ -79,7 +109,7 @@ impl<'a> Painter<'a> {
     }
 }
 
-fn draw_sidebar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
+fn draw_sidebar(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     let r = hits.sidebar;
     if r.is_empty() {
         return;
@@ -96,15 +126,26 @@ fn draw_sidebar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
             p.put(buf, x, y, "loading…", p.fg(Role::Overlay0));
         }
         Loadable::Failed(e) => {
-            p.put(buf, x, y, &e.message, p.fg(Role::Red));
+            // A store or key failure is explained in the overlay; here it
+            // only needs naming. Anything else is explained here.
+            let brief = ErrorOverlay::for_startup(e).map(|o| format!("{}.", o.title));
+            p.put(buf, x, y, brief.as_deref().unwrap_or(&e.message), p.fg(Role::Red));
         }
         Loadable::Ready(list) if list.is_empty() => {
             p.put(buf, x, y, "No connections yet.", note);
+            // No key to add one until slice 03: only keys that work are shown.
+            p.put(buf, x, y + 1, "Add one in the dbx app.", p.fg(Role::Overlay0));
         }
         Loadable::Ready(list) => {
             let room = r.bottom().saturating_sub(y) as usize;
-            for (row, c) in (y..).zip(list.iter().take(room)) {
-                p.put(buf, x, row, &format!("○ {}", c.name), p.fg(Role::Text));
+            let sb = &mut app.ui.sidebar;
+            sb.cursor = sb.cursor.min(list.len().saturating_sub(1));
+            sb.scroll = scrolled(sb.scroll, sb.cursor, room);
+            let (cursor, scroll) = (sb.cursor, sb.scroll);
+            let shown = (list.len() - scroll).min(room) as u16;
+            app.ui.hits.sidebar_list = Rect::new(r.x, y, r.width, shown).intersection(r);
+            for (row, (i, c)) in (y..).zip(list.iter().enumerate().skip(scroll).take(room)) {
+                draw_connection_row(&p, buf, Rect::new(r.x, row, r.width, 1), c, i == cursor);
             }
         }
     }
@@ -114,6 +155,35 @@ fn draw_sidebar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     for y in sep.top()..sep.bottom() {
         ps.put(buf, sep.x, y, "│", ps.fg(Role::SurfaceDim));
     }
+}
+
+/// The first visible row of a list scrolled as little as possible from
+/// `scroll` to keep `cursor` inside a window of `room` rows.
+fn scrolled(scroll: usize, cursor: usize, room: usize) -> usize {
+    if room == 0 || cursor < scroll {
+        cursor
+    } else if cursor >= scroll + room {
+        cursor + 1 - room
+    } else {
+        scroll
+    }
+}
+
+/// One connection: state glyph, name, and its kind right-aligned and muted.
+/// The name gives way (ending in `…`) before the kind does.
+fn draw_connection_row(p: &Painter, buf: &mut Buffer, row: Rect, c: &Connection, cursor: bool) {
+    let p = p.within(row);
+    if cursor {
+        p.fill(buf, Style::default().bg(p.theme.color(Role::SelectionBg)));
+    }
+    let kind = c.kind.label();
+    let kind_w = kind.chars().count() as u16;
+    // " ○ " then the name, then one space, the kind and one space of margin.
+    let name_x = row.x + 3;
+    let kind_x = row.right().saturating_sub(kind_w + 1).max(name_x + 2);
+    p.put(buf, row.x + 1, row.y, "○", p.fg(Role::Overlay0));
+    p.within(Rect::new(name_x, row.y, kind_x.saturating_sub(name_x + 1), 1)).put(buf, name_x, row.y, &c.name, p.fg(Role::Text));
+    p.put(buf, kind_x, row.y, kind, p.fg(Role::Overlay0));
 }
 
 fn draw_editor(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
@@ -153,7 +223,16 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     let mut x = p.put(buf, r.x, r.y, &pane, label(Role::Accent));
 
     let hints = match app.ui.mode {
-        Mode::Normal => vec![(app.ui.keys.prefix.to_string(), "prefix")],
+        // An overlay takes all input and shows its own keys.
+        _ if app.ui.overlay.is_some() => Vec::new(),
+        Mode::Normal => {
+            let mut h = vec![(app.ui.keys.prefix.to_string(), "prefix")];
+            let has_rows = matches!(&app.model.connections, Loadable::Ready(list) if !list.is_empty());
+            if app.ui.focus == PaneId::Sidebar && has_rows {
+                h.push(("j/k".to_string(), "move"));
+            }
+            h
+        }
         Mode::Prefix { .. } => {
             x = p.put(buf, x + 1, r.y, " PREFIX ", label(Role::Yellow));
             let mut h = app.ui.keys.hints();

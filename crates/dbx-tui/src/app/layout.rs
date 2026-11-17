@@ -16,6 +16,9 @@ pub struct HitMap {
     pub sidebar: Rect,
     /// The one-column `│` between the sidebar and the rest.
     pub sidebar_separator: Rect,
+    /// The connection rows as drawn: the first is the list's `scroll`th entry.
+    /// Empty when no list is shown. Filled while drawing the sidebar.
+    pub sidebar_list: Rect,
     pub editor: Rect,
     /// The results pane, starting at the divider row that carries its title.
     pub results: Rect,

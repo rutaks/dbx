@@ -11,6 +11,24 @@ SOCK="dbxtui-test"
 SESSION="journey-$$"
 mkdir -p "$OUT"
 
+# Every journey runs the client against a scratch store with a scratch key:
+# never the real store, never the keychain (dbx reads DBX_SECRET_KEY_FILE
+# before any key policy).
+STORE="$OUT/store"
+KEYFILE="$OUT/secret.key"
+SCRATCH_HOME="$OUT/home"
+# HOME too, so dbx never looks for a key file in the real user's home.
+CLIENT="env -u DBX_SECRET_KEY HOME=$SCRATCH_HOME DBX_DATA_DIR=$STORE DBX_SECRET_KEY_FILE=$KEYFILE $BIN"
+scratch_store() {
+  rm -rf "$STORE"; mkdir -p "$STORE" "$SCRATCH_HOME"
+  [ -f "$KEYFILE" ] || { openssl rand -hex 32 >"$KEYFILE"; chmod 600 "$KEYFILE"; }
+}
+# seed NAME KIND HOST PORT [DATABASE]: saves a connection into the scratch store
+seed() {
+  env -u DBX_SECRET_KEY HOME="$SCRATCH_HOME" DBX_SECRET_KEY_FILE="$KEYFILE" "$TARGET_DIR/debug/examples/seed_store" "$STORE" "$@" >/dev/null \
+    || fail "seed $1"
+}
+
 tm() { tmux -L "$SOCK" "$@"; }
 cleanup() { tm kill-server >/dev/null 2>&1 || true; }
 trap cleanup EXIT

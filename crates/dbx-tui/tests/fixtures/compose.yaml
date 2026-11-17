@@ -1,0 +1,22 @@
+# Test databases for layers 1 and 5 (docs/process.md, Testing).
+# Bring up with ./up.sh, remove with ./down.sh. Compose project: dbxtui-fixtures.
+#
+# Postgres 16, pinned by digest (postgres:16 = 16.15-1.pgdg13+2 on 2026-11-17).
+# Host port 55433: 55432 belongs to another container.
+# Databases: `pagila` (Pagila at 5ba5a57, fetched by fetch-pagila.sh) and
+# `edge` (our edge-case schema, edge/*.sql). Superuser postgres / dbxtui.
+name: dbxtui-fixtures
+services:
+  postgres:
+    image: postgres@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+    environment:
+      POSTGRES_PASSWORD: dbxtui
+      POSTGRES_USER: postgres
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ./pagila:/fixtures/pagila:ro
+      - ./edge:/fixtures/edge:ro
+    tmpfs:
+      - /var/lib/postgresql/data
