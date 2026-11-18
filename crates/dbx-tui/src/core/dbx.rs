@@ -966,6 +966,33 @@ impl Syntax for DbxCore {
     }
 }
 
+/// dbx's `analyze_sql_references` for `sql`, in our own types. Its spans are
+/// 1-based lines and columns (the column of a character, with the end
+/// inclusive); ours are 0-based with the end after the last character.
+fn references_for(kind: &DbKind, sql: &str) -> Result<References, String> {
+    use dbx_core::sql_analysis::{analyze_sql_references, SqlTextSpan};
+    let span = |s: SqlTextSpan| {
+        let start = Cursor { row: s.start_line.saturating_sub(1), col: s.start_column.saturating_sub(1) };
+        let end = Cursor { row: s.end_line.saturating_sub(1), col: s.end_column };
+        Span { start, end: if (end.row, end.col) < (start.row, start.col) { start } else { end } }
+    };
+    let analysis = analyze_sql_references(sql, Some(kind.label()))?;
+    Ok(References {
+        tables: analysis
+            .tables
+            .into_iter()
+            .map(|t| TableReference { name: t.name, schema: t.schema, alias: t.alias, span: span(t.span), scope: t.scope_id })
+            .collect(),
+        columns: analysis
+            .columns
+            .into_iter()
+            .map(|c| ColumnReference { name: c.name, qualifier: c.qualifier, span: span(c.span), scope: c.scope_id })
+            .collect(),
+        scopes: analysis.scopes.into_iter().map(|s| (s.id, s.parent_id)).collect(),
+        unknown_qualifiers: analysis.unknown_qualifiers.into_iter().map(|u| (u.qualifier, span(u.span))).collect(),
+    })
+}
+
 /// The type names of a kind of database, from dbx's dialect files: each
 /// type's name and its aliases. `list_dialect_type_names` gives only the
 /// names (Postgres's `character varying`, not `varchar`; `integer`, not
@@ -1132,6 +1159,30 @@ impl Core for DbxCore {
             })
             .collect())
     }
+    async fn foreign_keys(&self, at: &TablePath) -> Result<Vec<ForeignKey>, CoreError> {
+        self.ensure_browsable(&at.schema.database.connection).await?;
+        let schema = &at.schema;
+        let (conn, database, schema_name, table) =
+            (schema.database.connection.0.clone(), schema.database.database.clone(), schema.schema.clone(), at.table.clone());
+        let list = self
+            .metadata(&schema.database.connection, move |state| async move {
+                dbx_core::schema::list_foreign_keys_core(&state, &conn, &database, &schema_name, &table).await
+            })
+            .await?;
+        Ok(list
+            .into_iter()
+            .map(|k| ForeignKey { name: k.name, column: k.column, ref_schema: k.ref_schema, ref_table: k.ref_table, ref_column: k.ref_column })
+            .collect())
+    }
+    async fn analyze_references(&self, kind: &DbKind, sql: &str) -> Result<Option<References>, CoreError> {
+        let (kind, sql) = (kind.clone(), sql.to_string());
+        // A parse of one statement: CPU only, off the runtime's workers.
+        let parsed = tokio::task::spawn_blocking(move || references_for(&kind, &sql))
+            .await
+            .map_err(|e| CoreError::new(CoreErrorKind::Other, format!("the analysis stopped unexpectedly: {e}")))?;
+        // A statement that does not parse is an answer, not a failure.
+        Ok(parsed.ok())
+    }
     async fn complete(&self, request: &CompletionRequest) -> Result<Completion, CoreError> {
         use dbx_core::db::{CompletionAssistantCandidateKind as K, CompletionAssistantMatchMode, CompletionAssistantObjectKind as O, CompletionAssistantRequest};
         self.ensure_browsable(&request.at.connection).await?;
@@ -1148,7 +1199,7 @@ impl Core for DbxCore {
             object_kinds,
             mask: request.prefix.clone(),
             case_sensitive: false,
-            global_search: false,
+            global_search: request.global,
             max_results: Some(limit),
             search_in_comments: false,
             search_in_definitions: false,
@@ -1777,5 +1828,18 @@ mod tests {
         assert_eq!(statement_range_for(&DbKind::Postgres, "", Cursor::default()), None);
         assert_eq!(statement_range_for(&DbKind::Postgres, "  \n ", Cursor::default()), None);
         assert_eq!(statement_range_for(&DbKind::Other("no-such-database".into()), "select 1", Cursor::default()), None);
+    }
+
+    #[test]
+    fn dbxs_analysis_names_the_tables_and_aliases_of_a_statement_that_parses_and_says_so_for_one_that_does_not() {
+        let sql = "select f.title\nfrom film f join public.film_actor as fa on fa.film_id = f.film_id";
+        let refs = references_for(&DbKind::Postgres, sql).expect("it parses");
+        let tables: Vec<(&str, Option<&str>, Option<&str>)> = refs.tables.iter().map(|t| (t.name.as_str(), t.schema.as_deref(), t.alias.as_deref())).collect();
+        assert_eq!(tables, [("film", None, Some("f")), ("film_actor", Some("public"), Some("fa"))]);
+        // Spans are in the rows and columns of the text, from 0, the end after the last character.
+        assert_eq!((refs.tables[0].span.start, refs.tables[0].span.end), (Cursor { row: 1, col: 5 }, Cursor { row: 1, col: 9 }));
+        assert!(refs.columns.iter().any(|c| c.name == "title" && c.qualifier.as_deref() == Some("f")), "{:?}", refs.columns);
+        assert!(refs.scopes.iter().any(|(_, parent)| parent.is_none()));
+        assert!(references_for(&DbKind::Postgres, "select a from film f join").is_err(), "a half-typed statement does not parse");
     }
 }

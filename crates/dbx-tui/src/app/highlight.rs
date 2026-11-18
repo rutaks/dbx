@@ -109,7 +109,7 @@ fn mysql_family(kind: Option<&DbKind>) -> bool {
     }
 }
 
-fn dialect_of(kind: Option<&DbKind>) -> Box<dyn Dialect> {
+pub(super) fn dialect_of(kind: Option<&DbKind>) -> Box<dyn Dialect> {
     match kind {
         Some(DbKind::Postgres) => Box::new(PostgreSqlDialect {}),
         Some(DbKind::Sqlite) => Box::new(SQLiteDialect {}),

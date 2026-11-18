@@ -151,6 +151,8 @@ pub enum Health {
 pub struct SchemaCache {
     nodes: HashMap<NodeId, Children>,
     health: HashMap<ConnectionId, Health>,
+    /// Counts changes to what is loaded: what the semantic colours key by.
+    version: u64,
 }
 
 static NOT_LOADED: Children = Children::NotLoaded;
@@ -160,7 +162,13 @@ impl SchemaCache {
         self.nodes.get(node).unwrap_or(&NOT_LOADED)
     }
 
+    /// Changes whenever a listing is stored or dropped.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     pub fn set(&mut self, node: NodeId, state: Children) {
+        self.version += 1;
         match state {
             Children::NotLoaded => self.nodes.remove(&node),
             state => self.nodes.insert(node, state),
@@ -226,6 +234,7 @@ impl SchemaCache {
         for n in &gone {
             self.nodes.remove(n);
         }
+        self.version += 1;
         gone
     }
 
@@ -236,6 +245,7 @@ impl SchemaCache {
         for n in &gone {
             self.nodes.remove(n);
         }
+        self.version += 1;
         gone
     }
 
@@ -256,6 +266,7 @@ impl SchemaCache {
 
     /// Forgets every node and the health of `connection`.
     pub fn remove_connection(&mut self, connection: &ConnectionId) {
+        self.version += 1;
         self.nodes.retain(|n, _| n.connection() != connection);
         self.health.remove(connection);
     }

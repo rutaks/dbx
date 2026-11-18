@@ -50,6 +50,12 @@ pub enum Role {
     SynIdentifier,
     SynPunct,
     SynBad,
+    /// A name that resolves to a column of the loaded schema (IntelliJ's
+    /// purple, herdr's `mauve`).
+    SynColumn,
+    /// A table, alias or column that resolves to nothing in the loaded schema
+    /// (IntelliJ's unresolved-reference red).
+    SynUnresolved,
     EditorBg,
     CurrentLine,
     LineNumber,
@@ -61,7 +67,7 @@ pub enum Role {
 }
 
 impl Role {
-    pub const ALL: [Role; 35] = [
+    pub const ALL: [Role; 37] = [
         Role::Accent,
         Role::PanelBg,
         Role::SidebarBg,
@@ -90,6 +96,8 @@ impl Role {
         Role::SynIdentifier,
         Role::SynPunct,
         Role::SynBad,
+        Role::SynColumn,
+        Role::SynUnresolved,
         Role::EditorBg,
         Role::CurrentLine,
         Role::LineNumber,
@@ -131,6 +139,8 @@ pub struct Palette {
     syn_identifier: Color,
     syn_punct: Color,
     syn_bad: Color,
+    syn_column: Color,
+    syn_unresolved: Color,
     editor_bg: Color,
     current_line: Color,
     line_number: Color,
@@ -176,6 +186,8 @@ impl Palette {
             Role::SynIdentifier => self.syn_identifier,
             Role::SynPunct => self.syn_punct,
             Role::SynBad => self.syn_bad,
+            Role::SynColumn => self.syn_column,
+            Role::SynUnresolved => self.syn_unresolved,
             Role::EditorBg => self.editor_bg,
             Role::CurrentLine => self.current_line,
             Role::LineNumber => self.line_number,
@@ -245,6 +257,8 @@ impl Palette {
             syn_identifier: Color::Rgb(205, 214, 244),
             syn_punct: Color::Rgb(205, 214, 244),
             syn_bad: Color::Rgb(243, 139, 168),
+            syn_column: Color::Rgb(203, 166, 247),
+            syn_unresolved: Color::Rgb(243, 139, 168),
             editor_bg: Color::Reset,
             current_line: Color::Rgb(30, 30, 46),
             line_number: Color::Rgb(108, 112, 134),
@@ -287,6 +301,8 @@ impl Palette {
             syn_identifier: Color::Reset,
             syn_punct: Color::Reset,
             syn_bad: Color::LightRed,
+            syn_column: Color::Magenta,
+            syn_unresolved: Color::LightRed,
             editor_bg: Color::Reset,
             current_line: Color::DarkGray,
             line_number: Color::DarkGray,
@@ -335,6 +351,8 @@ impl Palette {
             syn_identifier: rgb(0xBCBEC4),
             syn_punct: rgb(0xBCBEC4),
             syn_bad: rgb(0xF75464),
+            syn_column: rgb(0xC77DBB),
+            syn_unresolved: rgb(0xF75464),
             editor_bg: rgb(0x1E1F22),
             current_line: rgb(0x26282E),
             line_number: rgb(0x4B5059),
@@ -381,6 +399,8 @@ impl Palette {
             syn_identifier: c(25),
             syn_punct: c(26),
             syn_bad: c(27),
+            syn_column: c(35),
+            syn_unresolved: c(36),
             editor_bg: c(28),
             current_line: c(29),
             line_number: c(30),
@@ -483,6 +503,8 @@ mod tests {
         assert_eq!(p.color(Role::SynIdentifier), rgb(0xBC, 0xBE, 0xC4));
         assert_eq!(p.color(Role::SynPunct), rgb(0xBC, 0xBE, 0xC4));
         assert_eq!(p.color(Role::SynBad), rgb(0xF7, 0x54, 0x64));
+        assert_eq!(p.color(Role::SynColumn), rgb(0xC7, 0x7D, 0xBB));
+        assert_eq!(p.color(Role::SynUnresolved), rgb(0xF7, 0x54, 0x64));
         assert_eq!(p.color(Role::Text), rgb(0xBC, 0xBE, 0xC4));
         assert_eq!(p.color(Role::EditorBg), rgb(0x1E, 0x1F, 0x22));
         assert_eq!(p.color(Role::CurrentLine), rgb(0x26, 0x28, 0x2E));

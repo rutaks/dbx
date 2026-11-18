@@ -491,6 +491,7 @@ impl App {
             a if a.scope() == super::keys::Scope::Results => self.perform_results(a, now, fx),
             a if a.scope() == super::keys::Scope::Resize => self.perform_resize(a, fx),
             a if a.scope() == super::keys::Scope::Complete => self.perform_complete(a, fx),
+            a if a.scope() == super::keys::Scope::Template => self.perform_template(a, fx),
             a if a.scope() != super::keys::Scope::Sidebar => self.perform(a, now, fx),
             a => self.perform_sidebar(a, fx),
         }

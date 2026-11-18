@@ -235,6 +235,10 @@ pub struct CompletionRequest {
     pub prefix: String,
     /// The most names returned.
     pub limit: usize,
+    /// Relations only, with no `schema`: look in every schema the user may
+    /// use, and not only in those the search path makes visible (dbx's
+    /// `global_search`). It is how a name that exists in two schemas is found.
+    pub global: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -263,6 +267,63 @@ pub struct Completion {
     pub candidates: Vec<Candidate>,
     /// The search stopped at its limit: there may be more names.
     pub incomplete: bool,
+}
+
+/// One column pair of a foreign key of a table: the table's own `column`
+/// refers to `ref_column` of `ref_table`. A key over several columns is
+/// several of these with the same `name`, in column order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub column: String,
+    /// The schema of the referenced table, when the database says it.
+    pub ref_schema: Option<String>,
+    pub ref_table: String,
+    pub ref_column: String,
+}
+
+// ---- what a statement refers to ----------------------------------------------
+
+/// A stretch of SQL text, in characters: `start` is the first character and
+/// `end` the one after the last, in the rows and columns of the text that was
+/// analysed (the first row is 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: Cursor,
+    pub end: Cursor,
+}
+
+/// A table a statement names (dbx's `SqlTableReference`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableReference {
+    pub name: String,
+    pub schema: Option<String>,
+    pub alias: Option<String>,
+    pub span: Span,
+    /// The query block it is in; see `References::scopes`.
+    pub scope: usize,
+}
+
+/// A column a statement names, with the name before its dot when it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnReference {
+    pub name: String,
+    pub qualifier: Option<String>,
+    pub span: Span,
+    pub scope: usize,
+}
+
+/// What dbx's analysis of a statement that parses says it refers to
+/// (`analyze_sql_references`). Names are as written; CTE names and subquery
+/// aliases are not among `tables`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct References {
+    pub tables: Vec<TableReference>,
+    pub columns: Vec<ColumnReference>,
+    /// (id, the id of the block that holds it).
+    pub scopes: Vec<(usize, Option<usize>)>,
+    /// Qualifiers (`x` of `x.col`) that name no table or alias in view.
+    pub unknown_qualifiers: Vec<(String, Span)>,
 }
 
 // ---- runs and results ------------------------------------------------------
@@ -536,6 +597,17 @@ pub trait Core: Syntax {
     async fn schemas(&self, at: &DatabasePath) -> Result<Vec<String>, CoreError>;
     async fn tables(&self, at: &SchemaPath) -> Result<Vec<Table>, CoreError>;
     async fn columns(&self, at: &TablePath) -> Result<Vec<ColumnInfo>, CoreError>;
+    /// The foreign keys a table has (dbx's `list_foreign_keys_core`): the
+    /// table's own columns that refer to another table. Keys of other tables
+    /// that refer to this one are not included.
+    async fn foreign_keys(&self, at: &TablePath) -> Result<Vec<ForeignKey>, CoreError>;
+    /// What the statement `sql` (one statement, the text of the buffer between
+    /// two positions) refers to: dbx's `analyze_sql_references`, on the
+    /// dialect of `kind`. `Ok(None)` says the text does not parse, which a
+    /// half-typed statement does not; the caller reads tokens then. It does no
+    /// I/O, but it is a call like the others (answered later, a stale answer
+    /// dropped) so that typing never waits for a parse.
+    async fn analyze_references(&self, kind: &DbKind, sql: &str) -> Result<Option<References>, CoreError>;
     /// A prefix search of names for the completion popup: schemas, tables and
     /// views, or functions. Like the schema calls it can be abandoned: the
     /// caller drops the future and the work stops.

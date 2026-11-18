@@ -1039,7 +1039,7 @@ async fn observe_loading_a_million_rows() {
 // ---- slice 11: the completion popup's calls ----------------------------------
 
 fn search(id: &ConnectionId, db: &str, schema: Option<&str>, kind: SearchKind, prefix: &str) -> CompletionRequest {
-    CompletionRequest { at: database(id, db), schema: schema.map(String::from), kind, prefix: prefix.into(), limit: 100 }
+    CompletionRequest { at: database(id, db), schema: schema.map(String::from), kind, prefix: prefix.into(), limit: 100, global: false }
 }
 
 fn kinds(found: &[Candidate]) -> Vec<(&str, CandidateKind)> {
@@ -1143,4 +1143,30 @@ async fn abandoning_a_search_stops_its_work_and_the_next_call_works() {
     let _ = slow.await;
     let found = core.complete(&search(&id, "pagila", Some("public"), SearchKind::Relation, "fil")).await.expect("the next search");
     assert_eq!(found.candidates.len(), 4);
+}
+
+#[tokio::test]
+async fn the_foreign_keys_of_film_actor_name_film_and_actor() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let keys = core.foreign_keys(&table(&id, "pagila", "public", "film_actor")).await.expect("foreign keys");
+    eprintln!("OBSERVED film_actor keys: {keys:?}");
+    let has = |column: &str, to: &str, to_column: &str| keys.iter().any(|k| k.column == column && k.ref_table == to && k.ref_column == to_column && k.ref_schema.as_deref().is_none_or(|s| s == "public"));
+    assert!(has("film_id", "film", "film_id"), "{keys:?}");
+    assert!(has("actor_id", "actor", "actor_id"), "{keys:?}");
+    // Only the table's own keys: `film` has none that refer to film_actor.
+    let film = core.foreign_keys(&table(&id, "pagila", "public", "film")).await.expect("foreign keys");
+    assert!(film.iter().all(|k| k.ref_table != "film_actor"), "{film:?}");
+}
+
+#[tokio::test]
+async fn a_search_across_schemas_finds_a_name_that_two_schemas_have() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let all = core.complete(&CompletionRequest { global: true, ..search(&id, "pagila", None, SearchKind::Relation, "film") }).await.expect("search");
+    assert!(all.candidates.iter().any(|c| c.name == "film" && c.schema.as_deref() == Some("public")), "{all:?}");
 }

@@ -62,6 +62,8 @@ pub enum Call {
     Schemas(DatabasePath),
     Tables(SchemaPath),
     Columns(TablePath),
+    ForeignKeys(TablePath),
+    Analyze(String),
     Complete(CompletionRequest),
     CurrentSchema(DatabasePath),
     Release(DatabasePath),
@@ -85,6 +87,8 @@ pub struct Catalogue {
     pub functions: Vec<(String, String, String)>,
     /// (schema, table, columns)
     pub columns: Vec<(String, String, Vec<ColumnInfo>)>,
+    /// (schema, table, the keys of that table)
+    pub foreign_keys: Vec<(String, String, Vec<ForeignKey>)>,
     pub delay: Duration,
 }
 
@@ -111,6 +115,8 @@ pub struct FakeCore {
     sessions: Mutex<HashSet<(SessionId, DatabasePath)>>,
     default_connections_empty: std::sync::atomic::AtomicBool,
     syntax_calls: Mutex<SyntaxCalls>,
+    /// What `analyze_references` answers, by the exact text asked about.
+    analyses: Mutex<Vec<(String, References)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -199,6 +205,11 @@ impl FakeCore {
         if let Some(c) = lock(&self.catalogue).as_mut() {
             c.delay = delay;
         }
+    }
+    /// Makes `analyze_references` answer `references` for exactly `sql`. Any
+    /// other text does not parse, as far as the fake is concerned (`None`).
+    pub fn script_analysis(&self, sql: &str, references: References) {
+        lock(&self.analyses).push((sql.to_string(), references));
     }
     pub fn script_run(&self, r: Scripted<ResultSet>) {
         push(&self.run, r);
@@ -303,6 +314,20 @@ impl Core for FakeCore {
             }
         }
         reply(&self.columns, || unscripted("columns")).await
+    }
+
+    async fn foreign_keys(&self, at: &TablePath) -> Result<Vec<ForeignKey>, CoreError> {
+        self.record(Call::ForeignKeys(at.clone()));
+        let Some(c) = lock(&self.catalogue).clone() else { return unscripted("foreign_keys") };
+        if !c.delay.is_zero() {
+            tokio::time::sleep(c.delay).await;
+        }
+        Ok(c.foreign_keys.iter().find(|(s, t, _)| *s == at.schema.schema && *t == at.table).map(|(_, _, keys)| keys.clone()).unwrap_or_default())
+    }
+
+    async fn analyze_references(&self, _kind: &DbKind, sql: &str) -> Result<Option<References>, CoreError> {
+        self.record(Call::Analyze(sql.to_string()));
+        Ok(lock(&self.analyses).iter().find(|(text, _)| text == sql).map(|(_, r)| r.clone()))
     }
 
     async fn complete(&self, request: &CompletionRequest) -> Result<Completion, CoreError> {
@@ -505,7 +530,8 @@ mod tests {
             core.schemas(&db).await.err(),
             core.tables(&schema).await.err(),
             core.columns(&table).await.err(),
-            core.complete(&CompletionRequest { at: db.clone(), schema: None, kind: SearchKind::Relation, prefix: String::new(), limit: 10 }).await.err(),
+            core.foreign_keys(&table).await.err(),
+            core.complete(&CompletionRequest { at: db.clone(), schema: None, kind: SearchKind::Relation, prefix: String::new(), limit: 10, global: false }).await.err(),
             core.current_schema(&db).await.err(),
             core.run(RunId(1), request()).await.err(),
             core.close_session(SessionId { tab: TabId(1), serial: 1 }, &db).await.err(),

@@ -19,6 +19,9 @@ impl KeyCombo {
             KeyCode::Char(c) if mods.contains(KeyModifiers::SHIFT) => {
                 Self { code: KeyCode::Char(c.to_ascii_uppercase()), mods: mods - KeyModifiers::SHIFT }
             }
+            // `shift+tab` is one key, which terminals send as `BackTab` with
+            // or without shift set.
+            KeyCode::Tab | KeyCode::BackTab if mods.contains(KeyModifiers::SHIFT) => Self { code: KeyCode::BackTab, mods: mods - KeyModifiers::SHIFT },
             _ => Self { code, mods },
         }
     }
@@ -49,6 +52,7 @@ impl KeyCombo {
                     "ctrl" => KeyModifiers::CONTROL,
                     "alt" => KeyModifiers::ALT,
                     "shift" => KeyModifiers::SHIFT,
+                    "cmd" | "super" => KeyModifiers::SUPER,
                     _ => return None,
                 };
             }
@@ -87,6 +91,9 @@ impl fmt::Display for KeyCombo {
         if self.mods.contains(KeyModifiers::ALT) {
             f.write_str("alt+")?;
         }
+        if self.mods.contains(KeyModifiers::SUPER) {
+            f.write_str("cmd+")?;
+        }
         if self.mods.contains(KeyModifiers::SHIFT) {
             f.write_str("shift+")?;
         }
@@ -99,7 +106,7 @@ impl fmt::Display for KeyCombo {
             KeyCode::Delete => f.write_str("delete"),
             KeyCode::Home => f.write_str("home"),
             KeyCode::End => f.write_str("end"),
-            KeyCode::BackTab => f.write_str("backtab"),
+            KeyCode::BackTab => f.write_str("shift+tab"),
             KeyCode::PageUp => f.write_str("pageup"),
             KeyCode::PageDown => f.write_str("pagedown"),
             KeyCode::Char(c) => write!(f, "{c}"),
@@ -130,6 +137,9 @@ pub enum Scope {
     /// Read by the editor while the completion popup is open, before the
     /// editor itself sees the key.
     Complete,
+    /// Read by the editor while a live template is being filled in, before the
+    /// editor itself sees the key.
+    Template,
 }
 
 /// A named thing the client can do, to which keys are bound.
@@ -147,7 +157,7 @@ pub enum Action {
     OpenPrefix,
     /// Run the selection, or the statement under the cursor, in the query tab.
     Run,
-    /// The same, from a direct key (`f5`, `alt+enter`).
+    /// The same, from a direct key (`f5`).
     RunDirect,
     /// Cancel the tab's run; while a cancel is waiting to land, offer to drop
     /// the tab's session.
@@ -199,6 +209,11 @@ pub enum Action {
     ResizeDone,
     /// Open the completion popup by hand (a direct key, in the editor).
     CompleteOpen,
+    /// The intention actions (`alt+enter`, as in IntelliJ): on a select list's
+    /// `*` the caret is on, replace it with the columns it stands for; where
+    /// no action applies, nothing happens, and no hint is shown. It is not a
+    /// run key.
+    ExpandStar,
     // The completion popup's own keys, read while it is open.
     /// Insert the selected suggestion at the caret.
     CompleteInsert,
@@ -209,6 +224,24 @@ pub enum Action {
     CompletePageUp,
     CompletePageDown,
     CompleteClose,
+    /// Expand the live template the popup has highlighted (`enter` and `tab`
+    /// by default: what is highlighted is what you get). Read before the
+    /// popup's own keys, and only while a template is highlighted.
+    ExpandTemplate,
+    // The keys of a live template being filled in.
+    /// Move to the next variable; from the last, to the template's end.
+    TemplateNext,
+    TemplatePrev,
+    /// Leave template mode with the text as it is.
+    TemplateDone,
+    /// Put the caret on the next / previous name the loaded schema does not
+    /// have (direct keys, shown only while there is one).
+    NextUnresolved,
+    PrevUnresolved,
+    /// Close the open parentheses of the statement under the caret and add its
+    /// semicolon: from a direct key, and after the prefix.
+    FinishStatementDirect,
+    FinishStatement,
 }
 
 impl Action {
@@ -249,11 +282,19 @@ impl Action {
             Action::ResizeUp | Action::ResizeDown => "split",
             Action::ResizeDone => "done",
             Action::CompleteOpen => "complete",
+            Action::ExpandStar => "expand *",
             Action::CompleteInsert => "insert",
             Action::CompleteReplace => "replace",
             Action::CompleteUp | Action::CompleteDown => "move",
             Action::CompletePageUp | Action::CompletePageDown => "page",
             Action::CompleteClose => "close",
+            Action::ExpandTemplate => "expand",
+            Action::TemplateNext => "next",
+            Action::TemplatePrev => "prev",
+            Action::TemplateDone => "done",
+            Action::NextUnresolved => "next error",
+            Action::PrevUnresolved => "prev error",
+            Action::FinishStatementDirect | Action::FinishStatement => "finish",
         }
     }
 
@@ -269,15 +310,24 @@ impl Action {
             | Action::Run
             | Action::Cancel
             | Action::ResizeMode
+            | Action::FinishStatement
             | Action::OpenPrefix => Scope::Prefix,
             Action::ResizeLeft | Action::ResizeRight | Action::ResizeUp | Action::ResizeDown | Action::ResizeDone => Scope::Resize,
-            Action::RunDirect | Action::CancelDirect | Action::CompleteOpen => Scope::Direct,
+            Action::RunDirect
+            | Action::CancelDirect
+            | Action::CompleteOpen
+            | Action::ExpandStar
+            | Action::NextUnresolved
+            | Action::PrevUnresolved
+            | Action::FinishStatementDirect => Scope::Direct,
+            Action::TemplateNext | Action::TemplatePrev | Action::TemplateDone => Scope::Template,
             Action::CompleteInsert
             | Action::CompleteReplace
             | Action::CompleteUp
             | Action::CompleteDown
             | Action::CompletePageUp
             | Action::CompletePageDown
+            | Action::ExpandTemplate
             | Action::CompleteClose => Scope::Complete,
             Action::GridLeft
             | Action::GridRight
@@ -309,6 +359,7 @@ pub struct Keybinds {
     results: Vec<(KeyCombo, Action)>,
     resize: Vec<(KeyCombo, Action)>,
     complete: Vec<(KeyCombo, Action)>,
+    template: Vec<(KeyCombo, Action)>,
 }
 
 impl Default for Keybinds {
@@ -329,12 +380,20 @@ impl Default for Keybinds {
                 (plain('z'), Action::Zoom),
                 (plain('q'), Action::Quit),
                 (plain('R'), Action::ResizeMode),
+                (plain(';'), Action::FinishStatement),
             ],
             direct: vec![
                 (key("f5"), Action::RunDirect),
-                (key("alt+enter"), Action::RunDirect),
                 (key("ctrl+c"), Action::CancelDirect),
                 (key("ctrl+space"), Action::CompleteOpen),
+                // The intention actions: where the caret is on a select list's
+                // `*`, it expands it; anywhere else it does nothing. It never runs.
+                (key("alt+enter"), Action::ExpandStar),
+                (key("f2"), Action::NextUnresolved),
+                (key("shift+f2"), Action::PrevUnresolved),
+                // Terminals differ in which of the two they can send.
+                (key("cmd+shift+enter"), Action::FinishStatementDirect),
+                (key("ctrl+shift+enter"), Action::FinishStatementDirect),
             ],
             sidebar: vec![
                 (key("j"), Action::MoveDown),
@@ -407,6 +466,14 @@ impl Default for Keybinds {
                 (key("pagedown"), Action::CompletePageDown),
                 (key("pageup"), Action::CompletePageUp),
                 (key("esc"), Action::CompleteClose),
+                // Where a template is highlighted these are read first.
+                (key("tab"), Action::ExpandTemplate),
+                (key("enter"), Action::ExpandTemplate),
+            ],
+            template: vec![
+                (key("tab"), Action::TemplateNext),
+                (key("shift+tab"), Action::TemplatePrev),
+                (key("esc"), Action::TemplateDone),
             ],
         }
     }
@@ -438,9 +505,22 @@ impl Keybinds {
         self.resize.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
 
-    /// The action the completion popup binds to `key`.
-    pub fn lookup_complete(&self, key: &KeyCombo) -> Option<Action> {
-        self.complete.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+    /// The action a live template being filled in binds to `key`.
+    pub fn lookup_template(&self, key: &KeyCombo) -> Option<Action> {
+        self.template.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+    }
+
+    /// The action the completion popup binds to `key`. While `template` (the
+    /// popup has a live template highlighted) the expansion key is the
+    /// template's, whatever else the key does.
+    pub fn lookup_complete(&self, key: &KeyCombo, template: bool) -> Option<Action> {
+        let own = |a: &Action| (*a == Action::ExpandTemplate) == template;
+        self.complete.iter().find(|(k, a)| k == key && own(a)).or_else(|| self.complete.iter().find(|(k, a)| k == key && *a != Action::ExpandTemplate)).map(|(_, a)| *a)
+    }
+
+    /// Every key bound to `action` in its scope, as shown, in binding order.
+    pub fn keys_for(&self, action: Action) -> Vec<String> {
+        self.table(action.scope()).iter().filter(|(_, a)| *a == action).map(|(k, _)| k.to_string()).collect()
     }
 
     fn table(&self, scope: Scope) -> &[(KeyCombo, Action)] {
@@ -451,6 +531,7 @@ impl Keybinds {
             Scope::Sidebar => &self.sidebar,
             Scope::Resize => &self.resize,
             Scope::Complete => &self.complete,
+            Scope::Template => &self.template,
         }
     }
 
@@ -472,6 +553,7 @@ impl Keybinds {
             Scope::Results => &mut self.results,
             Scope::Resize => &mut self.resize,
             Scope::Complete => &mut self.complete,
+            Scope::Template => &mut self.template,
         };
         table.retain(|(k, a)| *a != action && *k != combo);
         table.push((combo, action));
@@ -508,19 +590,29 @@ impl Keybinds {
     }
 
     /// The hints for the mode bar while the completion popup is open, from
-    /// the live bindings.
-    pub fn complete_hints(&self) -> Vec<Hint> {
+    /// the live bindings. With a live template highlighted the keys that take
+    /// it are the expansion's.
+    pub fn complete_hints(&self, template: bool) -> Vec<Hint> {
         let one = |actions: &[Action], desc: &'static str| Hint {
             keys: actions.iter().filter_map(|a| self.key_for(*a).map(|k| (k, *a))).collect(),
             desc,
         };
+        let expand = Hint { keys: self.keys_for(Action::ExpandTemplate).into_iter().map(|k| (k, Action::ExpandTemplate)).collect(), desc: "expand" };
         let mut out = vec![
-            one(&[Action::CompleteInsert], "insert"),
-            one(&[Action::CompleteReplace], "replace"),
+            if template { expand } else { one(&[Action::CompleteInsert], "insert") },
+            if template { Hint { keys: Vec::new(), desc: "replace" } } else { one(&[Action::CompleteReplace], "replace") },
             one(&[Action::CompleteDown, Action::CompleteUp], "move"),
             one(&[Action::CompletePageDown, Action::CompletePageUp], "page"),
             one(&[Action::CompleteClose], "close"),
         ];
+        out.retain(|h| !h.keys.is_empty());
+        out
+    }
+
+    /// The hints for the mode bar while a live template is being filled in.
+    pub fn template_hints(&self) -> Vec<Hint> {
+        let one = |action: Action, desc: &'static str| Hint { keys: self.key_for(action).map(|k| (k, action)).into_iter().collect(), desc };
+        let mut out = vec![one(Action::TemplateNext, "next"), one(Action::TemplatePrev, "prev"), one(Action::TemplateDone, "done")];
         out.retain(|h| !h.keys.is_empty());
         out
     }

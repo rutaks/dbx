@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::Painter;
 use crate::app::highlight::{matching_bracket, Span};
+use crate::app::marks::Mark;
 use crate::app::theme::Role;
 use crate::app::App;
 use crate::core::{display_safe, DbKind};
@@ -118,6 +119,7 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
         let look = Look {
             theme,
             spans,
+            marks: ui.marks.row(row),
             selected,
             marked: &marked,
             caret: (focused && at_caret).then_some(caret.col),
@@ -147,6 +149,8 @@ fn gutter_text(p: &Painter, buf: &mut Buffer, gutter: Rect, y: u16, n: &str, sty
 struct Look<'a> {
     theme: &'a crate::app::theme::Palette,
     spans: &'a [Span],
+    /// Names the loaded schema resolves (or does not), over plain identifiers.
+    marks: &'a [Mark],
     /// Selected characters of the row, `usize::MAX` meaning to its end.
     selected: Option<(usize, usize)>,
     /// Characters with the matched-bracket background.
@@ -197,7 +201,12 @@ fn paint_line(p: &Painter, buf: &mut Buffer, text: Rect, y: u16, line: &str, lef
         while look.spans.get(si).is_some_and(|s| s.end <= ch) {
             si += 1;
         }
-        let role = look.spans.get(si).filter(|s| s.start <= ch).map_or(Role::Text, |s| s.role);
+        let mut role = look.spans.get(si).filter(|s| s.start <= ch).map_or(Role::Text, |s| s.role);
+        if role == Role::SynIdentifier {
+            if let Some(m) = look.marks.iter().find(|m| m.start <= ch && ch < m.end) {
+                role = m.role;
+            }
+        }
         let mut style = Style::default().fg(theme.color(role)).add_modifier(theme.modifier(role)).bg(look.base_bg);
         if look.marked.iter().any(|&m| (ch..ch + chars).contains(&m)) {
             style = style.bg(theme.color(Role::MatchedBrace)).add_modifier(theme.modifier(Role::MatchedBrace));

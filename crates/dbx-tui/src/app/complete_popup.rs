@@ -14,6 +14,16 @@ pub enum ItemKind {
     Column,
     Function,
     Procedure,
+    /// A common table expression defined in the statement.
+    Cte,
+    /// Every column of a table, comma-separated, for an `insert` column list.
+    ColumnList,
+    /// An expression or alias of the select list, for `group by` and `order by`.
+    Select,
+    /// A whole `join ... on` condition built from a foreign key.
+    Condition,
+    /// A live template: its abbreviation, expanded with `tab`.
+    Template,
 }
 
 impl ItemKind {
@@ -29,6 +39,11 @@ impl ItemKind {
             ItemKind::Column => "column",
             ItemKind::Function => "function",
             ItemKind::Procedure => "procedure",
+            ItemKind::Cte => "cte",
+            ItemKind::ColumnList => "columns",
+            ItemKind::Select => "select",
+            ItemKind::Condition => "join",
+            ItemKind::Template => "template",
         }
     }
 }
@@ -46,6 +61,23 @@ pub struct Item {
     pub detail: Option<String>,
     /// The characters of `name` the typed text matched.
     pub matched: Vec<usize>,
+    /// What the item belongs to, shown beside it: the alias (or name) of the
+    /// table a column is from, the schema of a table whose name more than one
+    /// schema has.
+    pub owner: Option<String>,
+    /// The alias accepting this table adds after its name (`film f`).
+    pub alias: Option<String>,
+}
+
+impl Item {
+    /// What accepting the item puts into the text: `insert`, and the alias
+    /// after it when there is one.
+    pub fn text(&self) -> String {
+        match &self.alias {
+            Some(alias) => format!("{} {alias}", self.insert),
+            None => self.insert.clone(),
+        }
+    }
 }
 
 /// Rows the window shows at most.
@@ -73,9 +105,9 @@ impl Popup {
     /// Otherwise, or when it is not there, it is the first: the best match,
     /// whichever it now is, and the list is new to the user.
     pub fn set_items(&mut self, items: Vec<Item>, keep: bool) {
-        let was = if keep && (self.touched || self.seen) { self.selected_item().map(|i| (i.name.clone(), i.kind)) } else { None };
+        let was = if keep && (self.touched || self.seen) { self.selected_item().map(|i| (i.name.clone(), i.kind, i.owner.clone())) } else { None };
         self.items = items;
-        match was.and_then(|(name, kind)| self.items.iter().position(|i| i.name == name && i.kind == kind)) {
+        match was.and_then(|(name, kind, owner)| self.items.iter().position(|i| i.name == name && i.kind == kind && i.owner == owner)) {
             Some(at) => self.selected = at,
             None => {
                 self.selected = 0;
@@ -201,7 +233,7 @@ mod tests {
     use super::*;
 
     fn item(name: &str, kind: ItemKind) -> Item {
-        Item { name: name.into(), insert: name.into(), kind, detail: None, matched: Vec::new() }
+        Item { name: name.into(), insert: name.into(), kind, detail: None, matched: Vec::new(), owner: None, alias: None }
     }
 
     fn items(n: usize) -> Vec<Item> {

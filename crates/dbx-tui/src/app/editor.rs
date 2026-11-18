@@ -189,6 +189,27 @@ impl Editor {
         Ok(changed)
     }
 
+    /// Puts the caret at `at` (clamped to the text) and ends any selection.
+    pub fn move_to(&mut self, at: Cursor) {
+        self.area.cancel_selection();
+        let row = at.row.min(self.area.lines().len().saturating_sub(1));
+        let col = at.col.min(self.area.lines().get(row).map_or(0, |l| l.chars().count()));
+        self.area.move_cursor(CursorMove::Jump(row.min(u16::MAX as usize) as u16, col.min(u16::MAX as usize) as u16));
+    }
+
+    /// Selects `from..to` of one row, with the caret at `to`: typing replaces it.
+    pub fn select_range(&mut self, from: Cursor, to: Cursor) {
+        self.move_to(from);
+        if to != from {
+            self.area.start_selection();
+            self.move_to_keeping_selection(to);
+        }
+    }
+
+    fn move_to_keeping_selection(&mut self, at: Cursor) {
+        self.area.move_cursor(CursorMove::Jump(at.row.min(u16::MAX as usize) as u16, at.col.min(u16::MAX as usize) as u16));
+    }
+
     /// Inserts pasted text at the cursor, replacing any selection. Returns
     /// whether the buffer changed, or, for a paste over `PASTE_LIMIT` or with
     /// a line over `LINE_LIMIT`, why none of it was pasted: SQL is never cut.

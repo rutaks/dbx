@@ -125,7 +125,7 @@ async fn the_prefix_and_the_run_keys_never_reach_the_editor() {
     assert!(matches!(h.app.ui.mode, Mode::Prefix { .. }), "ctrl+g is the prefix, not the widget's");
     h.press("esc");
     h.press("f5 alt+enter");
-    assert_eq!(h.app.ui.editor.text(), "x", "no newline from alt+enter, nothing from f5");
+    assert_eq!(h.app.ui.editor.text(), "x", "no newline from alt+enter (an intention action, not a run key), nothing from f5");
 }
 
 #[tokio::test]
@@ -164,7 +164,7 @@ async fn with_no_database_given_to_the_tab_run_shows_a_notice_and_emits_no_comma
     let mut h = started(&["local pg"]).await;
     h.press("ctrl+g l");
     h.type_text("select 1");
-    for keys in ["f5", "alt+enter", "ctrl+g r"] {
+    for keys in ["f5", "ctrl+g r"] {
         h.app.ui.notice = None;
         let commands = h.press_fx(keys);
         assert!(commands.is_empty(), "{keys}: {commands:?}");

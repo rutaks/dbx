@@ -81,9 +81,10 @@ connection cancels a run on it first, and the removal waits for that run.
 
 | Key | Does |
 |---|---|
-| `f5`, `alt+enter`, `ctrl+g r` | run the selection, or else the statement under the cursor (dbx splits statements at `;`, and also before a line starting with a keyword such as `CREATE`, `INSERT`, `UPDATE`, `DELETE` or `SET`, but not `SELECT` or `WITH`, after two or more blank lines; a cursor on a blank line after a statement runs that statement) |
+| `f5`, `ctrl+g r` | run the selection, or else the statement under the cursor (dbx splits statements at `;`, and also before a line starting with a keyword such as `CREATE`, `INSERT`, `UPDATE`, `DELETE` or `SET`, but not `SELECT` or `WITH`, after two or more blank lines; a cursor on a blank line after a statement runs that statement) |
 | `ctrl+c` (editor or results focused), `ctrl+g c` (anywhere) | cancel the run; pressed again while the cancel has not landed, ask whether to stop waiting (below). With nothing running, `ctrl+c` does nothing at all |
 | `ctrl+space` (editor focused) | open the completion popup (below) |
+| `alt+enter` (editor focused) | the intention actions, as in IntelliJ: on a select list's `*` it expands it; anywhere else it does nothing and shows no hint. It is not a run key |
 | anything else, editor focused | the editor's own (`ratatui-textarea` defaults: shift+arrows select, `ctrl+u`/`ctrl+r` undo/redo) |
 
 A run has no time limit unless the connection sets its own query timeout in
@@ -220,6 +221,65 @@ that does not parse; a statement is the tokens between `;`s, read within
   schema and `pg_catalog`; the common aggregates and window functions
   (`count`, `sum`, `row_number`...) are the client's own list, because dbx's
   search asks for `pg_proc.prokind` `f` and `p` and never returns them).
+
+**In context** (`app/complete_scope.rs`, slice 12). The statement is read into
+select blocks, CTEs and subqueries, and the caret's place in that tree gives
+what is in scope: the block's own tables and aliases, derived tables (their
+alias and select-list names), CTEs defined before the caret, and, for a
+correlated subquery, the outer blocks after them (a derived table without
+`lateral` and a CTE body see nothing outside). dbx's `analyze_sql_references`
+(`Core::analyze_references`, asked once per statement text, answered later like
+any Core call) replaces the tables the tokens found when the statement parses;
+when it does not, the tokens stand. In a column position every source's columns
+are listed with its alias, a name two sources share is inserted qualified
+(`f.film_id`), and a keyword that starts like the word ranks before a column
+only where it is valid. After `join x on` the first items are whole conditions
+from `Core::foreign_keys` of `x` and of each earlier table (`f.film_id =
+fa.film_id`, cached like columns). `insert into t (` lists all columns as one
+item first; `group by`/`order by` list the select list's expressions and
+aliases first. Accepting a table after `from`/`join` adds an alias (initials
+of the `_`-separated words, numbered when taken; `Settings::alias_on_table`,
+on by default), unless one is typed after the word or the word continues; a
+name that exists in more than one schema (found by a search across schemas,
+`CompletionRequest::global`) is inserted as `schema.name`. A generated alias is
+never a reserved word of the dialect (Postgres' list, sqlparser's reserved
+lists and the highlighter's keywords) nor a table, CTE or alias the statement
+has, none is added when the statement already writes the table's own name
+before a dot (`film_actor.actor_id`), and the row shows the alias that will be
+inserted (`film f`). A column of an outer query, and every column while any
+source's columns are not loaded yet, is inserted qualified (a bare name would be
+the nearer query's own). `alt+enter` on a `*` of a select list expands it
+(`Action::ExpandStar`, the intention actions; in the mode bar there only):
+qualified by alias when there is more than one table or the table has an alias.
+It refuses, with a notice saying why, when a source is not a table the client can
+list (a function, `values`, `lateral`, a parenthesised join), when a subquery or
+CTE has a column it cannot name, or when the block joins with `using` or
+`natural`.
+
+**Templates, colours and finishing** (`app/template.rs`, `marks.rs`, `finish.rs`, slice 12). Live templates `sel`
+`selw` `selc` `lim` `ins` `upd` `del` `tab` `view` are offered only at a true statement start (nothing but
+whitespace or comments since the previous `;` or the start of the buffer: `drop table ins` is not rewritten). When
+the word is exactly a template's abbreviation, the template is the first item, highlighted, with the kind
+`template` and a preview of its expansion on the right, and both `enter` and `tab` expand it (what is highlighted is
+what you get; `Action::ExpandTemplate`, shown in the mode bar from the live bindings while one is highlighted);
+one more character and the list is keywords again, with the templates last. Template mode (`TEMPLATE` in the mode
+bar; `tab`, `shift+tab`, `esc`, from the live bindings) follows the text: typing replaces a variable, a variable
+named twice is typed in both places, a table accepted in a table variable fills `$alias$` and, for `ins`,
+`$columns$` (a late reply is written only while its table is still in the variable; otherwise the table there is
+asked for); moving the caret out, an undo, a redo or a paste leaves it. Postfix `.from` `.cfrom` `.join` (first
+foreign key of the table) `.cast` expand with the expansion key. Semantic colours (`Role::SynColumn`,
+`Role::SynUnresolved`) come only from a statement dbx parsed, Postgres only, and claim only what the client knows:
+a table is unresolved only when written with a schema whose whole relation list (the search's, which has
+partitions) is loaded and lacks it, never when unqualified; a column only when the statement has no source the
+client cannot list (function, `values`, `lateral`, parenthesised join, a subquery or CTE with an unnamed item),
+the sources' columns are loaded, and the name is not a system column, a whole-row reference or a select-list name;
+a statement with a set operation is left unmarked. dbx's analysis is asked about a statement only once the text has
+been still for 200 ms (a deadline, not a tick; completion reads the same analyses and never asks), and what is
+worked out for a statement is kept by its text and the loaded schema, so working it out again is a lookup. `f2` /
+`shift+f2` go to the next / previous unresolved name (in the mode bar only when there is one). `cmd+shift+enter`,
+`ctrl+shift+enter` and prefix `;` close open brackets and add the semicolon (one undo step), reading the statement
+with the highlighter's tokens; a statement with a string, comment or dollar-quoted body that is not closed is left
+alone, with a notice.
 
 **Order** (`app/complete_match.rs`): an exact match, then a prefix, then the
 initials of the words of the name (split at `_`, `-`, spaces and camel-case

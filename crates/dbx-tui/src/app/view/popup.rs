@@ -28,7 +28,13 @@ const DETAIL_MAX: usize = 24;
 
 /// What an item says on the right: its type, when it has one, then its kind.
 fn right_text(item: &Item) -> (String, &'static str) {
-    let detail = item.detail.as_deref().map(display_safe).map(|d| clip(&d, DETAIL_MAX)).unwrap_or_default();
+    let ty = item.detail.as_deref().map(display_safe).map(|d| clip(&d, DETAIL_MAX)).unwrap_or_default();
+    // The table a column is from, or the schema of a table, before its type.
+    let detail = match item.owner.as_deref().map(display_safe).map(|o| clip(&o, DETAIL_MAX)) {
+        Some(owner) if ty.is_empty() => owner,
+        Some(owner) => format!("{owner}  {ty}"),
+        None => ty,
+    };
     (detail, item.kind.label())
 }
 
@@ -77,7 +83,13 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) 
     let rows = app.ui.complete.popup.rows() as u16;
 
     let popup = &app.ui.complete.popup;
-    let name_w = popup.items().iter().map(|i| width_of(&i.name) as usize).max().unwrap_or(0).min(MAX_WIDTH as usize);
+    let name_w = popup
+        .items()
+        .iter()
+        .map(|i| width_of(&i.name) as usize + i.alias.as_deref().map_or(0, |a| 1 + width_of(a) as usize))
+        .max()
+        .unwrap_or(0)
+        .min(MAX_WIDTH as usize);
     let right_w = popup
         .items()
         .iter()
@@ -152,6 +164,13 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) 
                 cx += w as u16;
             }
             ch += chars;
+        }
+        // The alias accepting the table adds, after its name.
+        if let Some(alias) = &item.alias {
+            let shown = format!(" {}", display_safe(alias));
+            if cx + width_of(&shown) as u16 <= name_limit {
+                pane.put(buf, cx, row_y, &shown, base.fg(theme.color(Role::Overlay1)));
+            }
         }
     }
     if bar == 1 {

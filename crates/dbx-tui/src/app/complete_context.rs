@@ -13,6 +13,7 @@
 //! schema, a table, an alias) is for the caller, who knows the schema: the
 //! aliases the statement defines are in `refs`.
 
+use super::complete_scope::{self, Scope};
 use crate::core::Cursor;
 
 /// Which keywords the position allows.
@@ -86,6 +87,17 @@ pub struct Context {
     /// The caret is inside a string or a comment, or on a number: nothing is
     /// offered.
     pub literal: bool,
+    /// What is in scope at the caret, from the tokens.
+    pub scope: Scope,
+    /// Accepting a table here may add an alias (after `from` or `join`, and
+    /// none follows the word): the names the statement already uses.
+    pub alias_taken: Option<Vec<String>>,
+    /// The names the statement already puts before a dot (`film_actor` in
+    /// `film_actor.actor_id`).
+    pub qualifiers: Vec<String>,
+    /// Nothing but whitespace and comments stands between the previous `;`
+    /// (or the start of the buffer) and the word: a statement starts here.
+    pub statement_start: bool,
 }
 
 impl Context {
@@ -104,7 +116,7 @@ impl Context {
 // ---- the scanner -----------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
+pub(super) enum Tok {
     /// An unquoted word, as typed.
     Word(String),
     /// `"name"`: the name without its quotes, and whether it was closed.
@@ -124,11 +136,11 @@ enum Tok {
 }
 
 #[derive(Debug, Clone)]
-struct Token {
-    tok: Tok,
-    start: Cursor,
+pub(super) struct Token {
+    pub(super) tok: Tok,
+    pub(super) start: Cursor,
     /// Exclusive.
-    end: Cursor,
+    pub(super) end: Cursor,
 }
 
 fn is_word_start(c: char) -> bool {
@@ -141,7 +153,7 @@ fn is_word_char(c: char) -> bool {
 
 /// The tokens of the buffer. Never fails: what is unfinished (a string, a
 /// comment, a quoted name) is a token that says so.
-fn scan(lines: &[String]) -> Vec<Token> {
+pub(super) fn scan(lines: &[String]) -> Vec<Token> {
     let rows: Vec<Vec<char>> = lines.iter().map(|l| l.chars().collect()).collect();
     let mut out = Vec::new();
     let (mut row, mut col) = (0usize, 0usize);
@@ -357,7 +369,7 @@ fn only_after(w: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-fn lower(t: &Token) -> Option<String> {
+pub(super) fn lower(t: &Token) -> Option<String> {
     match &t.tok {
         Tok::Word(w) => Some(w.to_lowercase()),
         _ => None,
@@ -365,7 +377,7 @@ fn lower(t: &Token) -> Option<String> {
 }
 
 /// A name token's text.
-fn name_of(t: &Token) -> Option<&str> {
+pub(super) fn name_of(t: &Token) -> Option<&str> {
     match &t.tok {
         Tok::Word(w) => Some(w),
         Tok::Quoted(n, _) => Some(n),
@@ -512,6 +524,12 @@ pub fn analyse(lines: &[String], caret: Cursor) -> Context {
     let mut context = analyse_rows(&lines[from.min(to)..to], Cursor { row: caret.row.saturating_sub(from), col: caret.col });
     context.word_start.row += from;
     context.word_end.row += from;
+    context.scope.shift_rows(from);
+    // The window may have been cut short of the statement's start (a long
+    // statement): what is before it is then not known to be nothing.
+    if from > 0 && !lines.get(from).is_some_and(|l| l.contains(';')) {
+        context.statement_start = false;
+    }
     context
 }
 
@@ -527,6 +545,10 @@ fn analyse_rows(lines: &[String], caret: Cursor) -> Context {
         wants: Wants::none(),
         refs: Vec::new(),
         literal: false,
+        scope: Scope::default(),
+        alias_taken: None,
+        qualifiers: Vec::new(),
+        statement_start: false,
     };
     // Inside a string or a comment, or on a number: nothing.
     if tokens.iter().any(|t| inside(t, caret)) {
@@ -566,6 +588,18 @@ fn analyse_rows(lines: &[String], caret: Cursor) -> Context {
     let stmt = &sig[from..to.max(from)];
     let being_typed = |t: &Token| word_start == t.start && (word_end == t.end || !word.is_empty() || quoted);
     let refs = table_refs(stmt, |t| being_typed(t) && name_of(t).is_some());
+    let toks: Vec<&Token> = stmt.iter().copied().filter(|t| !(being_typed(t) && name_of(t).is_some())).collect();
+    let at_caret = toks.iter().position(|t| !before(t.start, word_start)).unwrap_or(toks.len());
+    let mut scope = complete_scope::read(&toks, lines, word_start, at_caret);
+    // The text dbx's analysis is asked about is the whole statement, the word
+    // being typed included: the semantic colours ask about the same text.
+    scope.text = stmt.first().zip(stmt.last()).map(|(a, b)| (a.start, b.end));
+    // The names the statement uses to qualify a column (`film_actor.actor_id`).
+    let qualifiers: Vec<String> = stmt
+        .windows(2)
+        .filter(|w| w[1].tok == Tok::Dot && !being_typed(w[0]))
+        .filter_map(|w| name_of(w[0]).map(String::from))
+        .collect();
 
     // What stands before the word: its qualifier, then the token before that.
     let mut j = stmt.iter().position(|t| !before(t.start, word_start)).unwrap_or(stmt.len());
@@ -577,17 +611,19 @@ fn analyse_rows(lines: &[String], caret: Cursor) -> Context {
                 j -= 2;
             }
             // `(1).`, `*.`: a dot that follows nothing we can name.
-            None => return Context { word, word_start, word_end, quoted, quote_closed, refs, ..nothing(caret) },
+            None => return Context { word, word_start, word_end, quoted, quote_closed, refs, scope, ..nothing(caret) },
         }
     }
     let lead = j.checked_sub(1).map(|k| stmt[k]);
 
     // The clause the word is in: the last keyword before it that sets one.
     let mut in_relation = false;
+    let mut relation_kw = String::new();
     for t in &stmt[..j] {
         if let Some(w) = lower(t) {
             if relation_keyword(&w) {
                 in_relation = true;
+                relation_kw = w;
             } else if clause_keyword(&w) {
                 in_relation = false;
             }
@@ -633,7 +669,16 @@ fn analyse_rows(lines: &[String], caret: Cursor) -> Context {
         wants.keywords = Keywords::None;
         wants.functions = false;
     }
-    Context { word, word_start, word_end, quoted, quote_closed, alias_position, wants, refs, literal: false }
+    // A table accepted after `from` or `join` takes an alias, unless the user
+    // has typed one after the word.
+    let alias_follows = stmt.iter().find(|t| !before(t.start, word_end) && t.start != word_start).is_some_and(|t| match &t.tok {
+        Tok::Word(w) => w.eq_ignore_ascii_case("as") || !super::highlight::is_keyword(&w.to_lowercase()),
+        Tok::Quoted(..) => true,
+        _ => false,
+    });
+    let alias_taken = (relation_position && matches!(relation_kw.as_str(), "from" | "join") && !alias_follows).then(|| scope.names.clone());
+    let statement_start = stmt.iter().all(|t| !before(t.start, word_start));
+    Context { word, word_start, word_end, quoted, quote_closed, alias_position, wants, refs, literal: false, scope, alias_taken, qualifiers, statement_start }
 }
 
 #[cfg(test)]

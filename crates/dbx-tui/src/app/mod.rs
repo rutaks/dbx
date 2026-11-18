@@ -2,26 +2,31 @@
 //! `view(frame)`. No tokio, no terminal I/O, no dbx types.
 
 mod connection_ui;
+pub mod finish;
 mod resize;
 pub mod complete;
 pub mod complete_context;
 pub mod complete_insert;
 pub mod complete_match;
 pub mod complete_popup;
+pub mod complete_scope;
 pub mod editor;
 pub mod form;
 pub mod grid;
 pub mod highlight;
 pub mod keys;
 pub mod layout;
+pub mod marks;
 pub mod overlay;
 pub mod pointer;
 #[cfg(feature = "test-support")]
 pub mod probe;
 pub mod query;
 pub mod requests;
+pub mod settings;
 pub mod sidebar;
 pub mod syntax;
+pub mod template;
 pub mod text_field;
 pub mod theme;
 pub mod tree;
@@ -31,7 +36,15 @@ pub(crate) mod view;
 #[cfg(test)]
 mod cancel_tests;
 #[cfg(test)]
+mod finish_tests;
+#[cfg(test)]
+mod marks_tests;
+#[cfg(test)]
+mod template_tests;
+#[cfg(test)]
 mod complete_tests;
+#[cfg(test)]
+mod complete_scope_tests;
 #[cfg(test)]
 mod connections_tests;
 #[cfg(test)]
@@ -118,6 +131,7 @@ pub struct Model {
     pub requests: Requests,
     /// What the completion popup has asked the Core for and kept.
     pub completions: complete::CompletionCache,
+    pub settings: settings::Settings,
     /// The id the next run gets.
     pub next_run: u64,
     /// The most rows a run fetches.
@@ -173,6 +187,10 @@ pub struct Ui {
     pub syntax: syntax::SyntaxState,
     /// The completion popup.
     pub complete: complete::CompleteUi,
+    /// The live template being filled in, if any.
+    pub template: template::TemplateUi,
+    /// What the loaded schema says about the names in the buffer.
+    pub marks: marks::Marks,
     pub notice: Option<Notice>,
     /// The results pane's cell cursor and window.
     pub grid: grid::GridUi,
@@ -216,6 +234,10 @@ pub enum CoreCall {
     /// The columns of a table, for completion: kept in the completion cache,
     /// not in the sidebar's tree.
     TableColumns(crate::core::TablePath),
+    /// The foreign keys of a table, for completion.
+    ForeignKeys(crate::core::TablePath),
+    /// What dbx's analysis says a statement refers to.
+    AnalyzeReferences(crate::core::DbKind, String),
 }
 
 /// The reply to a `CoreCall`.
@@ -230,6 +252,9 @@ pub enum CoreReply {
     Completed(Result<crate::core::Completion, CoreError>),
     CurrentSchema(Result<Option<String>, CoreError>),
     TableColumns(Result<Vec<crate::core::ColumnInfo>, CoreError>),
+    ForeignKeys(Result<Vec<crate::core::ForeignKey>, CoreError>),
+    /// `None`: the statement does not parse.
+    References(Result<Option<crate::core::References>, CoreError>),
 }
 
 #[derive(Debug)]
@@ -297,6 +322,7 @@ impl App {
                 tabs: vec![QueryTab::new(TabId(1))],
                 requests: Requests::default(),
                 completions: complete::CompletionCache::default(),
+                settings: settings::Settings::default(),
                 next_run: 1,
                 row_cap: DEFAULT_ROW_CAP,
             },
@@ -319,6 +345,8 @@ impl App {
                 editor: editor::Editor::new(),
                 syntax: syntax::SyntaxState::default(),
                 complete: complete::CompleteUi::default(),
+                template: template::TemplateUi::default(),
+                marks: marks::Marks::default(),
                 notice: None,
                 grid: grid::GridUi::default(),
                 now: None,
@@ -376,6 +404,8 @@ impl App {
             Event::Timer => {}
         }
         self.completion_housekeeping(&mut fx);
+        self.template_housekeeping(&mut fx);
+        self.refresh_marks(&mut fx);
         self.ensure_rows();
         fx
     }
@@ -393,7 +423,7 @@ impl App {
             Mode::Prefix { expires } => Some(expires),
             Mode::Normal | Mode::Resize => None,
         };
-        [prefix, self.query_deadline()].into_iter().flatten().min()
+        [prefix, self.query_deadline(), self.ui.marks.deadline()].into_iter().flatten().min()
     }
 
     pub fn view(&mut self, frame: &mut Frame) {
@@ -419,7 +449,7 @@ impl App {
                 if combo == self.ui.keys.prefix {
                     self.ui.mode = Mode::Prefix { expires: now + self.ui.prefix_timeout };
                     fx.repaint = true;
-                } else if let Some(action) = self.ui.keys.lookup_direct(&combo) {
+                } else if let Some(action) = self.direct_action(&combo) {
                     self.perform(action, now, fx);
                 } else if combo == CTRL_C {
                     // Bound to cancel by default (a direct key, above). Even
@@ -449,6 +479,13 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The action a direct key does now. `alt+enter` is the intention
+    /// actions: it expands a `*` where the caret is on one (`perform` finds
+    /// there is nothing to do elsewhere), and is never a run key.
+    fn direct_action(&self, combo: &KeyCombo) -> Option<Action> {
+        self.ui.keys.lookup_direct(combo)
     }
 
     fn on_paste(&mut self, text: &str, fx: &mut Effects) {
@@ -494,6 +531,22 @@ impl App {
                 None
             }
             // ctrl+c cancels only where the run is: the editor and the results.
+            (Action::ExpandStar, Editor) => {
+                self.expand_star(fx);
+                None
+            }
+            (Action::FinishStatementDirect | Action::FinishStatement, Editor) => {
+                self.finish_statement(fx);
+                None
+            }
+            (Action::NextUnresolved, Editor) => {
+                self.goto_unresolved(true, fx);
+                None
+            }
+            (Action::PrevUnresolved, Editor) => {
+                self.goto_unresolved(false, fx);
+                None
+            }
             (Action::CancelDirect, Editor | Results) => {
                 self.cancel_run(now, fx);
                 None

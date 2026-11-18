@@ -530,7 +530,11 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     let keys = &app.ui.keys;
     // While the completion popup is open the bar shows its keys.
     if app.completion_visible() {
-        return keys.complete_hints();
+        return keys.complete_hints(app.ui.complete.popup.selected_item().is_some_and(|i| i.kind == super::complete_popup::ItemKind::Template));
+    }
+    // Filling in a template: its keys.
+    if app.ui.template.active() && app.ui.focus == PaneId::Editor {
+        return keys.template_hints();
     }
     let one = |action: Action, desc: &'static str| keys.key_for(action).map(|k| Hint { keys: vec![(k, action)], desc });
     let mut hints = Vec::new();
@@ -553,9 +557,17 @@ fn normal_hints(app: &App) -> Vec<Hint> {
         }
     }
     if app.ui.focus == PaneId::Editor {
+        if app.star_site().is_some() {
+            hints.extend(one(Action::ExpandStar, "expand *"));
+        }
         hints.extend(one(Action::RunDirect, "run"));
         hints.extend(one(Action::CompleteOpen, "complete"));
         hints.push(prefix);
+        // Only while there is a name to go to.
+        if app.ui.marks.unresolved_count() > 0 {
+            hints.extend(one(Action::NextUnresolved, "next error"));
+            hints.extend(one(Action::PrevUnresolved, "prev error"));
+        }
         return hints;
     }
     if app.ui.focus == PaneId::Results {
@@ -660,7 +672,12 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
     let hints = match app.ui.mode {
         // An overlay takes all input and shows its own keys.
         _ if app.ui.overlay.is_some() => Vec::new(),
-        Mode::Normal => normal_hints(app),
+        Mode::Normal => {
+            if app.ui.template.active() && app.ui.focus == PaneId::Editor {
+                x = p.put(buf, x + 1, r.y, " TEMPLATE ", label(Role::Teal));
+            }
+            normal_hints(app)
+        }
         Mode::Resize => {
             x = p.put(buf, x + 1, r.y, " RESIZE ", label(Role::Peach));
             app.ui.keys.resize_hints()

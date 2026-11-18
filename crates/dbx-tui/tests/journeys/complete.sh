@@ -57,9 +57,9 @@ expect editor-focused 'ctrl\+space complete'
 # Typing an identifier after FROM opens the popup: tables and views of the
 # schema (the first answer takes a round trip), with their kind on the right.
 type_sql 'select * from fi'
-wait_for 04-popup 'film +table'
-expect popup 'film_list +view'
-expect popup 'film_actor +table'
+wait_for 04-popup 'film f +table'
+expect popup 'film_list fl +view'
+expect popup 'film_actor fa +table'
 expect_not popup 'film_id'
 expect_not popup 'lateral'
 # The popup's keys are in the mode bar, and it is over the editor, not an overlay.
@@ -69,11 +69,11 @@ expect popup 'esc close'
 expect popup 'select \* from fi'
 expect_not popup 'ctrl\+space complete'
 
-# enter inserts the first suggestion, `film`, at the caret; the popup is gone.
+# enter inserts the first suggestion, `film`, with its generated alias; the popup is gone.
 key Enter
 wait_for 05-accepted 'ctrl\+space complete'
-expect accepted 'select \* from film$|select \* from film +[│ ]'
-expect_not accepted 'film_list +view'
+expect accepted 'select \* from film f'
+expect_not accepted 'film_list fl +view'
 # Run it: rows.
 key F5
 wait_for 06-rows '(1,000\+|[0-9,]+) rows +[0-9.]+m?s'

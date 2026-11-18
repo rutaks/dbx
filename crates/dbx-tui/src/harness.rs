@@ -27,6 +27,8 @@ pub struct Harness {
     /// plus tokio time since then, so a test that pauses and advances tokio
     /// time moves the app's clock with it.
     t0: tokio::time::Instant,
+    /// Time the test has let pass without waiting for it (`advance`).
+    skew: std::time::Duration,
 }
 
 impl Harness {
@@ -36,7 +38,7 @@ impl Harness {
         let core: Arc<dyn Core> = fake.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         let syntax: Arc<dyn crate::core::Syntax> = fake.clone();
-        let mut h = Harness { app: App::new(), fake, core, tx, rx, tasks: Tasks::default(), quit: false, repaints: 0, t0: tokio::time::Instant::now() };
+        let mut h = Harness { app: App::new(), fake, core, tx, rx, tasks: Tasks::default(), quit: false, repaints: 0, t0: tokio::time::Instant::now(), skew: std::time::Duration::ZERO };
         h.app.ui.syntax.set_handle(syntax);
         let fx = h.app.start();
         h.run(fx);
@@ -45,7 +47,15 @@ impl Harness {
 
     /// The app's clock now.
     pub fn now(&self) -> std::time::Instant {
-        base() + (tokio::time::Instant::now() - self.t0)
+        base() + (tokio::time::Instant::now() - self.t0) + self.skew
+    }
+
+    /// Lets `by` pass on the app's clock without waiting for it, and wakes
+    /// the app as the shell's timer would at its next deadline. Replies of
+    /// Core calls are on tokio's time and are not moved by this.
+    pub fn advance(&mut self, by: std::time::Duration) {
+        self.skew += by;
+        self.tick();
     }
 
     /// Lets the app's clock reach now, as the shell's timer would: an

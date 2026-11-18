@@ -18,17 +18,17 @@ use crate::harness::Harness;
 
 // ---- helpers ------------------------------------------------------------------
 
-fn column(name: &str, db_type: &str, primary_key: bool) -> ColumnInfo {
+pub(super) fn column(name: &str, db_type: &str, primary_key: bool) -> ColumnInfo {
     ColumnInfo { name: name.into(), db_type: db_type.into(), nullable: !primary_key, primary_key, default: None }
 }
 
-fn relation(schema: &str, name: &str, kind: CandidateKind) -> (String, String, CandidateKind) {
+pub(super) fn relation(schema: &str, name: &str, kind: CandidateKind) -> (String, String, CandidateKind) {
     (schema.into(), name.into(), kind)
 }
 
 /// A small Pagila: the tables the acceptance tests name, a view, a table with
 /// a space and capitals in its name, and a few functions.
-fn pagila() -> Catalogue {
+pub(super) fn pagila() -> Catalogue {
     use CandidateKind::{Table as T, View as V};
     Catalogue {
         current_schema: Some("public".into()),
@@ -56,19 +56,20 @@ fn pagila() -> Catalogue {
             ),
             ("public".into(), "film_actor".into(), vec![column("actor_id", "integer", false), column("film_id", "integer", false)]),
         ],
+        foreign_keys: Vec::new(),
         delay: Duration::ZERO,
     }
 }
 
 /// `local pg` with `pagila` given to the tab and the editor focused, over a
 /// fake that holds `catalogue`.
-async fn editing(catalogue: Catalogue) -> Harness {
+pub(super) async fn editing(catalogue: Catalogue) -> Harness {
     let fake = FakeCore::new();
     fake.script_catalogue(catalogue);
     editing_on(fake).await
 }
 
-async fn editing_on(fake: FakeCore) -> Harness {
+pub(super) async fn editing_on(fake: FakeCore) -> Harness {
     fake.script_connections(Scripted::ok(vec![super::connections_tests::conn("local pg", DbKind::Postgres)]));
     fake.script_databases(Scripted::ok(vec!["edge".into(), "pagila".into()]));
     let mut h = Harness::start(fake);
@@ -82,20 +83,26 @@ async fn editing_on(fake: FakeCore) -> Harness {
 }
 
 /// Types `text`, then lets the replies of whatever the typing asked for arrive.
-async fn type_and_settle(h: &mut Harness, text: &str) {
+pub(super) async fn type_and_settle(h: &mut Harness, text: &str) {
     h.type_text(text);
     h.settle().await;
 }
 
-fn names(h: &Harness) -> Vec<String> {
+pub(super) fn names(h: &Harness) -> Vec<String> {
     h.app.ui.complete.popup.items().iter().map(|i| i.name.clone()).collect()
 }
 
-fn visible(h: &Harness) -> bool {
+/// The names that are not live templates (slice 12 lists those at a
+/// statement's start too).
+pub(super) fn keywords(h: &Harness) -> Vec<String> {
+    h.app.ui.complete.popup.items().iter().filter(|i| i.kind != ItemKind::Template).map(|i| i.name.clone()).collect()
+}
+
+pub(super) fn visible(h: &Harness) -> bool {
     h.app.completion_visible()
 }
 
-fn text(h: &Harness) -> String {
+pub(super) fn text(h: &Harness) -> String {
     h.app.ui.editor.text()
 }
 
@@ -105,12 +112,13 @@ fn name_searches(h: &Harness) -> Vec<CompletionRequest> {
     searches(h).into_iter().filter(|r| r.kind != SearchKind::Function).collect()
 }
 
-fn searches(h: &Harness) -> Vec<CompletionRequest> {
+pub(super) fn searches(h: &Harness) -> Vec<CompletionRequest> {
     h.fake
         .calls()
         .into_iter()
         .filter_map(|c| match c {
-            Call::Complete(r) => Some(r),
+            // The search across schemas (for a name that two have) is counted apart.
+            Call::Complete(r) if !r.global => Some(r),
             _ => None,
         })
         .collect()
@@ -121,12 +129,13 @@ const KEYWORDS_AFTER_FROM: [&str; 2] = ["lateral", "only"];
 // ---- the popup opens, and what enter and tab do ----------------------------------
 
 #[tokio::test]
-async fn typing_sel_opens_the_popup_with_select_first_and_enter_leaves_select_in_the_editor() {
+async fn typing_sele_opens_the_popup_with_select_first_and_enter_leaves_select_in_the_editor() {
+    // (`sel` itself is a live template's abbreviation: there, enter expands it.)
     let mut h = editing(pagila()).await;
-    type_and_settle(&mut h, "sel").await;
+    type_and_settle(&mut h, "sele").await;
     assert!(visible(&h));
     assert_eq!(names(&h)[0], "select");
-    assert_eq!(text(&h), "sel", "listing it changed nothing");
+    assert_eq!(text(&h), "sele", "listing it changed nothing");
     h.press("enter");
     assert_eq!(text(&h), "select", "enter inserts at the caret");
     assert!(!visible(&h), "and the popup is closed");
@@ -136,7 +145,7 @@ async fn typing_sel_opens_the_popup_with_select_first_and_enter_leaves_select_in
 #[tokio::test]
 async fn enter_with_the_popup_open_is_not_a_line_break_and_with_it_closed_it_is() {
     let mut h = editing(pagila()).await;
-    type_and_settle(&mut h, "sel").await;
+    type_and_settle(&mut h, "sele").await;
     h.press("enter");
     assert_eq!(text(&h), "select");
     h.press("enter");
@@ -145,7 +154,7 @@ async fn enter_with_the_popup_open_is_not_a_line_break_and_with_it_closed_it_is(
 
 #[tokio::test]
 async fn tab_replaces_the_rest_of_the_word_to_the_right_and_enter_inserts_before_it() {
-    for (key, want) in [("tab", "select * from film"), ("enter", "select * from filmm_x")] {
+    for (key, want) in [("tab", "select * from film f"), ("enter", "select * from filmm_x")] {
         let mut h = editing(pagila()).await;
         h.app.ui.editor.set_text("select * from film_x");
         h.press("left left left");
@@ -410,12 +419,12 @@ async fn a_table_named_with_capitals_and_a_space_is_inserted_quoted_and_others_a
     type_and_settle(&mut h, "select * from Ord").await;
     assert_eq!(names(&h), ["Order Items"]);
     h.press("enter");
-    assert_eq!(text(&h), "select * from \"Order Items\"");
+    assert_eq!(text(&h), "select * from \"Order Items\" oi");
 
     let mut h = editing(pagila()).await;
     type_and_settle(&mut h, "select * from film_c").await;
     h.press("enter");
-    assert_eq!(text(&h), "select * from film_category", "names are inserted exactly as stored");
+    assert_eq!(text(&h), "select * from film_category fc", "names are inserted exactly as stored");
 }
 
 #[tokio::test]
@@ -424,13 +433,13 @@ async fn a_name_started_with_a_quote_is_replaced_whole() {
     type_and_settle(&mut h, "select * from \"Or").await;
     assert_eq!(names(&h), ["Order Items"]);
     h.press("enter");
-    assert_eq!(text(&h), "select * from \"Order Items\"");
+    assert_eq!(text(&h), "select * from \"Order Items\" oi");
 }
 
 #[tokio::test]
 async fn a_keyword_is_inserted_in_the_case_the_user_is_typing_in() {
     let mut h = editing(pagila()).await;
-    type_and_settle(&mut h, "SEL").await;
+    type_and_settle(&mut h, "SELE").await;
     assert_eq!(names(&h)[0], "select");
     h.press("enter");
     assert_eq!(text(&h), "SELECT");
@@ -555,9 +564,9 @@ async fn a_kind_other_than_postgres_gets_keywords_and_the_core_is_never_asked() 
     // The tab's connection is now a MySQL one.
     h.app.ui.editor.set_text("");
     let before = h.fake.calls().len();
-    type_and_settle(&mut h, "sel").await;
+    type_and_settle(&mut h, "sele").await;
     assert_eq!(names(&h)[0], "select");
-    type_and_settle(&mut h, "ect * from fi").await;
+    type_and_settle(&mut h, "ct * from fi").await;
     assert!(h.app.ui.complete.popup.items().iter().all(|i| i.kind == ItemKind::Keyword), "{:?}", names(&h));
     assert_eq!(h.fake.calls().len(), before, "nothing was asked of the Core");
 }
@@ -590,11 +599,11 @@ async fn while_a_call_is_in_flight_typed_characters_appear_at_once_and_the_list_
     assert!(h.tasks.is_empty(), "one letter asks the Core nothing");
     h.type_text("el");
     assert_eq!(text(&h), "sel");
-    assert_eq!(names(&h), ["select"]);
+    assert_eq!(keywords(&h), ["select"]);
     assert!(!h.tasks.is_empty(), "from two letters on the Core is asked for functions, and has not answered");
     h.type_text("e");
     assert_eq!(text(&h), "sele", "the character is in the text at once");
-    assert_eq!(names(&h), ["select"], "and the list refiltered from the keywords");
+    assert_eq!(keywords(&h), ["select"], "and the list refiltered from the keywords");
     h.type_text("ct le");
     assert_eq!(text(&h), "select le");
     assert!(visible(&h), "keywords that match `le`: {:?}", names(&h));
@@ -699,7 +708,7 @@ async fn the_mode_bar_shows_the_popups_keys_while_it_is_open_and_not_otherwise()
     let closed = bar(&mut h);
     assert!(closed.contains("f5 run") && !closed.contains("tab replace"), "{closed}");
     assert!(closed.contains("ctrl+space complete"), "the key that opens it is offered in the editor: {closed}");
-    type_and_settle(&mut h, "sel").await;
+    type_and_settle(&mut h, "sele").await;
     let open = bar(&mut h);
     for hint in ["enter insert", "tab replace", "down/up move", "esc close"] {
         assert!(open.contains(hint), "{hint} in {open}");
@@ -712,7 +721,7 @@ async fn the_mode_bar_shows_the_popups_keys_while_it_is_open_and_not_otherwise()
 #[tokio::test]
 async fn a_popup_hint_in_the_mode_bar_does_what_its_key_does() {
     let mut h = editing(pagila()).await;
-    type_and_settle(&mut h, "sel").await;
+    type_and_settle(&mut h, "sele").await;
     frame_rows(&mut h.app, 114, 30);
     let hit = h.app.ui.mode_hints.iter().find(|m| m.action == Action::CompleteInsert).copied().expect("an insert hint");
     let fx = click(&mut h.app, hit.rect);
@@ -783,7 +792,7 @@ async fn a_click_on_an_item_accepts_it_and_a_click_elsewhere_closes_the_popup() 
     assert_eq!(h.app.ui.complete.popup.items()[2].name, "film_actor");
     let fx = click(&mut h.app, third);
     h.run(fx);
-    assert_eq!(text(&h), "select * from film_actor");
+    assert_eq!(text(&h), "select * from film_actor fa");
     assert!(!visible(&h));
 
     let mut h = editing(pagila()).await;
@@ -939,8 +948,8 @@ async fn typing_an_alias_after_a_table_opens_no_popup_and_enter_is_a_line_break_
 #[tokio::test]
 async fn enter_in_a_closed_quoted_name_replaces_it_through_the_closing_quote() {
     for (sql, want) in [
-        ("select * from \"Or\"", "select * from \"Order Items\""),
-        ("select * from \"Or\" where x", "select * from \"Order Items\" where x"),
+        ("select * from \"Or\"", "select * from \"Order Items\" oi"),
+        ("select * from \"Or\" where x", "select * from \"Order Items\" oi where x"),
         ("select * from \"Ord\" o", "select * from \"Order Items\" o"),
     ] {
         let mut h = editing(pagila()).await;
@@ -970,8 +979,8 @@ async fn tab_and_enter_with_the_caret_mid_word_in_a_closed_quote_leave_one_closi
         h.settle().await;
         assert_eq!(names(&h), ["Order Items"]);
         h.press(key);
-        assert_eq!(text(&h), "select * from \"Order Items\"", "{key}");
-        assert_eq!(h.app.ui.editor.cursor().col, 27, "{key}: the caret is after the name");
+        assert_eq!(text(&h), "select * from \"Order Items\" oi", "{key}");
+        assert_eq!(h.app.ui.editor.cursor().col, 30, "{key}: the caret is after the name and its alias");
     }
 }
 
@@ -1009,11 +1018,11 @@ async fn one_undo_restores_the_text_from_before_an_acceptance_and_one_redo_puts_
     let at = names(&h).iter().position(|n| n == "film").unwrap();
     h.app.ui.complete.popup.select(at);
     h.press("tab");
-    assert_eq!(text(&h), "select * from film");
+    assert_eq!(text(&h), "select * from film f");
     h.press("ctrl+u");
     assert_eq!(text(&h), "select * from fil_x", "one undo");
     h.press("ctrl+r");
-    assert_eq!(text(&h), "select * from film", "one redo");
+    assert_eq!(text(&h), "select * from film f", "one redo");
 }
 
 // ---- the list under a pending enter -----------------------------------------------------------

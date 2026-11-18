@@ -322,6 +322,8 @@ pub(crate) fn execute(
                         CoreCall::Complete(request) => CoreReply::Completed(core.complete(&request).await),
                         CoreCall::CurrentSchema(at) => CoreReply::CurrentSchema(core.current_schema(&at).await),
                         CoreCall::TableColumns(at) => CoreReply::TableColumns(core.columns(&at).await),
+                        CoreCall::ForeignKeys(at) => CoreReply::ForeignKeys(core.foreign_keys(&at).await),
+                        CoreCall::AnalyzeReferences(kind, sql) => CoreReply::References(core.analyze_references(&kind, &sql).await),
                     };
                     done.lock().remove(&id);
                     if let Some(ended) = ended {
