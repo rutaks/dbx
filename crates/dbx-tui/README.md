@@ -213,6 +213,7 @@ Run every command from the dbx workspace root.
 | Fast: app, view, keys, FakeCore (layer 2) | `cargo test -p dbx-tui --lib --test no_colour_literals` | nothing |
 | Store: `DbxCore` on scratch stores (layer 1) | `cargo test -p dbx-tui --test store -- --test-threads=1` | nothing external; temp dirs, key files, a local TCP port |
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
+| Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
 | Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `cancel`, `first-query`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
@@ -221,7 +222,8 @@ Run every command from the dbx workspace root.
 ones fail, saying so, when the fixtures are not up). Test helpers on the
 production adapter (`DbxCore::seed_config`, `runtime_config`,
 `runtime_config_ids`, `probe_select_one`, `with_managed_keys`,
-`check_seed_dir`) sit behind the `test-support` feature, which tests and
+`check_seed_dir`) sit behind the `test-support` feature (as does `app::probe::GridProbe`, which
+lets `ground_truth` read a result back from the drawn grid), which tests and
 examples get through a self dev-dependency; the client binary is built
 without it. Saving a connection is the real `Core::save_connection`, used by
 the tests and by `examples/seed_store`, which refuses any directory outside
@@ -254,5 +256,17 @@ printed at the end. `browse-pagila` also starts a throwaway local socket that ac
   integer, 400 rows; every value encodes its own column and row), `million_rows`
   (id, text, number; a million rows by `generate_series`, about a second to
   load) and `width_text` (wide characters, combining marks, joiners).
+
+- `gt_*` tables (`edge/05-ground-truth.sql`): one per type family, each row
+  labelled with what it probes: integers to 2^63, `numeric`, floats with NaN and
+  the infinities, text (empty, `NULL`, emoji, RTL, ZWJ, 100 kB), date and time
+  types, bool/uuid/bytea, json, arrays, enum/domain/range/composite, network
+  types, money and bit strings, xml and tsvector. `ground_truth` compares them
+  with `psql`; `tests/fixtures/KNOWN_DIFFERENCES.md` lists every cell where the
+  client differs (and `GT_WRITE=1` regenerates it, marks new rows `UNREVIEWED` and fails that run; it is refused under `CI`), and
+  `tests/fixtures/UPSTREAM-PROPOSAL.md` is the unsent write-up of dbx's losses.
+  Apply a changed file to the running database with
+  `docker exec -i dbxtui-fixtures-postgres-1 psql -U postgres -d edge -f - < tests/fixtures/edge/05-ground-truth.sql`
+  (after dropping the tables it creates).
 
 `up.sh` starts it and waits until it answers queries; `down.sh` removes it.

@@ -8,6 +8,8 @@ pub mod grid;
 pub mod keys;
 pub mod layout;
 pub mod overlay;
+#[cfg(feature = "test-support")]
+pub mod probe;
 pub mod query;
 pub mod requests;
 pub mod sidebar;
