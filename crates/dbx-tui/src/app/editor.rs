@@ -8,7 +8,7 @@
 //! renderer is used only (into a scratch buffer, `layout`) to keep its view
 //! following the caret.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
@@ -32,7 +32,26 @@ pub struct Editor {
     /// Counts changes to the text: what the highlighter and the statement
     /// finder key their caches by.
     revision: u64,
+    /// Keys the widget has been given (a test watches that one the client
+    /// kept for itself never reached it).
+    keys_given: u64,
+    /// Replacements (`replace`) the widget holds as two history entries each,
+    /// which undo and redo step over as one.
+    replacements: Vec<Replacement>,
 }
+
+/// The text before a replacement, between its delete and its insert, and
+/// after it, as digests: undo that lands on `between` from `after` has stopped
+/// half way through one, and so has redo from `before`.
+#[derive(Debug, Clone, Copy)]
+struct Replacement {
+    before: u64,
+    between: u64,
+    after: u64,
+}
+
+/// The most replacements remembered (the widget itself holds 50 edits).
+const REPLACEMENTS_KEPT: usize = 64;
 
 impl Default for Editor {
     fn default() -> Self {
@@ -42,7 +61,7 @@ impl Default for Editor {
 
 impl Editor {
     pub fn new() -> Self {
-        Editor { area: TextArea::default(), revision: 0 }
+        Editor { area: TextArea::default(), revision: 0, keys_given: 0, replacements: Vec::new() }
     }
 
     /// The whole buffer, rows joined with `\n`.
@@ -63,6 +82,7 @@ impl Editor {
     /// Replaces the buffer and puts the cursor at its end.
     pub fn set_text(&mut self, text: &str) {
         self.revision += 1;
+        self.replacements.clear();
         let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         self.area = TextArea::new(lines);
         self.area.move_cursor(ratatui_textarea::CursorMove::Bottom);
@@ -91,10 +111,82 @@ impl Editor {
     /// Returns whether anything visible changed: the text, the cursor or the
     /// selection (the view scrolls only with the cursor).
     pub fn key(&mut self, key: KeyEvent) -> bool {
+        self.keys_given += 1;
         let before = (self.area.cursor(), self.area.selection_range());
-        let edited = self.area.input(key);
+        // `ctrl+u` and `ctrl+r` are the widget's undo and redo.
+        let step = match key.code {
+            KeyCode::Char(c @ ('u' | 'r')) if key.modifiers == KeyModifiers::CONTROL && !self.replacements.is_empty() => Some(c == 'u'),
+            _ => None,
+        };
+        let was = step.map(|_| self.digest());
+        let mut edited = self.area.input(key);
+        if let (Some(undo), Some(was), true) = (step, was, edited) {
+            let now = self.digest();
+            let half = self.replacements.iter().any(|r| if undo { r.after == was && r.between == now } else { r.before == was && r.between == now });
+            if half {
+                edited |= if undo { self.area.undo() } else { self.area.redo() };
+            }
+        }
         self.revision += u64::from(edited);
         edited || before != (self.area.cursor(), self.area.selection_range())
+    }
+
+    /// How many keys the widget has been given.
+    pub fn keys_given(&self) -> u64 {
+        self.keys_given
+    }
+
+    /// A digest of the text, to tell states of the buffer apart.
+    fn digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.area.lines().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Replaces the text between two positions of one row with `text`, and
+    /// puts the cursor after it. Any selection ends. Returns whether the
+    /// buffer changed, or why nothing was done: the position is a row or
+    /// column the widget cannot address (past `u16::MAX`), or `text` holds a
+    /// control character (a line break would split it across rows).
+    ///
+    /// The widget records a delete and an insert as two history entries and
+    /// has no way to group them, so the pair is remembered here and `key`
+    /// steps over both for one undo or redo. (The widget's own history is
+    /// still two entries: only `ctrl+u` and `ctrl+r` as given to `key` step
+    /// over the pair.)
+    pub fn replace(&mut self, from: Cursor, to: Cursor, text: &str) -> Result<bool, &'static str> {
+        debug_assert!(from.row == to.row && from.col <= to.col, "a replacement stays on one row");
+        if from.row > u16::MAX as usize || from.col > u16::MAX as usize {
+            return Err("that place is too far into the text to be edited here");
+        }
+        if text.chars().any(char::is_control) {
+            return Err("it holds a control character");
+        }
+        let Some(line) = self.area.lines().get(from.row) else { return Err("that row is no longer there") };
+        let line_len = line.chars().count();
+        let (start, end) = (from.col.min(line_len), to.col.min(line_len).max(from.col.min(line_len)));
+        let unchanged = line.chars().skip(start).take(end - start).eq(text.chars());
+        self.area.cancel_selection();
+        let jump = |area: &mut TextArea<'static>, col: usize| area.move_cursor(CursorMove::Jump(from.row as u16, col.min(u16::MAX as usize) as u16));
+        if unchanged {
+            jump(&mut self.area, start + text.chars().count());
+            return Ok(false);
+        }
+        jump(&mut self.area, start);
+        let before = self.digest();
+        let deleted = self.area.delete_str(end - start);
+        let between = self.digest();
+        let inserted = self.area.insert_str(text);
+        let changed = deleted || inserted;
+        self.revision += u64::from(changed);
+        if deleted && inserted {
+            if self.replacements.len() == REPLACEMENTS_KEPT {
+                self.replacements.remove(0);
+            }
+            self.replacements.push(Replacement { before, between, after: self.digest() });
+        }
+        Ok(changed)
     }
 
     /// Inserts pasted text at the cursor, replacing any selection. Returns
@@ -238,4 +330,60 @@ fn clean_paste(text: &str) -> String {
         .filter(|c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
         .map(|c| if c.is_control() && c != '\n' && c != '\t' { '\u{fffd}' } else { c })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    use super::*;
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn at(row: usize, col: usize) -> Cursor {
+        Cursor { row, col }
+    }
+
+    #[test]
+    fn a_replacement_is_one_undo_step_and_one_redo_step() {
+        let mut e = Editor::new();
+        e.set_text("select * from f");
+        e.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(e.text(), "select * from fa");
+        assert_eq!(e.replace(at(0, 14), at(0, 16), "film_actor"), Ok(true));
+        assert_eq!(e.text(), "select * from film_actor");
+        e.key(ctrl('u'));
+        assert_eq!(e.text(), "select * from fa", "one undo gives back the text before");
+        e.key(ctrl('r'));
+        assert_eq!(e.text(), "select * from film_actor", "one redo gives the text after");
+        e.key(ctrl('u'));
+        e.key(ctrl('u'));
+        assert_eq!(e.text(), "select * from f", "the next undo is the step before the replacement");
+        e.key(ctrl('r'));
+        e.key(ctrl('r'));
+        assert_eq!(e.text(), "select * from film_actor");
+    }
+
+    #[test]
+    fn a_replacement_that_changes_nothing_leaves_no_history() {
+        let mut e = Editor::new();
+        e.set_text("select");
+        e.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(e.replace(at(0, 0), at(0, 6), "select"), Ok(false));
+        e.key(ctrl('u'));
+        assert_eq!(e.text(), "select", "the one undo was the typed character");
+    }
+
+    #[test]
+    fn a_replacement_on_a_row_the_widget_cannot_address_is_refused_and_edits_nothing() {
+        let mut e = Editor::new();
+        e.set_text(&"\n".repeat(70_000));
+        let before = e.text();
+        let revision = e.revision();
+        assert!(e.replace(at(65_536, 0), at(65_536, 0), "x").is_err());
+        assert!(e.text() == before, "a row above u16::MAX was edited");
+        assert_eq!(e.revision(), revision);
+    }
 }

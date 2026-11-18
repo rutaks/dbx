@@ -62,11 +62,30 @@ pub enum Call {
     Schemas(DatabasePath),
     Tables(SchemaPath),
     Columns(TablePath),
+    Complete(CompletionRequest),
+    CurrentSchema(DatabasePath),
     Release(DatabasePath),
     Run(RunId),
     Cancel(RunId),
     CloseSession(SessionId, DatabasePath),
     History,
+}
+
+/// What the fake database holds, for completion: answered by content (the
+/// prefix, the schema, the kind) and not in a fixed order, because the app
+/// asks for what it needs as it needs it. Every call it serves waits `delay`
+/// first (tokio time).
+#[derive(Debug, Clone, Default)]
+pub struct Catalogue {
+    pub current_schema: Option<String>,
+    pub schemas: Vec<String>,
+    /// (schema, name, kind)
+    pub relations: Vec<(String, String, CandidateKind)>,
+    /// (schema, name, what it returns)
+    pub functions: Vec<(String, String, String)>,
+    /// (schema, table, columns)
+    pub columns: Vec<(String, String, Vec<ColumnInfo>)>,
+    pub delay: Duration,
 }
 
 type Queue<T> = Mutex<VecDeque<Scripted<T>>>;
@@ -84,6 +103,7 @@ pub struct FakeCore {
     run: Queue<ResultSet>,
     close_session: Queue<()>,
     history: Queue<Vec<HistoryEntry>>,
+    catalogue: Mutex<Option<Catalogue>>,
     calls: Mutex<Vec<Call>>,
     cancelled: Mutex<HashSet<RunId>>,
     cancel_signal: Notify,
@@ -169,6 +189,16 @@ impl FakeCore {
     }
     pub fn script_columns(&self, r: Scripted<Vec<ColumnInfo>>) {
         push(&self.columns, r);
+    }
+    /// Gives the fake a database to answer completion from.
+    pub fn script_catalogue(&self, c: Catalogue) {
+        *lock(&self.catalogue) = Some(c);
+    }
+    /// Changes how long the catalogue's calls take from now on.
+    pub fn set_catalogue_delay(&self, delay: Duration) {
+        if let Some(c) = lock(&self.catalogue).as_mut() {
+            c.delay = delay;
+        }
     }
     pub fn script_run(&self, r: Scripted<ResultSet>) {
         push(&self.run, r);
@@ -257,7 +287,66 @@ impl Core for FakeCore {
     }
     async fn columns(&self, at: &TablePath) -> Result<Vec<ColumnInfo>, CoreError> {
         self.record(Call::Columns(at.clone()));
+        let from_catalogue = || {
+            let held = lock(&self.catalogue).clone();
+            match held {
+                Some(c) => Ok((c.delay, c.columns.iter().find(|(s, t, _)| *s == at.schema.schema && *t == at.table).map(|(_, _, cols)| cols.clone()))),
+                None => Err(()),
+            }
+        };
+        if lock(&self.columns).is_empty() {
+            if let Ok((delay, cols)) = from_catalogue() {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                return Ok(cols.unwrap_or_default());
+            }
+        }
         reply(&self.columns, || unscripted("columns")).await
+    }
+
+    async fn complete(&self, request: &CompletionRequest) -> Result<Completion, CoreError> {
+        self.record(Call::Complete(request.clone()));
+        let Some(c) = lock(&self.catalogue).clone() else { return unscripted("complete") };
+        if !c.delay.is_zero() {
+            tokio::time::sleep(c.delay).await;
+        }
+        let wanted = request.prefix.to_lowercase();
+        let starts = |name: &str| name.to_lowercase().starts_with(&wanted);
+        let in_schema = |schema: &String| request.schema.as_ref().is_none_or(|s| s == schema);
+        let mut found: Vec<Candidate> = match request.kind {
+            SearchKind::Schema => c
+                .schemas
+                .iter()
+                .filter(|n| starts(n))
+                .map(|n| Candidate { name: n.clone(), kind: CandidateKind::Schema, schema: Some(n.clone()), detail: None })
+                .collect(),
+            SearchKind::Relation => c
+                .relations
+                .iter()
+                .filter(|(s, n, _)| in_schema(s) && starts(n))
+                .map(|(s, n, k)| Candidate { name: n.clone(), kind: *k, schema: Some(s.clone()), detail: None })
+                .collect(),
+            SearchKind::Function => c
+                .functions
+                .iter()
+                .filter(|(s, n, _)| in_schema(s) && starts(n))
+                .map(|(s, n, r)| Candidate { name: n.clone(), kind: CandidateKind::Function, schema: Some(s.clone()), detail: Some(r.clone()) })
+                .collect(),
+        };
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        let incomplete = found.len() >= request.limit;
+        found.truncate(request.limit);
+        Ok(Completion { candidates: found, incomplete })
+    }
+
+    async fn current_schema(&self, at: &DatabasePath) -> Result<Option<String>, CoreError> {
+        self.record(Call::CurrentSchema(at.clone()));
+        let Some(c) = lock(&self.catalogue).clone() else { return unscripted("current_schema") };
+        if !c.delay.is_zero() {
+            tokio::time::sleep(c.delay).await;
+        }
+        Ok(c.current_schema)
     }
 
     async fn release(&self, at: &DatabasePath) -> Result<(), CoreError> {
@@ -416,6 +505,8 @@ mod tests {
             core.schemas(&db).await.err(),
             core.tables(&schema).await.err(),
             core.columns(&table).await.err(),
+            core.complete(&CompletionRequest { at: db.clone(), schema: None, kind: SearchKind::Relation, prefix: String::new(), limit: 10 }).await.err(),
+            core.current_schema(&db).await.err(),
             core.run(RunId(1), request()).await.err(),
             core.close_session(SessionId { tab: TabId(1), serial: 1 }, &db).await.err(),
             core.history(HistoryQuery::default()).await.err(),

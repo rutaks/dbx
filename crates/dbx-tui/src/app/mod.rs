@@ -3,6 +3,11 @@
 
 mod connection_ui;
 mod resize;
+pub mod complete;
+pub mod complete_context;
+pub mod complete_insert;
+pub mod complete_match;
+pub mod complete_popup;
 pub mod editor;
 pub mod form;
 pub mod grid;
@@ -25,6 +30,8 @@ pub(crate) mod view;
 
 #[cfg(test)]
 mod cancel_tests;
+#[cfg(test)]
+mod complete_tests;
 #[cfg(test)]
 mod connections_tests;
 #[cfg(test)]
@@ -109,6 +116,8 @@ pub struct Model {
     /// The query tabs. One until the tab bar arrives (slice 15).
     pub tabs: Vec<QueryTab>,
     pub requests: Requests,
+    /// What the completion popup has asked the Core for and kept.
+    pub completions: complete::CompletionCache,
     /// The id the next run gets.
     pub next_run: u64,
     /// The most rows a run fetches.
@@ -162,6 +171,8 @@ pub struct Ui {
     pub editor: editor::Editor,
     /// What the editor draws from: colours, type names, the statement range.
     pub syntax: syntax::SyntaxState,
+    /// The completion popup.
+    pub complete: complete::CompleteUi,
     pub notice: Option<Notice>,
     /// The results pane's cell cursor and window.
     pub grid: grid::GridUi,
@@ -198,6 +209,13 @@ pub enum CoreCall {
     List(NodeId),
     /// Run a statement in a query tab.
     Run(RunId, RunRequest),
+    /// A prefix search of names for the completion popup.
+    Complete(crate::core::CompletionRequest),
+    /// The schema unqualified names resolve in on a database.
+    CurrentSchema(DatabasePath),
+    /// The columns of a table, for completion: kept in the completion cache,
+    /// not in the sidebar's tree.
+    TableColumns(crate::core::TablePath),
 }
 
 /// The reply to a `CoreCall`.
@@ -209,6 +227,9 @@ pub enum CoreReply {
     Removed(Result<(), CoreError>),
     Listed(Result<Listing, CoreError>),
     Ran(Result<ResultSet, CoreError>),
+    Completed(Result<crate::core::Completion, CoreError>),
+    CurrentSchema(Result<Option<String>, CoreError>),
+    TableColumns(Result<Vec<crate::core::ColumnInfo>, CoreError>),
 }
 
 #[derive(Debug)]
@@ -275,6 +296,7 @@ impl App {
                 schema: SchemaCache::default(),
                 tabs: vec![QueryTab::new(TabId(1))],
                 requests: Requests::default(),
+                completions: complete::CompletionCache::default(),
                 next_run: 1,
                 row_cap: DEFAULT_ROW_CAP,
             },
@@ -296,6 +318,7 @@ impl App {
                 note: None,
                 editor: editor::Editor::new(),
                 syntax: syntax::SyntaxState::default(),
+                complete: complete::CompleteUi::default(),
                 notice: None,
                 grid: grid::GridUi::default(),
                 now: None,
@@ -352,6 +375,7 @@ impl App {
             Event::Paste(text) => self.on_paste(&text, &mut fx),
             Event::Timer => {}
         }
+        self.completion_housekeeping(&mut fx);
         self.ensure_rows();
         fx
     }
@@ -405,7 +429,7 @@ impl App {
                     match self.ui.focus {
                         PaneId::Sidebar => self.on_sidebar_key(combo, fx),
                         // The editor takes text: every other key is its own.
-                        PaneId::Editor => fx.repaint |= self.ui.editor.key(key),
+                        PaneId::Editor => self.on_editor_key(key, combo, fx),
                         PaneId::Results => self.on_results_key(combo, now, fx),
                     }
                 }
@@ -429,6 +453,7 @@ impl App {
 
     fn on_paste(&mut self, text: &str, fx: &mut Effects) {
         if self.ui.focus == PaneId::Editor {
+            self.close_completion(fx);
             match self.ui.editor.paste(text) {
                 Ok(changed) => fx.repaint |= changed,
                 Err(why) => self.notify(format!("The text was not pasted: {why}."), true, fx),
@@ -473,6 +498,11 @@ impl App {
                 self.cancel_run(now, fx);
                 None
             }
+            // The key that opens the completion popup works in the editor.
+            (Action::CompleteOpen, Editor) => {
+                self.perform_complete(action, fx);
+                None
+            }
             _ => None,
         };
         if let Some(pane) = target {
@@ -506,6 +536,9 @@ impl App {
             _ => (false, true),
         };
         let step = if down { 1 } else { -1 };
+        if !sideways && self.wheel_completion(mouse.column, mouse.row, WHEEL_ROWS * step, fx) {
+            return;
+        }
         if self.ui.hits.sidebar.contains(at) {
             if !sideways {
                 self.scroll_sidebar(WHEEL_ROWS * step, fx);
@@ -531,6 +564,12 @@ impl App {
         if let Some(hit) = self.ui.mode_hints.iter().find(|h| h.rect.contains(at)).copied() {
             self.ui.clicks.forget();
             return self.click_hint(hit.action, now, fx);
+        }
+        // The completion popup is drawn over the panes: a press on it is its
+        // own, and a press anywhere else closes it and goes on.
+        if self.press_completion(x, y, fx) {
+            self.ui.clicks.forget();
+            return;
         }
         // A divider is nobody's pane: pressing it takes no focus; dragging it
         // resizes, and a double-click puts it back.
@@ -725,6 +764,14 @@ impl App {
             (Target::SaveConnection(serial), CoreReply::Saved(result)) => self.on_saved(serial, result, fx),
             (Target::RemoveConnection(id), CoreReply::Removed(result)) => self.on_removed(id, result, fx),
             (Target::Run(_), CoreReply::Ran(result)) => self.on_ran(result, fx),
+            (Target::Complete(need), reply) => {
+                // Whether the screen changed is its own business: a reply for
+                // a word the caret has left repaints nothing.
+                if self.on_complete_reply(need, reply, fx) {
+                    fx.repaint = true;
+                }
+                return;
+            }
             (Target::Children(node), CoreReply::Listed(result)) => {
                 if !self.on_listed(node, result, fx) {
                     return;

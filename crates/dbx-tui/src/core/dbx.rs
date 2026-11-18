@@ -1132,6 +1132,69 @@ impl Core for DbxCore {
             })
             .collect())
     }
+    async fn complete(&self, request: &CompletionRequest) -> Result<Completion, CoreError> {
+        use dbx_core::db::{CompletionAssistantCandidateKind as K, CompletionAssistantMatchMode, CompletionAssistantObjectKind as O, CompletionAssistantRequest};
+        self.ensure_browsable(&request.at.connection).await?;
+        let object_kinds = match request.kind {
+            SearchKind::Schema => vec![O::Schema],
+            SearchKind::Relation => vec![O::Table, O::View],
+            SearchKind::Function => vec![O::Function],
+        };
+        let limit = request.limit.clamp(1, 1000);
+        let search = CompletionAssistantRequest {
+            connection_id: request.at.connection.0.clone(),
+            database: request.at.database.clone(),
+            schema: request.schema.clone(),
+            object_kinds,
+            mask: request.prefix.clone(),
+            case_sensitive: false,
+            global_search: false,
+            max_results: Some(limit),
+            search_in_comments: false,
+            search_in_definitions: false,
+            parent_schema: None,
+            parent_name: None,
+            match_mode: Some(CompletionAssistantMatchMode::Prefix),
+        };
+        let conn = request.at.connection.clone();
+        let response = self
+            .metadata(&conn, move |state| async move { dbx_core::schema::completion_assistant_search_core(&state, search).await })
+            .await?;
+        let candidates = response
+            .candidates
+            .into_iter()
+            .filter_map(|c| {
+                let kind = match c.kind {
+                    K::Schema => CandidateKind::Schema,
+                    K::Table => CandidateKind::Table,
+                    K::View => CandidateKind::View,
+                    K::MaterializedView => CandidateKind::MaterializedView,
+                    K::Function => CandidateKind::Function,
+                    K::Procedure => CandidateKind::Procedure,
+                    _ => return None,
+                };
+                let detail = c.data_type.filter(|d| !d.is_empty());
+                Some(Candidate { name: c.name, kind, schema: c.schema, detail })
+            })
+            .collect();
+        Ok(Completion { candidates, incomplete: response.incomplete })
+    }
+    async fn current_schema(&self, at: &DatabasePath) -> Result<Option<String>, CoreError> {
+        self.ensure_browsable(&at.connection).await?;
+        let (conn, database) = (at.connection.0.clone(), at.database.clone());
+        self.metadata(&at.connection, move |state| async move {
+            // Through the query path: dbx has no getter for it. Its own pool
+            // for the call, not the tab's session: the search path of a
+            // session may have been `SET`, and this asks what a fresh
+            // connection resolves names in.
+            let options = QueryExecutionOptions { max_rows: Some(1), timeout_secs: Some(0), ..Default::default() };
+            let result = execute_sql_statement_with_options_typed(&state, &conn, &database, "select current_schema()", None, None, options)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(result.rows.first().and_then(|r| r.first()).and_then(|v| v.as_str()).map(str::to_string))
+        })
+        .await
+    }
     async fn release(&self, at: &DatabasePath) -> Result<(), CoreError> {
         let state = self.state().await?;
         let postgres = state.configs.read().await.get(&at.connection.0).is_some_and(|c| kind_of(c.db_type) == DbKind::Postgres);

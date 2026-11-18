@@ -319,6 +319,9 @@ pub(crate) fn execute(
                         CoreCall::RemoveConnection(id) => CoreReply::Removed(core.remove_connection(&id).await),
                         CoreCall::List(node) => CoreReply::Listed(list(core.as_ref(), node).await),
                         CoreCall::Run(run, request) => CoreReply::Ran(core.run(run, request).await),
+                        CoreCall::Complete(request) => CoreReply::Completed(core.complete(&request).await),
+                        CoreCall::CurrentSchema(at) => CoreReply::CurrentSchema(core.current_schema(&at).await),
+                        CoreCall::TableColumns(at) => CoreReply::TableColumns(core.columns(&at).await),
                     };
                     done.lock().remove(&id);
                     if let Some(ended) = ended {

@@ -28,6 +28,28 @@ fn gutter_width(lines: usize) -> u16 {
 /// The width of a tab stop, as the widget expands tabs.
 const TAB: usize = 4;
 
+/// Where character `at` of the buffer is on screen, as the last frame drew
+/// the editor: its cell, when it is inside the text area.
+pub(super) fn cell_of(app: &App, at: crate::core::Cursor) -> Option<(u16, u16)> {
+    let text = app.ui.hits.editor_text;
+    let (top, left) = app.ui.editor.scroll_top();
+    let line = app.ui.editor.lines().get(at.row)?;
+    if at.row < top {
+        return None;
+    }
+    let y = text.y.checked_add(u16::try_from(at.row - top).ok()?).filter(|y| *y < text.bottom())?;
+    let (mut col, mut chars) = (0usize, 0usize);
+    for g in line.graphemes(true) {
+        if chars >= at.col {
+            break;
+        }
+        chars += g.chars().count();
+        col += if g == "\t" { TAB - col % TAB } else { UnicodeWidthStr::width(display_safe(g).as_str()) };
+    }
+    let x = text.x + col.saturating_sub(left) as u16;
+    (x < text.right()).then_some((x, y))
+}
+
 /// Marks the rows of the statement that would run, in the gutter.
 const BAR: &str = "▎";
 

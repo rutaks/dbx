@@ -250,6 +250,10 @@ impl App {
         if self.browsing_unsupported(&node) {
             return;
         }
+        // A refresh makes what completion kept for this part of the tree stale.
+        if self.model.schema.state(&node).listing().is_some() {
+            self.invalidate_completions(&node, fx);
+        }
         let target = Target::Children(node.clone());
         for old in self.model.requests.forget(&target) {
             fx.commands.push(Command::Abandon(old));
@@ -299,6 +303,7 @@ impl App {
     fn drop_cache(&mut self, node: &NodeId, fx: &mut Effects) {
         self.abandon_at_or_below(node, fx);
         self.release_below(node, true, fx);
+        self.invalidate_completions(node, fx);
         self.model.schema.remove_at_or_below(node);
         self.ui.sidebar.expanded.retain(|n| !n.is_below(node));
         self.touch_rows();
@@ -404,6 +409,7 @@ impl App {
     pub(super) fn forget_connection(&mut self, id: &ConnectionId, fx: &mut Effects) {
         let node = NodeId::Connection(id.clone());
         self.release_below(&node, false, fx);
+        self.invalidate_completions(&node, fx);
         self.model.schema.remove_connection(id);
         self.ui.sidebar.expanded.retain(|n| n.connection() != id);
         for old in self.model.requests.forget_where(|t| matches!(t, Target::Children(n) if n.connection() == id)) {
@@ -484,6 +490,7 @@ impl App {
             }
             a if a.scope() == super::keys::Scope::Results => self.perform_results(a, now, fx),
             a if a.scope() == super::keys::Scope::Resize => self.perform_resize(a, fx),
+            a if a.scope() == super::keys::Scope::Complete => self.perform_complete(a, fx),
             a if a.scope() != super::keys::Scope::Sidebar => self.perform(a, now, fx),
             a => self.perform_sidebar(a, fx),
         }

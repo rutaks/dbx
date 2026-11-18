@@ -21,6 +21,8 @@ pub struct Harness {
     rx: mpsc::UnboundedReceiver<(RequestId, CoreReply)>,
     pub tasks: Tasks,
     pub quit: bool,
+    /// How many of the replies `settle` fed the app asked for a repaint.
+    pub repaints: usize,
     /// tokio's time when the harness started: the app's clock is `base()`
     /// plus tokio time since then, so a test that pauses and advances tokio
     /// time moves the app's clock with it.
@@ -34,7 +36,7 @@ impl Harness {
         let core: Arc<dyn Core> = fake.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         let syntax: Arc<dyn crate::core::Syntax> = fake.clone();
-        let mut h = Harness { app: App::new(), fake, core, tx, rx, tasks: Tasks::default(), quit: false, t0: tokio::time::Instant::now() };
+        let mut h = Harness { app: App::new(), fake, core, tx, rx, tasks: Tasks::default(), quit: false, repaints: 0, t0: tokio::time::Instant::now() };
         h.app.ui.syntax.set_handle(syntax);
         let fx = h.app.start();
         h.run(fx);
@@ -70,6 +72,7 @@ impl Harness {
         while let Ok((id, reply)) = self.rx.try_recv() {
             let now = self.now();
             let fx = self.app.update(Event::Core(id, reply), now);
+            self.repaints += usize::from(fx.repaint);
             self.run(fx);
             for _ in 0..10 {
                 tokio::task::yield_now().await;

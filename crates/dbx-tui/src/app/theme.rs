@@ -56,10 +56,12 @@ pub enum Role {
     LineNumberActive,
     MatchedBrace,
     RangeToExecute,
+    /// The completion popup's fill.
+    PopupBg,
 }
 
 impl Role {
-    pub const ALL: [Role; 34] = [
+    pub const ALL: [Role; 35] = [
         Role::Accent,
         Role::PanelBg,
         Role::SidebarBg,
@@ -94,6 +96,7 @@ impl Role {
         Role::LineNumberActive,
         Role::MatchedBrace,
         Role::RangeToExecute,
+        Role::PopupBg,
     ];
 }
 
@@ -134,6 +137,7 @@ pub struct Palette {
     line_number_active: Color,
     matched_brace: Color,
     range_to_execute: Color,
+    popup_bg: Color,
     /// A selection is drawn reversed: for a theme whose selection colour is
     /// the terminal's own background, where no colour would show.
     selection_reversed: bool,
@@ -178,6 +182,7 @@ impl Palette {
             Role::LineNumberActive => self.line_number_active,
             Role::MatchedBrace => self.matched_brace,
             Role::RangeToExecute => self.range_to_execute,
+            Role::PopupBg => self.popup_bg,
         }
     }
 
@@ -246,6 +251,7 @@ impl Palette {
             line_number_active: Color::Rgb(166, 173, 200),
             matched_brace: Color::Rgb(69, 71, 90),
             range_to_execute: Color::Rgb(166, 227, 161),
+            popup_bg: Color::Rgb(24, 24, 37),
             selection_reversed: false,
         }
     }
@@ -287,6 +293,7 @@ impl Palette {
             line_number_active: Color::Gray,
             matched_brace: Color::Magenta,
             range_to_execute: Color::Green,
+            popup_bg: Color::DarkGray,
             selection_reversed: true,
         }
     }
@@ -334,6 +341,8 @@ impl Palette {
             line_number_active: rgb(0xA1A3AB),
             matched_brace: rgb(0x43454A),
             range_to_execute: rgb(0x3D7A49),
+            // IntelliJ's popups and lookup lists: #2B2D30.
+            popup_bg: rgb(0x2B2D30),
             selection_reversed: false,
         }
     }
@@ -378,6 +387,7 @@ impl Palette {
             line_number_active: c(31),
             matched_brace: c(32),
             range_to_execute: c(33),
+            popup_bg: c(34),
             selection_reversed: false,
         }
     }
@@ -481,6 +491,7 @@ mod tests {
         assert_eq!(p.color(Role::LineNumberActive), rgb(0xA1, 0xA3, 0xAB));
         assert_eq!(p.color(Role::MatchedBrace), rgb(0x43, 0x45, 0x4A));
         assert_eq!(p.color(Role::RangeToExecute), rgb(0x3D, 0x7A, 0x49));
+        assert_eq!(p.color(Role::PopupBg), rgb(0x2B, 0x2D, 0x30));
         assert!(p.modifier(Role::SynFunction).contains(ratatui::style::Modifier::ITALIC));
     }
 
@@ -500,6 +511,16 @@ mod tests {
             assert_ne!(look(&p, Role::SelectionBg), look(&p, Role::EditorBg), "{name}: a selection must show on the editor background");
             assert_ne!(look(&p, Role::SelectionBg), look(&p, Role::CurrentLine), "{name}: a selection must show on the caret row");
             assert_ne!(look(&p, Role::MatchedBrace), look(&p, Role::CurrentLine), "{name}: a matched brace must show on the caret row");
+        }
+    }
+
+    #[test]
+    fn in_every_theme_the_popup_is_told_from_the_editor_and_its_selected_row_shows_on_it() {
+        let look = |p: &Palette, role| (p.color(role), p.modifier(role));
+        for name in Palette::NAMES {
+            let p = Palette::by_name(name).expect(name);
+            assert_ne!(look(&p, Role::PopupBg), look(&p, Role::EditorBg), "{name}: the popup must stand out from the editor");
+            assert_ne!(look(&p, Role::SelectionBg), look(&p, Role::PopupBg), "{name}: the selected row must show on the popup");
         }
     }
 

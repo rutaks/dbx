@@ -47,6 +47,8 @@ pub struct QueryTab {
     pub result_session: u32,
     /// The run in flight, if it is "load more" of the shown result.
     pub loading_more: Option<LoadMore>,
+    /// The run in flight, or the last one, had `search_path` in its text.
+    pub run_mentions_search_path: bool,
 }
 
 /// A "load more" run in flight: the result it replaces stays on screen,
@@ -73,7 +75,7 @@ impl QueryTab {
     }
 
     pub fn new(id: TabId) -> Self {
-        QueryTab { id, target: None, session: 1, run: RunState::Idle, outcome: None, abandoned: Vec::new(), result_session: 1, loading_more: None }
+        QueryTab { id, target: None, session: 1, run: RunState::Idle, outcome: None, abandoned: Vec::new(), result_session: 1, loading_more: None, run_mentions_search_path: false }
     }
 }
 
@@ -243,6 +245,7 @@ impl App {
             return;
         }
         self.end_tab_session(fx);
+        self.close_completion(fx);
         let tab = self.tab_mut();
         // A new session: the old one's close may land after the next run has
         // started, and must not end it (`SessionId`).
@@ -307,6 +310,7 @@ impl App {
     pub(super) fn connection_removed(&mut self, id: &ConnectionId, fx: &mut Effects) {
         if self.tab().target.as_ref().is_some_and(|t| &t.connection == id) {
             self.abandon_run(fx);
+            self.close_completion(fx);
             // dbx dropped the connection's pools, sessions with them.
             let t = self.tab_mut();
             t.session += 1;
@@ -345,6 +349,7 @@ impl App {
         let run = crate::core::RunId(self.model.next_run);
         self.model.next_run += 1;
         let id = self.model.requests.begin(Target::Run(tab));
+        self.tab_mut().run_mentions_search_path = self.ui.editor.text().to_lowercase().contains("search_path");
         let request = RunRequest {
             connection: target.connection,
             database: Some(target.database),
@@ -413,6 +418,7 @@ impl App {
     /// ended: the tab is `Cancelled`, and what the reply carried is dropped.
     /// Any other stale reply changes nothing and repaints nothing.
     pub(super) fn on_ran_after_cancel(&mut self, id: RequestId, result: Result<ResultSet, CoreError>, fx: &mut Effects) {
+        self.after_run_forget_current_schema(fx);
         // A run the tab let go of has ended: it is no longer running anywhere.
         let before = self.tab().abandoned.len();
         self.tab_mut().abandoned.retain(|a| a.request != id);
@@ -449,6 +455,7 @@ impl App {
 
     /// The reply to the tab's current run.
     pub(super) fn on_ran(&mut self, result: Result<crate::core::ResultSet, CoreError>, fx: &mut Effects) {
+        self.after_run_forget_current_schema(fx);
         let now = self.ui.now;
         let tab = self.tab_mut();
         let elapsed = match (now, tab.run.in_flight()) {

@@ -65,11 +65,10 @@ impl SyntaxState {
         self.highlighter.current()
     }
 
-    /// Brings the colours up to date and returns the
-    /// range of the statement a run would send, if one can be placed. With a
-    /// selection the run sends the selection, which is outlined as a
-    /// selection already: no statement range then.
-    pub fn prepare(&mut self, editor: &Editor, kind: Option<&DbKind>) -> Option<(Cursor, Cursor)> {
+    /// Brings the colours up to date, and nothing else: what completion needs
+    /// to know which characters are a string or a comment. The same cache as
+    /// `prepare`, so the next frame tokenizes nothing more.
+    pub fn refresh(&mut self, editor: &Editor, kind: Option<&DbKind>) {
         if let Some(kind) = kind {
             if !self.types.iter().any(|(k, _)| k == kind) {
                 self.types.push((kind.clone(), TypeNames::new(self.handle.type_names(kind))));
@@ -78,6 +77,14 @@ impl SyntaxState {
         let none = TypeNames::default();
         let types = kind.and_then(|k| self.types.iter().find(|(t, _)| t == k)).map_or(&none, |(_, t)| t);
         self.highlighter.colours(editor.revision(), editor.lines(), kind, types);
+    }
+
+    /// Brings the colours up to date and returns the
+    /// range of the statement a run would send, if one can be placed. With a
+    /// selection the run sends the selection, which is outlined as a
+    /// selection already: no statement range then.
+    pub fn prepare(&mut self, editor: &Editor, kind: Option<&DbKind>) -> Option<(Cursor, Cursor)> {
+        self.refresh(editor, kind);
 
         let kind = kind?;
         if editor.selection().is_some() {

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use super::complete::Need;
 use super::tree::NodeId;
 use crate::core::{ConnectionId, TabId};
 
@@ -27,6 +28,9 @@ pub enum Target {
     SaveConnection(u64),
     /// The removal of one saved connection.
     RemoveConnection(ConnectionId),
+    /// One thing the completion popup asked the Core for. The latest request
+    /// for a thing wins: a longer word asks again, and the older reply is stale.
+    Complete(Need),
 }
 
 /// What a reply is, by the table.

@@ -77,7 +77,7 @@ impl TypeNames {
 /// `date`, `year`), and colouring those as keywords would paint ordinary
 /// identifiers. These are the core SQL words every dialect shares, plus the
 /// common Postgres ones.
-const KEYWORDS: &[&str] = &[
+pub(crate) const KEYWORDS: &[&str] = &[
     "add", "all", "alter", "analyze", "and", "any", "as", "asc", "begin", "between", "by", "call", "cascade", "case", "check",
     "collate", "column", "commit", "constraint", "copy", "create", "cross", "cube", "current", "database", "declare", "default",
     "delete", "desc", "distinct", "do", "drop", "else", "elsif", "end", "escape", "except", "execute", "exists", "explain", "false",
@@ -94,7 +94,7 @@ const KEYWORDS: &[&str] = &[
 /// Keywords that are calls when a parenthesis follows directly.
 const KEYWORD_FUNCTIONS: &[&str] = &["left", "right", "replace", "if", "truncate", "rollup", "cube", "filter"];
 
-fn is_keyword(lower: &str) -> bool {
+pub(crate) fn is_keyword(lower: &str) -> bool {
     static SET: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
     SET.get_or_init(|| KEYWORDS.iter().copied().collect()).contains(lower)
 }

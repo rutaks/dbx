@@ -83,6 +83,7 @@ connection cancels a run on it first, and the removal waits for that run.
 |---|---|
 | `f5`, `alt+enter`, `ctrl+g r` | run the selection, or else the statement under the cursor (dbx splits statements at `;`, and also before a line starting with a keyword such as `CREATE`, `INSERT`, `UPDATE`, `DELETE` or `SET`, but not `SELECT` or `WITH`, after two or more blank lines; a cursor on a blank line after a statement runs that statement) |
 | `ctrl+c` (editor or results focused), `ctrl+g c` (anywhere) | cancel the run; pressed again while the cancel has not landed, ask whether to stop waiting (below). With nothing running, `ctrl+c` does nothing at all |
+| `ctrl+space` (editor focused) | open the completion popup (below) |
 | anything else, editor focused | the editor's own (`ratatui-textarea` defaults: shift+arrows select, `ctrl+u`/`ctrl+r` undo/redo) |
 
 A run has no time limit unless the connection sets its own query timeout in
@@ -173,6 +174,92 @@ more than once and the caret is in none of the copies there is no outline.
 Themes: `catppuccin` (default), `terminal`, `intellij-dark` (IntelliJ's Dark
 values), chosen with the environment variable `DBX_TUI_THEME` until there is a
 config file.
+
+## Completion (the popup in the editor)
+
+A popup of suggestions opens below the word being typed (above it when there
+is no room, clipped to the terminal; no dimming, no box: it is not an
+overlay). It opens by itself once an identifier has a character in it, and
+right after a name and a dot; `ctrl+space` opens it by hand, whatever the
+word. It does not open inside a string or a comment (the highlighter's roles
+say which characters are), on a number, or for a word longer than 128 bytes.
+Not at all for a name typed in full when that is the only thing it would list
+(so `enter` after `film` is a line break).
+
+| Key (popup open) | Does |
+|---|---|
+| `enter` | insert the selected suggestion at the caret |
+| `tab` | replace the rest of the word to the right of the caret with it |
+| `down` `ctrl+n` / `up` `ctrl+p` | move the selection (it stops at the ends) |
+| `pagedown` / `pageup` | a window (10 rows) |
+| `esc` | close it, only it: the text stays and the next `esc` is the editor's |
+| anything else | goes to the editor, and the list follows the text |
+
+The keys are in the mode bar while it is open (live bindings, clickable).
+Mouse: a click on an item inserts it, a click anywhere else closes the popup
+and goes on, the wheel over it scrolls the list. The popup closes when the
+caret leaves the word, the editor loses focus, the prefix key is pressed, a
+paste lands, or the tab is given another database.
+
+**What it lists** (`app/complete_context.rs`, from tokens, so it works on SQL
+that does not parse; a statement is the tokens between `;`s, read within
+64 KiB and 200 rows of the caret):
+
+- after FROM, JOIN, INTO, UPDATE, TABLE and after a comma in a FROM list:
+  tables and views of the current schema, schemas, and only the keywords valid
+  there (`lateral`, `only`);
+- after `name.`: an alias or a table the statement names (`from film f`,
+  `join film_actor as fa`) gives its columns with their types; a schema gives
+  its tables; any other name is tried as a table of the current schema;
+  `schema.table.` gives that table's columns;
+- after a table name (and alias): the words that can follow it; after `as`:
+  nothing; after `order`, `group`, `insert`, `left`... only what the grammar
+  allows;
+- elsewhere: keywords, the columns of the tables in the statement, then
+  functions (searched by what is typed, from two letters on, in the current
+  schema and `pg_catalog`; the common aggregates and window functions
+  (`count`, `sum`, `row_number`...) are the client's own list, because dbx's
+  search asks for `pg_proc.prokind` `f` and `p` and never returns them).
+
+**Order** (`app/complete_match.rs`): an exact match, then a prefix, then the
+initials of the words of the name (split at `_`, `-`, spaces and camel-case
+humps; `fa` is `film_actor`, `fiac` too), then anywhere in the name; shorter
+names first within a tier. The first letter's case must match, the rest need
+not (keywords ignore case). Nothing typed: the sources in order, a table's
+columns in its own order. The matched characters are bold.
+
+**Inserting** (`app/complete_insert.rs`): names exactly as stored, quoted when
+the dialect needs it (anything but `[a-z_][a-z0-9_$]*`, and Postgres's
+reserved words: `"Order Items"`, `"order"`; backticks for MySQL; a quote
+inside is doubled). A keyword takes the case being typed (`SEL` gives
+`SELECT`). dbx's own quoting functions are private, so the rule is ours.
+
+**Where the names come from, in order.** The sidebar's tree when that node is
+loaded (schemas of the database, tables of the schema, columns of the table);
+else what the app asked the Core for and kept (`CompletionCache`, per
+connection, database and schema); else a Core call, made now and filled in
+when it answers. Typing never waits: the popup shows what it has, and a reply
+refreshes it only while the caret is on the word it was asked about (otherwise
+it lands in the cache and changes nothing on screen). The Core calls:
+
+| `Core` method | dbx behind it | Asked for |
+|---|---|---|
+| `complete(CompletionRequest)` | `schema::completion_assistant_search_core` (prefix search, `ILIKE`, `incomplete` when it hit its limit) | a schema's tables and views (the whole schema once, 1,000 at most; by prefix only when that was cut), the database's schemas, functions by prefix (300) |
+| `current_schema(at)` | `query::execute_sql_statement_with_options_typed` with `select current_schema()` | once per database, for unqualified names; a failure means `public` |
+| `columns(table)` (existing) | `schema::get_columns_core` | a table's columns, through `CoreCall::TableColumns` and not the tree's `List`, so the sidebar is not touched |
+
+Every one runs through `DbxCore::metadata`, raced against a cancel token like
+the other metadata calls, and the request table keys each by what it is for
+(`Target::Complete(Need)`), so a longer word that needs a new prefix search
+makes the older reply stale. A refresh of a tree node (`r`), closing it on an
+error, or removing its connection drops what was kept for that part of the
+tree (and abandons what was in flight for it). A failed call is not asked
+again until then, and the popup keeps what it has (keywords at least). Only
+Postgres connections get names; other kinds get keywords.
+
+Themes: the popup's fill is the role `popup_bg` (IntelliJ Dark `#2B2D30`), the
+selected row is drawn in the selection style, kinds and types in `overlay0` /
+`overlay1`.
 
 ## The result grid (results pane)
 
@@ -306,7 +393,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `cancel`, `first-query`, `mouse`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `cancel`, `complete`, `first-query`, `mouse`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 pub use dbx::{DbxCore, KeySource, StoreOptions};
 #[cfg(feature = "test-support")]
 pub use dbx::check_seed_dir;
-pub use fake::{Call, FakeCore, Scripted, SyntaxCalls};
+pub use fake::{Call, Catalogue, FakeCore, Scripted, SyntaxCalls};
 
 // ---- identifiers -----------------------------------------------------------
 
@@ -209,6 +209,60 @@ pub struct ColumnInfo {
 pub struct Table {
     pub name: String,
     pub kind: TableKind,
+}
+
+// ---- completion ------------------------------------------------------------
+
+/// What a completion search looks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchKind {
+    Schema,
+    /// Tables, views and materialized views.
+    Relation,
+    Function,
+}
+
+/// A prefix search of one database's names (dbx's
+/// `completion_assistant_search_core`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionRequest {
+    pub at: DatabasePath,
+    /// The schema searched, for relations and functions; the search of
+    /// schemas ignores it.
+    pub schema: Option<String>,
+    pub kind: SearchKind,
+    /// Names that start with it, without regard to case; empty is everything.
+    pub prefix: String,
+    /// The most names returned.
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CandidateKind {
+    Schema,
+    Table,
+    View,
+    MaterializedView,
+    Function,
+    Procedure,
+}
+
+/// One name a completion search found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Exactly as stored.
+    pub name: String,
+    pub kind: CandidateKind,
+    pub schema: Option<String>,
+    /// For a function, what it returns.
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub candidates: Vec<Candidate>,
+    /// The search stopped at its limit: there may be more names.
+    pub incomplete: bool,
 }
 
 // ---- runs and results ------------------------------------------------------
@@ -482,6 +536,13 @@ pub trait Core: Syntax {
     async fn schemas(&self, at: &DatabasePath) -> Result<Vec<String>, CoreError>;
     async fn tables(&self, at: &SchemaPath) -> Result<Vec<Table>, CoreError>;
     async fn columns(&self, at: &TablePath) -> Result<Vec<ColumnInfo>, CoreError>;
+    /// A prefix search of names for the completion popup: schemas, tables and
+    /// views, or functions. Like the schema calls it can be abandoned: the
+    /// caller drops the future and the work stops.
+    async fn complete(&self, request: &CompletionRequest) -> Result<Completion, CoreError>;
+    /// The schema unqualified names resolve in on this database (`select
+    /// current_schema()`), `None` when the server says there is none.
+    async fn current_schema(&self, at: &DatabasePath) -> Result<Option<String>, CoreError>;
     /// Lets go of the server connections the schema calls opened on one
     /// database (the tree collapsed it), so browsing many databases does not
     /// hold a slot on the server for each. Nothing is lost: the next call on

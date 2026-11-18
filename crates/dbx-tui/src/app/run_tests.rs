@@ -104,12 +104,13 @@ async fn typing_in_the_focused_editor_inserts_text_and_no_sidebar_key_fires() {
     let cursor_before = h.app.ui.sidebar.cursor;
     // `e`, `d`, `r`, `u`, `j`, `G` are sidebar keys; here they are letters.
     let mut commands = Vec::new();
-    for c in "select e, d, r, u, j\nfrom G".chars() {
+    // (`;` before the line break: a word being typed would be completed by `enter`.)
+    for c in "select e, d, r, u, j;\nfrom G".chars() {
         let code = if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) };
         let mods = if c.is_ascii_uppercase() { KeyModifiers::SHIFT } else { KeyModifiers::NONE };
         commands.extend(key(&mut h, code, mods));
     }
-    assert_eq!(h.app.ui.editor.text(), "select e, d, r, u, j\nfrom G");
+    assert_eq!(h.app.ui.editor.text(), "select e, d, r, u, j;\nfrom G");
     assert!(commands.is_empty(), "{commands:?}");
     assert!(h.app.ui.overlay.is_none(), "`e` did not open the edit form");
     assert_eq!(h.app.ui.sidebar.cursor, cursor_before);

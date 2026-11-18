@@ -127,6 +127,9 @@ pub enum Scope {
     Results,
     /// Read by the resize mode, which takes every key while it is on.
     Resize,
+    /// Read by the editor while the completion popup is open, before the
+    /// editor itself sees the key.
+    Complete,
 }
 
 /// A named thing the client can do, to which keys are bound.
@@ -194,6 +197,18 @@ pub enum Action {
     ResizeUp,
     ResizeDown,
     ResizeDone,
+    /// Open the completion popup by hand (a direct key, in the editor).
+    CompleteOpen,
+    // The completion popup's own keys, read while it is open.
+    /// Insert the selected suggestion at the caret.
+    CompleteInsert,
+    /// Replace the rest of the word to the right of the caret with it.
+    CompleteReplace,
+    CompleteUp,
+    CompleteDown,
+    CompletePageUp,
+    CompletePageDown,
+    CompleteClose,
 }
 
 impl Action {
@@ -233,6 +248,12 @@ impl Action {
             Action::ResizeLeft | Action::ResizeRight => "sidebar",
             Action::ResizeUp | Action::ResizeDown => "split",
             Action::ResizeDone => "done",
+            Action::CompleteOpen => "complete",
+            Action::CompleteInsert => "insert",
+            Action::CompleteReplace => "replace",
+            Action::CompleteUp | Action::CompleteDown => "move",
+            Action::CompletePageUp | Action::CompletePageDown => "page",
+            Action::CompleteClose => "close",
         }
     }
 
@@ -250,7 +271,14 @@ impl Action {
             | Action::ResizeMode
             | Action::OpenPrefix => Scope::Prefix,
             Action::ResizeLeft | Action::ResizeRight | Action::ResizeUp | Action::ResizeDown | Action::ResizeDone => Scope::Resize,
-            Action::RunDirect | Action::CancelDirect => Scope::Direct,
+            Action::RunDirect | Action::CancelDirect | Action::CompleteOpen => Scope::Direct,
+            Action::CompleteInsert
+            | Action::CompleteReplace
+            | Action::CompleteUp
+            | Action::CompleteDown
+            | Action::CompletePageUp
+            | Action::CompletePageDown
+            | Action::CompleteClose => Scope::Complete,
             Action::GridLeft
             | Action::GridRight
             | Action::GridUp
@@ -280,6 +308,7 @@ pub struct Keybinds {
     sidebar: Vec<(KeyCombo, Action)>,
     results: Vec<(KeyCombo, Action)>,
     resize: Vec<(KeyCombo, Action)>,
+    complete: Vec<(KeyCombo, Action)>,
 }
 
 impl Default for Keybinds {
@@ -305,6 +334,7 @@ impl Default for Keybinds {
                 (key("f5"), Action::RunDirect),
                 (key("alt+enter"), Action::RunDirect),
                 (key("ctrl+c"), Action::CancelDirect),
+                (key("ctrl+space"), Action::CompleteOpen),
             ],
             sidebar: vec![
                 (key("j"), Action::MoveDown),
@@ -367,6 +397,17 @@ impl Default for Keybinds {
                 (key("esc"), Action::ResizeDone),
                 (key("enter"), Action::ResizeDone),
             ],
+            complete: vec![
+                (key("enter"), Action::CompleteInsert),
+                (key("tab"), Action::CompleteReplace),
+                (key("down"), Action::CompleteDown),
+                (key("ctrl+n"), Action::CompleteDown),
+                (key("up"), Action::CompleteUp),
+                (key("ctrl+p"), Action::CompleteUp),
+                (key("pagedown"), Action::CompletePageDown),
+                (key("pageup"), Action::CompletePageUp),
+                (key("esc"), Action::CompleteClose),
+            ],
         }
     }
 }
@@ -397,6 +438,11 @@ impl Keybinds {
         self.resize.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
 
+    /// The action the completion popup binds to `key`.
+    pub fn lookup_complete(&self, key: &KeyCombo) -> Option<Action> {
+        self.complete.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+    }
+
     fn table(&self, scope: Scope) -> &[(KeyCombo, Action)] {
         match scope {
             Scope::Results => &self.results,
@@ -404,6 +450,7 @@ impl Keybinds {
             Scope::Direct => &self.direct,
             Scope::Sidebar => &self.sidebar,
             Scope::Resize => &self.resize,
+            Scope::Complete => &self.complete,
         }
     }
 
@@ -424,6 +471,7 @@ impl Keybinds {
             Scope::Sidebar => &mut self.sidebar,
             Scope::Results => &mut self.results,
             Scope::Resize => &mut self.resize,
+            Scope::Complete => &mut self.complete,
         };
         table.retain(|(k, a)| *a != action && *k != combo);
         table.push((combo, action));
@@ -454,6 +502,24 @@ impl Keybinds {
             one(&[Action::ResizeLeft, Action::ResizeRight], "sidebar"),
             one(&[Action::ResizeDown, Action::ResizeUp], "split"),
             one(&[Action::ResizeDone], "done"),
+        ];
+        out.retain(|h| !h.keys.is_empty());
+        out
+    }
+
+    /// The hints for the mode bar while the completion popup is open, from
+    /// the live bindings.
+    pub fn complete_hints(&self) -> Vec<Hint> {
+        let one = |actions: &[Action], desc: &'static str| Hint {
+            keys: actions.iter().filter_map(|a| self.key_for(*a).map(|k| (k, *a))).collect(),
+            desc,
+        };
+        let mut out = vec![
+            one(&[Action::CompleteInsert], "insert"),
+            one(&[Action::CompleteReplace], "replace"),
+            one(&[Action::CompleteDown, Action::CompleteUp], "move"),
+            one(&[Action::CompletePageDown, Action::CompletePageUp], "page"),
+            one(&[Action::CompleteClose], "close"),
         ];
         out.retain(|h| !h.keys.is_empty());
         out

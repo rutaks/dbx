@@ -4,6 +4,7 @@
 mod editor;
 mod form;
 mod panel;
+mod popup;
 mod results;
 mod viewer;
 
@@ -44,6 +45,8 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     draw_editor(app, &p, buf, &hits);
     draw_results(app, &p, buf, &hits);
     app.ui.mode_hints = draw_mode_bar(app, &p, buf, &hits);
+    // The completion popup is drawn over the panes, under any overlay.
+    popup::draw(app, &p, buf, &hits);
     // (The viewer says what a copy did inside its own box.)
     if !matches!(app.ui.overlay, Some(Overlay::CellViewer(_))) {
         draw_notice(app, &p, buf);
@@ -525,6 +528,10 @@ fn draw_results(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
 /// The hints for the mode bar in normal mode: only keys that work now.
 fn normal_hints(app: &App) -> Vec<Hint> {
     let keys = &app.ui.keys;
+    // While the completion popup is open the bar shows its keys.
+    if app.completion_visible() {
+        return keys.complete_hints();
+    }
     let one = |action: Action, desc: &'static str| keys.key_for(action).map(|k| Hint { keys: vec![(k, action)], desc });
     let mut hints = Vec::new();
     let prefix = Hint { keys: vec![(keys.prefix.to_string(), Action::OpenPrefix)], desc: "prefix" };
@@ -547,6 +554,7 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     }
     if app.ui.focus == PaneId::Editor {
         hints.extend(one(Action::RunDirect, "run"));
+        hints.extend(one(Action::CompleteOpen, "complete"));
         hints.push(prefix);
         return hints;
     }

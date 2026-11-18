@@ -12,8 +12,8 @@ mod common;
 
 use common::*;
 use dbx_tui::core::{
-    Cell, CellKind, ConnectionDraft, ConnectionId, Core, CoreErrorKind, Cursor, DatabasePath, DbxCore, RunId, RunRequest,
-    SchemaPath, SessionId, TabId, TableKind, TablePath, DEFAULT_ROW_CAP,
+    Candidate, CandidateKind, Cell, CellKind, CompletionRequest, ConnectionDraft, ConnectionId, Core, CoreErrorKind, Cursor, DatabasePath, DbxCore, RunId, RunRequest,
+    SchemaPath, SearchKind, SessionId, TabId, TableKind, TablePath, DEFAULT_ROW_CAP,
 };
 
 const FIXTURE_PASSWORD: &str = "dbxtui";
@@ -1034,4 +1034,113 @@ async fn observe_loading_a_million_rows() {
         );
         drop(set);
     }
+}
+
+// ---- slice 11: the completion popup's calls ----------------------------------
+
+fn search(id: &ConnectionId, db: &str, schema: Option<&str>, kind: SearchKind, prefix: &str) -> CompletionRequest {
+    CompletionRequest { at: database(id, db), schema: schema.map(String::from), kind, prefix: prefix.into(), limit: 100 }
+}
+
+fn kinds(found: &[Candidate]) -> Vec<(&str, CandidateKind)> {
+    let mut out: Vec<(&str, CandidateKind)> = found.iter().map(|c| (c.name.as_str(), c.kind)).collect();
+    out.sort_by_key(|(n, _)| *n);
+    out
+}
+
+#[tokio::test]
+async fn a_prefix_search_for_fil_in_public_returns_the_film_tables_and_the_film_view_with_their_kinds() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let found = core.complete(&search(&id, "pagila", Some("public"), SearchKind::Relation, "fil")).await.expect("search");
+    assert_eq!(
+        kinds(&found.candidates),
+        [
+            ("film", CandidateKind::Table),
+            ("film_actor", CandidateKind::Table),
+            ("film_category", CandidateKind::Table),
+            ("film_list", CandidateKind::View),
+        ],
+        "{found:?}"
+    );
+    assert!(!found.incomplete);
+    assert!(found.candidates.iter().all(|c| c.schema.as_deref() == Some("public")));
+    // Without regard to case.
+    let upper = core.complete(&search(&id, "pagila", Some("public"), SearchKind::Relation, "FIL")).await.expect("search");
+    assert_eq!(kinds(&upper.candidates), kinds(&found.candidates));
+    eprintln!("OBSERVED fil in public: {found:?}");
+}
+
+#[tokio::test]
+async fn a_search_keeps_the_name_as_stored_and_cuts_at_its_limit_saying_so() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let found = core.complete(&search(&id, "edge", Some("public"), SearchKind::Relation, "Mix")).await.expect("search");
+    assert_eq!(kinds(&found.candidates), [("Mixed Case", CandidateKind::Table)], "{found:?}");
+    let cut = core.complete(&CompletionRequest { limit: 3, ..search(&id, "pagila", Some("public"), SearchKind::Relation, "") }).await.expect("search");
+    assert_eq!(cut.candidates.len(), 3);
+    assert!(cut.incomplete, "stopped at the limit: there is more");
+}
+
+#[tokio::test]
+async fn schemas_and_functions_are_searched_the_same_way() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let schemas = core.complete(&search(&id, "pagila", None, SearchKind::Schema, "")).await.expect("schemas");
+    assert!(schemas.candidates.iter().any(|c| c.name == "public" && c.kind == CandidateKind::Schema), "{schemas:?}");
+    assert!(schemas.candidates.iter().all(|c| !c.name.starts_with("pg_") && c.name != "information_schema"), "no system schemas: {schemas:?}");
+    let functions = core.complete(&search(&id, "pagila", Some("pg_catalog"), SearchKind::Function, "low")).await.expect("functions");
+    // One candidate per overload (`lower(text)` returns text, `lower(anyrange)` anyelement), each with its result type.
+    let lowers: Vec<_> = functions.candidates.iter().filter(|c| c.name == "lower").collect();
+    assert!(lowers.iter().any(|c| c.kind == CandidateKind::Function && c.detail.as_deref() == Some("text")), "{functions:?}");
+    assert!(lowers.len() >= 2, "overloads are listed separately: {lowers:?}");
+    eprintln!("OBSERVED functions low in pg_catalog: {functions:?}");
+}
+
+#[tokio::test]
+async fn dbxs_function_search_does_not_return_aggregates_which_is_why_the_client_lists_the_common_ones_itself() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    // `count` is an aggregate (`pg_proc.prokind = 'a'`); the search asks for functions and procedures only.
+    let found = core.complete(&search(&id, "pagila", Some("pg_catalog"), SearchKind::Function, "coun")).await.expect("functions");
+    assert!(found.candidates.iter().all(|c| c.name != "count"), "if dbx now returns aggregates the client's own list can go: {found:?}");
+}
+
+#[tokio::test]
+async fn the_current_schema_is_what_unqualified_names_resolve_in_and_a_bad_database_says_why() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    assert_eq!(core.current_schema(&database(&id, "pagila")).await.expect("current_schema").as_deref(), Some("public"));
+    let missing = core.current_schema(&database(&id, "no_such_database")).await.expect_err("no such database");
+    assert!(missing.message.contains("no_such_database"), "{}", missing.message);
+    assert!(!missing.message.contains(PASSWORD));
+    let unknown = core.complete(&search(&ConnectionId("nope".into()), "pagila", None, SearchKind::Schema, "")).await.expect_err("no such connection");
+    assert!(!unknown.message.is_empty());
+}
+
+#[tokio::test]
+async fn abandoning_a_search_stops_its_work_and_the_next_call_works() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    let id = saved_fixture(&core).await;
+    // A search dropped before it answers: the future is gone, as when the app abandons a request.
+    let slow = {
+        let (core, id) = (core.clone(), id.clone());
+        tokio::spawn(async move { core.complete(&search(&id, "pagila", Some("public"), SearchKind::Relation, "")).await })
+    };
+    slow.abort();
+    let _ = slow.await;
+    let found = core.complete(&search(&id, "pagila", Some("public"), SearchKind::Relation, "fil")).await.expect("the next search");
+    assert_eq!(found.candidates.len(), 4);
 }

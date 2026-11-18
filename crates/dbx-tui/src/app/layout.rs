@@ -44,6 +44,9 @@ pub struct HitMap {
     /// Dragging it resizes the editor. Empty while a pane is zoomed.
     pub divider: Rect,
     pub mode_bar: Rect,
+    /// The completion popup as drawn (empty when it is not). Filled while
+    /// drawing; a press on it accepts the item under it.
+    pub popup: Rect,
 }
 
 /// What the user set by dragging a divider or from the resize mode. `None`
