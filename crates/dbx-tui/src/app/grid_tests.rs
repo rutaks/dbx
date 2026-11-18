@@ -571,14 +571,190 @@ async fn a_ten_megabyte_value_opens_and_scrolls_by_wrapping_only_what_is_on_scre
     h.press("pagedown pagedown j");
     screen(&mut h);
     let scroll = t.elapsed();
-    let t = std::time::Instant::now();
+    let worked = viewer(&h).work;
     h.press("G");
-    screen(&mut h);
-    let end = t.elapsed();
-    eprintln!("OBSERVED 10 MB viewer: open {open:?}, scroll {scroll:?}, G {end:?}, lines {:?}", viewer(&h).total());
+    let text = screen(&mut h).join("\n");
+    let at_end = viewer(&h).work - worked;
+    eprintln!("OBSERVED 10 MB viewer: open {open:?}, scroll {scroll:?}, G visited {at_end} graphemes");
     assert!(open < std::time::Duration::from_millis(250), "{open:?}");
     assert!(scroll < std::time::Duration::from_millis(100), "{scroll:?}");
-    assert!(viewer(&h).total().unwrap() > 10_000, "G found the end: {:?}", viewer(&h).total());
+    // G wraps the tail only (counted, not timed), and says `end` for the line
+    // numbers it does not know.
+    assert!(viewer(&h).anchored() && viewer(&h).total().is_none());
+    assert!(at_end < 20_000, "G visited {at_end} graphemes of 5,242,880");
+    assert!(text.contains("end"), "{text}");
+    assert!(!text.contains("lines 1"), "no line numbers: {text}");
+}
+
+// ---- the viewer: the tail, the mouse, repaints ------------------------------------
+
+fn viewer_of(text: &str, kind: CellKind) -> super::viewer::CellViewer {
+    let set = ResultSet { columns: vec![col("t", "text", kind)], rows: vec![vec![Cell::Value(text.to_string())]], ..rows_of(&[]) };
+    let mut v = super::viewer::CellViewer::open(&set, 0, 0).unwrap();
+    v.set_area(78, 30);
+    v
+}
+
+/// Every wrapped line of `text` at `width`, from the top: what a full wrap gives.
+fn full_wrap(text: &str, width: usize) -> Vec<String> {
+    let (mut out, mut at) = (Vec::new(), 0);
+    while at < text.len() {
+        let (end, next) = super::viewer::next_line(text, at, width);
+        out.push(text[at..end].to_string());
+        at = next;
+    }
+    out
+}
+
+#[test]
+fn g_on_a_single_huge_line_wraps_only_about_a_page_of_bytes_before_the_end() {
+    let mut text = "abcdefghij".repeat(1_000_000); // one 10 MB line
+    text.push_str("THE-END");
+    let mut v = viewer_of(&text, CellKind::Text);
+    v.lines(0, 30);
+    let before = v.work;
+    assert!(before < 30_000, "showing the top visited {before} graphemes");
+    v.scroll_to_end();
+    let visited = v.work - before;
+    assert!(visited < 3 * 31 * 78, "jumping to the end visited {visited} graphemes of 10,000,007");
+    assert!(v.anchored() && v.total().is_none(), "the line numbers are not known");
+    assert_eq!(v.position(30), "end");
+    let last = v.lines(v.scroll, 30).pop().unwrap();
+    assert!(last.body.ends_with("THE-END"), "the last line is the end of the value: {:?}", last.body);
+    // Drawing the page after the jump costs a page, not the value.
+    let drawn = v.work;
+    v.lines(v.scroll, 30);
+    assert!(v.work - drawn < 4 * 30 * 78);
+    // Another G, and a key that moves nothing, visit nothing more.
+    let again = v.work;
+    v.scroll_to_end();
+    assert!(v.work == again, "already at the end");
+    // A different width at the end stays at the end without wrapping the value.
+    v.set_area(60, 20);
+    let lines = v.lines(v.scroll, 20);
+    assert!(lines.last().unwrap().body.ends_with("THE-END"));
+    assert!(v.work - again < 20_000, "{}", v.work - again);
+    // `g` is the top again, with its numbers.
+    v.scroll_to_top();
+    assert!(!v.anchored() && v.scroll == 0);
+    assert_eq!(v.position(30), "lines 1-30", "the numbers are back");
+}
+
+#[test]
+fn g_on_a_value_with_line_breaks_shows_the_same_last_page_a_full_wrap_does() {
+    let text: String = (0..200_000).map(|i| format!("row {i} of the value\n")).collect();
+    let reference = full_wrap(&text, 78);
+    let mut v = viewer_of(&text, CellKind::Text);
+    v.scroll_to_end();
+    assert!(v.work < 20_000, "{}", v.work);
+    assert!(v.anchored());
+    let shown: Vec<String> = v.lines(v.scroll, 30).into_iter().map(|l| l.body).collect();
+    assert_eq!(shown, reference[reference.len() - 30..], "line-aligned: the page is the one a full wrap ends with");
+    // Up a page, then up past the top of the wrapped tail: the window grows and what is shown stays right.
+    let page_up = |v: &mut super::viewer::CellViewer, n: usize| {
+        for _ in 0..n {
+            v.scroll_by(-30);
+        }
+    };
+    page_up(&mut v, 3);
+    let shown: Vec<String> = v.lines(v.scroll, 30).into_iter().map(|l| l.body).collect();
+    assert_eq!(shown, reference[reference.len() - 120..reference.len() - 90]);
+    let worked = v.work;
+    page_up(&mut v, 100); // 3,000 lines up: past the tail that was wrapped first
+    assert!(v.work - worked < 500_000, "{} graphemes for 3,000 lines of 200,000", v.work - worked);
+    let shown: Vec<String> = v.lines(v.scroll, 30).into_iter().map(|l| l.body).collect();
+    assert_eq!(shown, reference[reference.len() - 3_120..reference.len() - 3_090], "{}", v.position(30));
+    // And down again to the end.
+    for _ in 0..200 {
+        v.scroll_by(30);
+    }
+    assert_eq!(v.lines(v.scroll, 30).into_iter().map(|l| l.body).collect::<Vec<_>>(), reference[reference.len() - 30..]);
+    assert_eq!(v.position(30), "end");
+    // `g` and the numbers are back.
+    v.scroll_to_top();
+    assert_eq!(v.lines(0, 1)[0].body, "row 0 of the value");
+    assert_eq!(v.position(30), "lines 1-30");
+}
+
+#[test]
+fn g_on_a_small_value_is_exact_and_keeps_its_line_numbers() {
+    let text: String = (0..100).map(|i| format!("l{i}\n")).collect();
+    let mut v = viewer_of(&text, CellKind::Text);
+    v.scroll_to_end();
+    assert!(!v.anchored(), "a value that fits the budget is wrapped whole");
+    assert_eq!(v.total(), Some(100));
+    assert_eq!(v.position(30), "lines 71-100 of 100");
+}
+
+#[tokio::test]
+async fn the_viewers_scroll_hints_are_clickable_and_the_wheel_scrolls_it() {
+    let long: String = (0..400).map(|i| format!("line {i}\n")).collect();
+    let set = ResultSet { columns: vec![col("t", "text", CellKind::Text)], rows: vec![vec![Cell::Value(long)]], ..rows_of(&[]) };
+    let mut h = focused(set).await;
+    h.press("enter");
+    let text = screen(&mut h).join("\n");
+    assert!(text.contains("j/k scroll") && text.contains("pagedown/pageup page") && text.contains("g/G ends"), "{text}");
+    let page = viewer(&h).page;
+    let click_on = |h: &mut Harness, t: &str, dx: u16| {
+        let (x, y) = where_is(h, t).unwrap_or_else(|| panic!("{t:?}"));
+        click(&mut h.app, Rect::new(x + dx, y, 1, 1));
+    };
+    click_on(&mut h, "j/k scroll", 0);
+    assert_eq!(viewer(&h).scroll, 1, "the `j` key");
+    screen(&mut h);
+    click_on(&mut h, "j/k scroll", 2);
+    assert_eq!(viewer(&h).scroll, 0, "the `k` key");
+    screen(&mut h);
+    click_on(&mut h, "j/k scroll", 4);
+    assert_eq!(viewer(&h).scroll, 1, "the words do what the first key does");
+    screen(&mut h);
+    click_on(&mut h, "pagedown/pageup page", 0);
+    assert_eq!(viewer(&h).scroll, 1 + page, "a page down");
+    screen(&mut h);
+    click_on(&mut h, "pagedown/pageup page", 9);
+    assert_eq!(viewer(&h).scroll, 1, "a page up");
+    screen(&mut h);
+    click_on(&mut h, "g/G ends", 2);
+    assert!(viewer(&h).scroll > 300, "G: the end ({} of 401 lines)", viewer(&h).scroll);
+    screen(&mut h);
+    click_on(&mut h, "g/G ends", 0);
+    assert_eq!(viewer(&h).scroll, 0, "g: the top");
+    screen(&mut h);
+    // The wheel scrolls three lines a notch, wherever the pointer is over the screen.
+    mouse(&mut h, MouseEventKind::ScrollDown, 40, 12, KeyModifiers::NONE);
+    mouse(&mut h, MouseEventKind::ScrollDown, 3, 3, KeyModifiers::NONE);
+    assert_eq!(viewer(&h).scroll, 6);
+    mouse(&mut h, MouseEventKind::ScrollUp, 40, 12, KeyModifiers::NONE);
+    assert_eq!(viewer(&h).scroll, 3);
+    assert!(h.app.ui.overlay.is_some());
+}
+
+#[tokio::test]
+async fn keys_and_wheel_turns_that_change_nothing_in_the_viewer_repaint_nothing() {
+    let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    let set = ResultSet { columns: vec![col("t", "text", CellKind::Text)], rows: vec![vec![Cell::Value(long)]], ..rows_of(&[]) };
+    let mut h = focused(set).await;
+    h.press("enter");
+    screen(&mut h);
+    // At the top: nothing moves.
+    for keys in ["k", "g", "pageup", "ctrl+u", "x", "h", "tab", "r"] {
+        assert!(!h.press(keys), "{keys:?} at the top repainted");
+    }
+    let up = mouse(&mut h, MouseEventKind::ScrollUp, 40, 12, KeyModifiers::NONE);
+    assert!(up.is_empty());
+    assert!(!h.app.update(Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, column: 40, row: 12, modifiers: KeyModifiers::NONE }), base()).repaint);
+    // One that moves does.
+    assert!(h.press("j"));
+    screen(&mut h);
+    assert!(h.press("G"));
+    screen(&mut h);
+    // At the end: nothing moves either, and a second G finds nothing new.
+    for keys in ["j", "G", "pagedown", "ctrl+d"] {
+        assert!(!h.press(keys), "{keys:?} at the end repainted");
+    }
+    assert!(!h.app.update(Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column: 40, row: 12, modifiers: KeyModifiers::NONE }), base()).repaint);
+    assert!(h.press("g"));
+    assert!(h.app.ui.overlay.is_some(), "none of that closed it");
 }
 
 #[tokio::test]

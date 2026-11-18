@@ -48,6 +48,7 @@ pub(super) fn draw(v: &mut CellViewer, keys: &Keybinds, notice: Option<&Notice>,
     v.scroll_by(0);
 
     let mut shown = 0;
+    let mut buttons: Vec<OverlayButton> = Vec::new();
     match &v.value {
         None if v.missing => {
             p.put(buf, text.x, text.y, &format!("{MISSING_MARK}  no cell: this row is shorter than the header"), p.fg(Role::Overlay0).bg(bg));
@@ -92,28 +93,35 @@ pub(super) fn draw(v: &mut CellViewer, keys: &Keybinds, notice: Option<&Notice>,
         }
         None if v.value.as_deref().is_some_and(|s| !s.is_empty()) => {
             let key = |a| keys.key_for(a).unwrap_or_default();
+            // Each key, and the words after them, scroll when clicked: the
+            // words do what the first key does, as in the mode bar.
             let hints = [
-                (format!("{}/{}", key(Action::GridDown), key(Action::GridUp)), "scroll"),
-                (format!("{}/{}", key(Action::GridPageDown), key(Action::GridPageUp)), "page"),
-                (format!("{}/{}", key(Action::GridFirstRow), key(Action::GridLastRow)), "ends"),
+                ((Action::GridDown, OverlayAction::ViewerLineDown), (Action::GridUp, OverlayAction::ViewerLineUp), "scroll"),
+                ((Action::GridPageDown, OverlayAction::ViewerPageDown), (Action::GridPageUp, OverlayAction::ViewerPageUp), "page"),
+                ((Action::GridFirstRow, OverlayAction::ViewerTop), (Action::GridLastRow, OverlayAction::ViewerBottom), "ends"),
             ];
             let mut x = inner.x;
-            for (k, desc) in hints {
-                x = p.put(buf, x, note_y, &k, p.bold(Role::Accent).bg(bg));
-                x = p.put(buf, x + 1, note_y, desc, p.fg(Role::Overlay0).bg(bg)) + 2;
+            for ((first, first_do), (second, second_do), desc) in hints {
+                let start = x;
+                let from = x;
+                x = p.put(buf, x, note_y, &key(first), p.bold(Role::Accent).bg(bg));
+                buttons.push(OverlayButton { rect: Rect::new(from, note_y, x - from, 1).intersection(inner), action: first_do });
+                x = p.put(buf, x, note_y, "/", p.fg(Role::Overlay0).bg(bg));
+                let from = x;
+                x = p.put(buf, x, note_y, &key(second), p.bold(Role::Accent).bg(bg));
+                buttons.push(OverlayButton { rect: Rect::new(from, note_y, x - from, 1).intersection(inner), action: second_do });
+                x = p.put(buf, x + 1, note_y, desc, p.fg(Role::Overlay0).bg(bg));
+                buttons.push(OverlayButton { rect: Rect::new(start, note_y, x - start, 1).intersection(inner), action: first_do });
+                x += 2;
             }
         }
         None => {}
     }
 
-    // Where in the value, on the left of the buttons.
+    // Where in the value, on the left of the buttons: line numbers, or `end`
+    // while the tail is anchored and the numbers are not known.
     if shown > 0 {
-        let first = v.scroll + 1;
-        let place = match v.total() {
-            Some(total) => format!("lines {first}-{} of {total}", v.scroll + shown),
-            None => format!("lines {first}-{}", v.scroll + shown),
-        };
-        p.put(buf, inner.x, button_y, &place, p.fg(Role::Overlay0).bg(bg));
+        p.put(buf, inner.x, button_y, &v.position(shown), p.fg(Role::Overlay0).bg(bg));
     }
 
     let mut specs: Vec<(String, &str, OverlayAction)> = Vec::new();
@@ -128,7 +136,6 @@ pub(super) fn draw(v: &mut CellViewer, keys: &Keybinds, notice: Option<&Notice>,
     specs.push(("esc".to_string(), "close", OverlayAction::Dismiss));
     let total: usize = specs.iter().map(|(k, l, _)| k.chars().count() + 1 + l.chars().count()).sum::<usize>() + 3 * (specs.len() - 1);
     let mut x = inner.right().saturating_sub(total as u16).max(inner.x);
-    let mut buttons = Vec::new();
     for (k, label, action) in specs {
         let start = x;
         x = p.put(buf, x, button_y, &k, p.bold(Role::Accent).bg(bg));

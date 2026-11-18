@@ -21,7 +21,7 @@ use super::keys::{Action, KeyCombo};
 use super::overlay::{ConfirmRerun, Overlay, OverlayAction};
 use super::query::{LoadMore, Outcome, RunState};
 use super::requests::Target;
-use super::viewer::CellViewer;
+use super::viewer::{CellViewer, Scroll};
 use super::{App, Command, CoreCall, Effects};
 use crate::core::{row_ceiling, Cell, Cursor, Rerun, ResultSet, RunRequest};
 
@@ -65,6 +65,8 @@ pub struct GridUi {
     pub cols_visible: usize,
     /// Where the data rows were drawn (below the header, right of the gutter).
     pub data: Rect,
+    /// The scrollbar's column as drawn, when the rows overflow.
+    pub bar: Rect,
     /// The columns drawn in the last frame.
     pub spans: Vec<Span>,
     pub widths: WidthCache,
@@ -307,26 +309,55 @@ impl App {
     /// A left click on the grid: the cursor goes to the cell under it. The
     /// row-number gutter picks a row, a gap between columns the column before
     /// it, and the header and the empty rows below the last one nothing.
-    pub(super) fn click_grid(&mut self, x: u16, y: u16, fx: &mut Effects) {
-        let Some(set) = shown(&self.model.tabs[0].outcome) else { return };
+    /// Returns the cell the click landed on, when it landed on one (the gutter
+    /// is not a cell), for double-clicks.
+    pub(super) fn click_grid(&mut self, x: u16, y: u16, fx: &mut Effects) -> Option<(usize, usize)> {
+        let set = shown(&self.model.tabs[0].outcome)?;
         let g = &mut self.ui.grid;
         if y < g.data.y || y >= g.data.bottom() {
-            return;
+            return None;
         }
         let row = g.top + (y - g.data.y) as usize;
         if row >= set.rows.len() {
-            return;
+            return None;
         }
         let before = (g.row, g.col);
         g.row = row;
+        let mut hit = None;
         if x >= g.data.x {
             if let Some(span) = g.spans.iter().rev().find(|s| s.x <= x) {
                 g.col = span.col;
+                hit = Some((row, span.col));
             }
         }
         if (g.row, g.col) != before {
             fx.repaint = true;
         }
+        hit
+    }
+
+    /// A press on the results' scrollbar column at screen row `y`: the list
+    /// jumps there (the thumb is centred on the press), or, on the thumb, it
+    /// is grabbed where it was pressed. Returns the drag it begins.
+    pub(super) fn press_grid_bar(&mut self, y: u16, fx: &mut Effects) -> Option<super::pointer::Drag> {
+        let set = shown(&self.model.tabs[0].outcome)?;
+        let (bar, top) = (self.ui.grid.bar, self.ui.grid.top);
+        let thumb = super::view::scrollbar_thumb(set.rows.len(), bar.height as usize, top)?;
+        let (grab, _) = super::pointer::grab(thumb, y.saturating_sub(bar.y) as usize);
+        self.drag_grid_bar(y, grab as u16, fx);
+        Some(super::pointer::Drag::GridBar { grab: grab as u16 })
+    }
+
+    /// The pointer is at screen row `y` with the thumb grabbed `grab` rows
+    /// below its top: scroll so the thumb is there.
+    pub(super) fn drag_grid_bar(&mut self, y: u16, grab: u16, fx: &mut Effects) {
+        let Some(set) = shown(&self.model.tabs[0].outcome) else { return };
+        let (bar, top) = (self.ui.grid.bar, self.ui.grid.top);
+        let (total, room) = (set.rows.len(), bar.height as usize);
+        let Some((_, len)) = super::view::scrollbar_thumb(total, room, top) else { return };
+        let thumb_top = (y.saturating_sub(bar.y) as usize).saturating_sub(grab as usize);
+        let scroll = super::pointer::scroll_for_thumb(total, room, len, thumb_top);
+        self.scroll_grid(scroll as isize - top as isize, 0, fx);
     }
 
     /// A key pressed while the cell viewer is open.
@@ -335,27 +366,38 @@ impl App {
             return self.overlay_action(OverlayAction::Dismiss, fx);
         }
         let Some(action) = self.ui.keys.lookup_results(&combo) else { return };
-        let Some(Overlay::CellViewer(v)) = &mut self.ui.overlay else { return };
-        let page = v.page as isize;
         match action {
-            Action::GridDown => v.scroll_by(1),
-            Action::GridUp => v.scroll_by(-1),
-            Action::GridPageDown => v.scroll_by(page),
-            Action::GridPageUp => v.scroll_by(-page),
-            Action::GridFirstRow => v.scroll = 0,
-            Action::GridLastRow => v.scroll_to_end(),
-            Action::ToggleRaw => v.toggle_raw(),
-            Action::CopyCell => return self.copy_viewer(fx),
-            _ => return,
+            Action::GridDown => self.scroll_viewer_by(Scroll::Line(1), fx),
+            Action::GridUp => self.scroll_viewer_by(Scroll::Line(-1), fx),
+            Action::GridPageDown => self.scroll_viewer_by(Scroll::Page(1), fx),
+            Action::GridPageUp => self.scroll_viewer_by(Scroll::Page(-1), fx),
+            Action::GridFirstRow => self.scroll_viewer_by(Scroll::Top, fx),
+            Action::GridLastRow => self.scroll_viewer_by(Scroll::Bottom, fx),
+            Action::ToggleRaw => self.toggle_viewer_raw(fx),
+            Action::CopyCell => self.copy_viewer(fx),
+            _ => {}
         }
-        fx.repaint = true;
     }
 
     /// The wheel over the viewer scrolls its text.
     pub(super) fn scroll_viewer(&mut self, lines: isize, fx: &mut Effects) {
+        self.scroll_viewer_by(Scroll::Line(lines), fx);
+    }
+
+    /// Moves the viewer's window, repainting only if it moved.
+    pub(super) fn scroll_viewer_by(&mut self, how: Scroll, fx: &mut Effects) {
         if let Some(Overlay::CellViewer(v)) = &mut self.ui.overlay {
-            v.scroll_by(lines);
-            fx.repaint = true;
+            fx.repaint |= v.scroll(how);
+        }
+    }
+
+    /// Pretty-printed or stored text: repaints only where there is a pretty form.
+    pub(super) fn toggle_viewer_raw(&mut self, fx: &mut Effects) {
+        if let Some(Overlay::CellViewer(v)) = &mut self.ui.overlay {
+            if v.can_toggle() {
+                v.toggle_raw();
+                fx.repaint = true;
+            }
         }
     }
 

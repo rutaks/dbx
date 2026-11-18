@@ -299,6 +299,7 @@ impl App {
     /// Quit: end the tab's session first.
     pub(super) fn quit(&mut self, fx: &mut Effects) {
         self.end_tab_session(fx);
+        self.save_layout(fx);
         fx.commands.push(Command::Quit);
     }
 

@@ -214,6 +214,12 @@ impl DbxCore {
         DbxCore { policy: SecretKeyPolicy::ManagedDataDir, ..Self::new(options) }
     }
 
+    /// The directory the store lives in, when the environment named one the
+    /// client can work with. Preferences are kept beside it.
+    pub fn store_dir(&self) -> Option<&Path> {
+        self.options.as_ref().ok().map(|o| o.data_dir.as_path())
+    }
+
     fn data_dir(&self) -> &Path {
         self.options.as_ref().map(|o| o.data_dir.as_path()).unwrap_or(Path::new(""))
     }

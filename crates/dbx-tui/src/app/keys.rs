@@ -125,6 +125,8 @@ pub enum Scope {
     /// Read by the results pane when it has focus, and by the cell viewer
     /// (neither takes text, so neither needs the prefix).
     Results,
+    /// Read by the resize mode, which takes every key while it is on.
+    Resize,
 }
 
 /// A named thing the client can do, to which keys are bound.
@@ -184,6 +186,14 @@ pub enum Action {
     LoadMore,
     /// In the viewer: JSON as pretty-printed, or as stored.
     ToggleRaw,
+    /// Enter the resize mode (after the prefix).
+    ResizeMode,
+    // The resize mode's own keys: the dividers move one step.
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    ResizeDone,
 }
 
 impl Action {
@@ -219,6 +229,10 @@ impl Action {
             Action::CopyRow => "copy row",
             Action::LoadMore => "more",
             Action::ToggleRaw => "raw",
+            Action::ResizeMode => "resize",
+            Action::ResizeLeft | Action::ResizeRight => "sidebar",
+            Action::ResizeUp | Action::ResizeDown => "split",
+            Action::ResizeDone => "done",
         }
     }
 
@@ -233,7 +247,9 @@ impl Action {
             | Action::Quit
             | Action::Run
             | Action::Cancel
+            | Action::ResizeMode
             | Action::OpenPrefix => Scope::Prefix,
+            Action::ResizeLeft | Action::ResizeRight | Action::ResizeUp | Action::ResizeDown | Action::ResizeDone => Scope::Resize,
             Action::RunDirect | Action::CancelDirect => Scope::Direct,
             Action::GridLeft
             | Action::GridRight
@@ -263,6 +279,7 @@ pub struct Keybinds {
     direct: Vec<(KeyCombo, Action)>,
     sidebar: Vec<(KeyCombo, Action)>,
     results: Vec<(KeyCombo, Action)>,
+    resize: Vec<(KeyCombo, Action)>,
 }
 
 impl Default for Keybinds {
@@ -282,6 +299,7 @@ impl Default for Keybinds {
                 (plain('c'), Action::Cancel),
                 (plain('z'), Action::Zoom),
                 (plain('q'), Action::Quit),
+                (plain('R'), Action::ResizeMode),
             ],
             direct: vec![
                 (key("f5"), Action::RunDirect),
@@ -337,6 +355,18 @@ impl Default for Keybinds {
                 (key("m"), Action::LoadMore),
                 (key("r"), Action::ToggleRaw),
             ],
+            resize: vec![
+                (key("h"), Action::ResizeLeft),
+                (key("left"), Action::ResizeLeft),
+                (key("l"), Action::ResizeRight),
+                (key("right"), Action::ResizeRight),
+                (key("k"), Action::ResizeUp),
+                (key("up"), Action::ResizeUp),
+                (key("j"), Action::ResizeDown),
+                (key("down"), Action::ResizeDown),
+                (key("esc"), Action::ResizeDone),
+                (key("enter"), Action::ResizeDone),
+            ],
         }
     }
 }
@@ -362,12 +392,18 @@ impl Keybinds {
         self.results.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
 
+    /// The action the resize mode binds to `key`.
+    pub fn lookup_resize(&self, key: &KeyCombo) -> Option<Action> {
+        self.resize.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+    }
+
     fn table(&self, scope: Scope) -> &[(KeyCombo, Action)] {
         match scope {
             Scope::Results => &self.results,
             Scope::Prefix => &self.bindings,
             Scope::Direct => &self.direct,
             Scope::Sidebar => &self.sidebar,
+            Scope::Resize => &self.resize,
         }
     }
 
@@ -387,6 +423,7 @@ impl Keybinds {
             Scope::Direct => &mut self.direct,
             Scope::Sidebar => &mut self.sidebar,
             Scope::Results => &mut self.results,
+            Scope::Resize => &mut self.resize,
         };
         table.retain(|(k, a)| *a != action && *k != combo);
         table.push((combo, action));
@@ -403,6 +440,22 @@ impl Keybinds {
                 None => out.push(Hint { keys: vec![(key.to_string(), *action)], desc: action.label() }),
             }
         }
+        out
+    }
+
+    /// The hints for the mode bar in the resize mode, from the live bindings:
+    /// the sidebar's keys, the split's, and the one that leaves.
+    pub fn resize_hints(&self) -> Vec<Hint> {
+        let one = |actions: &[Action], desc: &'static str| Hint {
+            keys: actions.iter().filter_map(|a| self.key_for(*a).map(|k| (k, *a))).collect(),
+            desc,
+        };
+        let mut out = vec![
+            one(&[Action::ResizeLeft, Action::ResizeRight], "sidebar"),
+            one(&[Action::ResizeDown, Action::ResizeUp], "split"),
+            one(&[Action::ResizeDone], "done"),
+        ];
+        out.retain(|h| !h.keys.is_empty());
         out
     }
 

@@ -31,7 +31,7 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 pub fn draw(app: &mut App, frame: &mut Frame) {
-    let hits = HitMap::compute(frame.area(), app.ui.focus, app.ui.zoomed);
+    let hits = HitMap::compute(frame.area(), app.ui.focus, app.ui.zoomed, &app.ui.layout);
     app.ui.hits = hits;
     // Rows are built for the width this frame gives the sidebar.
     app.ensure_rows();
@@ -283,6 +283,7 @@ fn draw_sidebar(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
             }
             if overflow {
                 let track = Rect::new(r.right() - 1, y, 1, room as u16);
+                app.ui.hits.sidebar_bar = track;
                 draw_scrollbar(&p, buf, track, total, scroll);
             }
         }
@@ -474,6 +475,8 @@ fn draw_editor(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     if area.is_empty() {
         return;
     }
+    // Where a click places the caret.
+    app.ui.hits.editor_text = area;
     let placeholder = editor_placeholder(app);
     let editor = &mut app.ui.editor;
     editor.set_placeholder(&placeholder);
@@ -655,6 +658,10 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
         // An overlay takes all input and shows its own keys.
         _ if app.ui.overlay.is_some() => Vec::new(),
         Mode::Normal => normal_hints(app),
+        Mode::Resize => {
+            x = p.put(buf, x + 1, r.y, " RESIZE ", label(Role::Peach));
+            app.ui.keys.resize_hints()
+        }
         Mode::Prefix { .. } => {
             x = p.put(buf, x + 1, r.y, " PREFIX ", label(Role::Yellow));
             let mut h = app.ui.keys.prefix_hints();

@@ -101,6 +101,13 @@ pub enum OverlayAction {
     /// cell's pretty-printed and stored text.
     ViewerCopy,
     ViewerToggleRaw,
+    /// The cell viewer's scroll hints: a line, a page, the ends.
+    ViewerLineDown,
+    ViewerLineUp,
+    ViewerPageDown,
+    ViewerPageUp,
+    ViewerTop,
+    ViewerBottom,
 }
 
 /// Where a form row was drawn, for clicks. Filled by `view`.

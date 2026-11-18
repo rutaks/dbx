@@ -154,7 +154,7 @@ cell costs a frame what a small one does. Keys, with the results pane focused
 | `y` / `Y` | copy the cell / the row |
 | `m` | load more (only on a truncated result) |
 
-Mouse: a click puts the cursor on a cell, the wheel scrolls rows (three per
+Mouse: a click puts the cursor on a cell, a double-click opens it in the viewer, the wheel scrolls rows (three per
 notch), shift+wheel or a horizontal wheel scrolls columns, a click on a hint
 does what its key does.
 
@@ -172,7 +172,15 @@ its title (and the value's length in characters and bytes): the whole value wrap
 (`j`/`k`), page and `g`/`G`; NULL, `empty string` and the text `NULL` look
 different (so does a cell the row lacks); every hard line break ends in a dimmed `↵` (LF), `←` (CR) or `←↵` (CRLF) and trailing spaces are a dimmed `·`, so values that differ look different; a JSON cell is pretty-printed (whitespace only: keys keep their
 order and numbers their digits) and `r` shows the stored text. Only the lines
-on screen are wrapped; `G` on a huge value wraps it all once. `y` copies the
+on screen are wrapped. `G` on a value over 64 KiB wraps only its tail, from
+about a page of bytes before the end (from the start of the line there when one
+begins within another page of bytes, else from a grapheme boundary, so the
+wrapping of a single huge line may differ from the full wrap's); the line
+numbers before that point are not known, so the position reads `end` (or
+`end -N`). Scrolling up past the top of the wrapped tail wraps twice as much,
+and `g` goes back to the top with its numbers. The scroll hints along the
+bottom are clickable, the wheel scrolls three lines a notch, and a key that
+moves nothing repaints nothing. `y` copies the
 stored value, never the pretty form. `esc` closes it.
 
 **Copy** sends `Command::CopyToClipboard`, which the shell writes as an OSC 52
@@ -204,6 +212,48 @@ of pure functions) decides between `Proven` (loads as is) and
 `ReadOnlyUnproven` (`select f()`, `select pg_notify(..)`: `m` opens a question
 naming the statement's first line, `enter` re-runs, `esc` cancels).
 
+## Mouse and resizing
+
+Mouse capture is on (the shell asks for SGR reports; hold shift to pass a drag
+to the terminal for its own selection, which is the terminal's doing). What is
+under the pointer is decided by the hit map `view` fills on every frame
+(`app/layout.rs`); a double-click is two presses of the same thing within
+350 ms of the `now` given to `update` (`app/pointer.rs`, no timers). An open
+overlay takes every mouse event: nothing behind it is reached, and its buttons
+(and the viewer's scroll hints) do what their keys do. No context menus.
+
+| Where | Mouse |
+|---|---|
+| any pane | a press focuses it |
+| sidebar | click selects a row, a click on the arrow or a double-click toggles it, the wheel scrolls, a press in the scrollbar column jumps there and dragging the thumb scrolls |
+| editor | click places the caret (mapped through the widget's own scroll offset and `screen_to_data`, so wide characters, tabs and scrolling count), drag selects (past the edge the view follows), double-click selects the word, the wheel scrolls (shift or a horizontal wheel: sideways) |
+| results | click moves the cell cursor, double-click opens the cell viewer, the wheel scrolls rows, shift+wheel or a horizontal wheel columns, the scrollbar like the sidebar's |
+| mode bar | a click on a hint (each key, and the words for the first key) |
+| dividers | drag the `│` (the sidebar) or the results' title row (the editor/results split); a double-click resets it |
+
+The wheel scrolls what is under the pointer, whichever pane has focus.
+
+**Resizing.** The sidebar (with its separator) keeps at least 14 columns and
+leaves the editor and results at least 24 (on a narrow terminal, up to half the
+width); the editor keeps at least 3 rows and the results 4. Without a saved
+size the sidebar is about 30% of the width (26 to 34) and the editor three
+fifths of the height. The keyboard does the same: prefix then `R` enters the
+resize mode (`RESIZE` in the mode bar, with `h/l sidebar`, `j/k split` and
+`esc done` as clickable hints); `h`/`l` or left/right move the sidebar's
+divider a column, `j`/`k` or down/up the split a row; `esc` or `enter` leaves.
+A drag is clamped to the limits wherever the pointer goes.
+
+**Preferences.** What the user set is kept as thousandths of the width and
+height (`sidebar_permille`, `editor_permille`) in `dbx-tui-prefs.json` in the
+directory the store lives in (`DbxCore::store_dir`: `DBX_DATA_DIR`, or the
+desktop app's directory). The shell reads it at the start and writes it
+(`Command::SavePrefs`, atomically) when a drag ends, a double-click resets, the
+resize mode is left, and on quit; `app` only holds the values
+(`Ui.layout`). A missing, unreadable or corrupt file, or a value that is not
+a usable proportion, means the default for that value, silently. A write that
+fails is ignored. The collapsed state of the sidebar is not saved: there is no
+collapse yet (zoom is not kept).
+
 ## Tests
 
 Run every command from the dbx workspace root.
@@ -215,7 +265,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `cancel`, `first-query`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `cancel`, `first-query`, `mouse`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live
@@ -239,7 +289,7 @@ without a scratch key, and the one test that needs "no key at all" uses
 `with_managed_keys`, whose key policy never looks at the keychain. Journeys
 do the same through `lib.sh` (`$CLIENT` runs the binary on a scratch store
 with a scratch key); captures go to `$JOURNEY_OUT`, or a temp directory
-printed at the end. `browse-pagila` also starts a throwaway local socket that accepts and never answers (a listing that hangs, collapsed, and then in flight while the client quits). `cancel` runs a small local proxy to the fixture that swallows Postgres cancel requests, for a cancel that never lands (the live tests have the same proxy in Rust). `examples/seed_store` saves a connection with a query timeout when `DBX_TUI_SEED_QUERY_TIMEOUT` is set. `examples/seed_store` takes the password from `DBX_TUI_SEED_PASSWORD` when set.
+printed at the end. `browse-pagila` also starts a throwaway local socket that accepts and never answers (a listing that hangs, collapsed, and then in flight while the client quits). `mouse` writes SGR mouse reports to the pane with `tmux send-keys -l` (which reaches the client as the terminal's own reports would). `cancel` runs a small local proxy to the fixture that swallows Postgres cancel requests, for a cancel that never lands (the live tests have the same proxy in Rust). `examples/seed_store` saves a connection with a query timeout when `DBX_TUI_SEED_QUERY_TIMEOUT` is set. `examples/seed_store` takes the password from `DBX_TUI_SEED_PASSWORD` when set.
 
 ### Fixture databases
 

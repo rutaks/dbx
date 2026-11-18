@@ -246,6 +246,7 @@ fn draw_grid(p: &Painter, buf: &mut Buffer, area: Rect, set: &ResultSet, g: &mut
     g.cols_visible = 0;
     g.spans.clear();
     g.data = Rect::default();
+    g.bar = Rect::default();
     if area.width == 0 || area.height == 0 || cols == 0 {
         return;
     }
@@ -337,7 +338,8 @@ fn draw_grid(p: &Painter, buf: &mut Buffer, area: Rect, set: &ResultSet, g: &mut
         }
     }
     if overflow {
-        draw_scrollbar(p, buf, Rect::new(area.right() - 1, area.y + 1, 1, rows_h as u16), rows, g.top);
+        g.bar = Rect::new(area.right() - 1, area.y + 1, 1, rows_h as u16);
+        draw_scrollbar(p, buf, g.bar, rows, g.top);
     }
 }
 

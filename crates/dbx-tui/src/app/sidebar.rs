@@ -7,17 +7,15 @@
 //! above it does not move it onto another row.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::keys::Action;
+use super::pointer::{self, ClickKey, Drag};
 use super::requests::Target;
 use super::tree::{self, Children, Health, Listing, NodeId, Row, RowKey, RowKind};
 use super::view;
 use super::{App, Command, CoreCall, Effects, Loadable, Mode, SidebarNote};
 use crate::core::{Connection, ConnectionId, CoreError, CoreErrorKind, DbKind};
-
-/// A second click on the same row within this long is a double-click.
-const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// The sidebar's cursor, scroll position, expanded nodes and visible rows.
 #[derive(Debug)]
@@ -41,8 +39,6 @@ pub struct SidebarUi {
     /// How many times `rows` has been rebuilt: tests watch that it is only when
     /// the tree changes.
     pub rebuilds: usize,
-    /// The row and time of the last left click, for double-clicks.
-    pub last_click: Option<(Instant, usize)>,
 }
 
 impl Default for SidebarUi {
@@ -57,7 +53,6 @@ impl Default for SidebarUi {
             built_width: 0,
             built_retry_key: None,
             rebuilds: 0,
-            last_click: None,
         }
     }
 }
@@ -446,16 +441,35 @@ impl App {
         // The arrow (and the space after it) toggles on one click.
         let arrow = list.x + MARGIN + 2 * r.depth;
         if r.is_node() && x >= arrow && x < arrow + 2 {
-            self.ui.sidebar.last_click = None;
+            self.ui.clicks.forget();
             return self.toggle(row, fx);
         }
-        let double = matches!(self.ui.sidebar.last_click, Some((at, same)) if same == row && now.saturating_duration_since(at) <= DOUBLE_CLICK);
-        if double {
-            self.ui.sidebar.last_click = None;
+        // A second click on the row, soon after, toggles it.
+        if self.ui.clicks.press(now, ClickKey::SidebarRow(row)) {
             self.toggle(row, fx);
-        } else {
-            self.ui.sidebar.last_click = Some((now, row));
         }
+    }
+
+    /// A press on the sidebar's scrollbar column at screen row `y`: the list
+    /// jumps there (the thumb is centred on the press), or, on the thumb, it is
+    /// grabbed where it was pressed. Returns the drag it begins.
+    pub(super) fn press_sidebar_bar(&mut self, y: u16, fx: &mut Effects) -> Option<Drag> {
+        let bar = self.ui.hits.sidebar_bar;
+        let thumb = view::scrollbar_thumb(self.ui.sidebar.rows.len(), bar.height as usize, self.ui.sidebar.scroll)?;
+        let (grab, _) = pointer::grab(thumb, y.saturating_sub(bar.y) as usize);
+        self.drag_sidebar_bar(y, grab as u16, fx);
+        Some(Drag::SidebarBar { grab: grab as u16 })
+    }
+
+    /// The pointer is at screen row `y` with the thumb grabbed `grab` rows
+    /// below its top: scroll so the thumb is there.
+    pub(super) fn drag_sidebar_bar(&mut self, y: u16, grab: u16, fx: &mut Effects) {
+        let bar = self.ui.hits.sidebar_bar;
+        let (total, room, scroll) = (self.ui.sidebar.rows.len(), bar.height as usize, self.ui.sidebar.scroll);
+        let Some((_, len)) = view::scrollbar_thumb(total, room, scroll) else { return };
+        let thumb_top = (y.saturating_sub(bar.y) as usize).saturating_sub(grab as usize);
+        let to = pointer::scroll_for_thumb(total, room, len, thumb_top);
+        self.scroll_sidebar(to as isize - scroll as isize, fx);
     }
 
     /// A click on a mode-bar hint does what its key does.
@@ -466,6 +480,7 @@ impl App {
                 fx.repaint = true;
             }
             a if a.scope() == super::keys::Scope::Results => self.perform_results(a, now, fx),
+            a if a.scope() == super::keys::Scope::Resize => self.perform_resize(a, fx),
             a if a.scope() != super::keys::Scope::Sidebar => self.perform(a, now, fx),
             a => self.perform_sidebar(a, fx),
         }

@@ -3,6 +3,7 @@
 //! `select!` over the terminal's events, the reply channel and the app's
 //! next deadline; it draws only when an update asks for a repaint.
 
+pub mod prefs;
 mod terminal;
 
 use std::collections::HashMap;
@@ -36,6 +37,8 @@ pub struct Tasks {
     /// The run in flight in each session, with its connection: true once it
     /// has ended (or its task is gone).
     runs: Arc<Mutex<HashMap<SessionId, RunEntry>>>,
+    /// Where `Command::SavePrefs` writes; nowhere unless something is given.
+    prefs: Option<std::path::PathBuf>,
 }
 
 /// What puts text on the clipboard.
@@ -43,7 +46,7 @@ pub type ClipboardSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl Default for Tasks {
     fn default() -> Self {
-        Tasks { clipboard: Arc::new(|_| {}), calls: Default::default(), closing: Default::default(), runs: Default::default() }
+        Tasks { clipboard: Arc::new(|_| {}), calls: Default::default(), closing: Default::default(), runs: Default::default(), prefs: None }
     }
 }
 
@@ -51,6 +54,12 @@ impl Tasks {
     /// The same tasks, copying through `sink`.
     pub fn with_clipboard(mut self, sink: ClipboardSink) -> Self {
         self.clipboard = sink;
+        self
+    }
+
+    /// The same tasks, saving the layout preferences to `path`.
+    pub fn with_prefs(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.prefs = path;
         self
     }
 }
@@ -165,12 +174,19 @@ pub fn install_crypto_provider() {
 /// Runs the client until the user quits. The terminal is restored on return.
 /// Returns a line for the user when quitting could not see a statement end
 /// (`quit_note`), to be printed once the terminal is theirs again.
-pub async fn run(core: Arc<dyn Core>) -> io::Result<Option<String>> {
+///
+/// `prefs` is the layout preferences file (beside the store): read at the
+/// start, written when the layout changes. Without one the layout is the
+/// default and nothing is written.
+pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>) -> io::Result<Option<String>> {
     let mut guard = TerminalGuard::enter()?;
     let (tx, mut rx) = mpsc::unbounded_channel::<(RequestId, CoreReply)>();
     let mut events = EventStream::new();
     let mut app = App::new();
-    let tasks = Tasks::default().with_clipboard(Arc::new(terminal::copy_to_terminal));
+    if let Some(path) = &prefs {
+        app.set_layout(self::prefs::load(path));
+    }
+    let tasks = Tasks::default().with_clipboard(Arc::new(terminal::copy_to_terminal)).with_prefs(prefs);
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -228,6 +244,13 @@ pub(crate) fn execute(
         match command {
             Command::Quit => quit = true,
             Command::CopyToClipboard(text) => (tasks.clipboard)(&text),
+            // A write that fails leaves the defaults for the next run: nothing
+            // is worth telling anyone about a layout.
+            Command::SavePrefs(layout) => {
+                if let Some(path) = &tasks.prefs {
+                    let _ = prefs::save(path, &layout);
+                }
+            }
             Command::Cancel(run) => core.cancel(run),
             Command::Abandon(id) => tasks.abandon(id),
             Command::Release(at) => {

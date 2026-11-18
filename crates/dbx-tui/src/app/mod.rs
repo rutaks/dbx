@@ -2,12 +2,14 @@
 //! `view(frame)`. No tokio, no terminal I/O, no dbx types.
 
 mod connection_ui;
+mod resize;
 pub mod editor;
 pub mod form;
 pub mod grid;
 pub mod keys;
 pub mod layout;
 pub mod overlay;
+pub mod pointer;
 #[cfg(feature = "test-support")]
 pub mod probe;
 pub mod query;
@@ -28,6 +30,8 @@ mod form_tests;
 #[cfg(test)]
 mod grid_tests;
 #[cfg(test)]
+mod mouse_tests;
+#[cfg(test)]
 mod run_tests;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -45,10 +49,12 @@ use crate::core::{
     Connection, ConnectionDraft, ConnectionId, CoreError, DatabasePath, ResultSet, RunId, RunRequest, SessionId, TabId, DEFAULT_ROW_CAP,
 };
 use keys::{Action, KeyCombo, Keybinds};
-use layout::{HintHit, HitMap};
+use layout::{HintHit, HitMap, LayoutPrefs};
+use pointer::{ClickKey, Clicks, Drag};
 use overlay::{ErrorOverlay, FieldHit, Overlay, OverlayAction, OverlayButton};
 use requests::{RequestId, Requests, Settled, Target};
 use query::{Notice, QueryTab};
+use viewer::Scroll;
 use sidebar::SidebarUi;
 use theme::Palette;
 use tree::{Listing, NodeId, RowKey, SchemaCache, Slot};
@@ -76,6 +82,9 @@ pub enum Mode {
     Normal,
     /// The prefix was pressed; the next key is a command. Ends at `expires`.
     Prefix { expires: Instant },
+    /// The resize mode (prefix, then `R`): the keys move the dividers until
+    /// `esc` or `enter`.
+    Resize,
 }
 
 /// Something that is loading, loaded or failed.
@@ -152,6 +161,16 @@ pub struct Ui {
     pub grid: grid::GridUi,
     /// The `now` of the last update: what the view measures elapsed time by.
     pub now: Option<Instant>,
+    /// Where the user put the dividers; `None` is the automatic size. The
+    /// shell reads it from a file at the start and writes it back
+    /// (`Command::SavePrefs`).
+    pub layout: LayoutPrefs,
+    /// The layout changed since it was last sent to be saved.
+    pub layout_unsaved: bool,
+    /// A drag the left button is in the middle of.
+    pub drag: Option<Drag>,
+    /// The last press, for double-clicks.
+    pub clicks: Clicks,
 }
 
 #[derive(Debug)]
@@ -214,6 +233,9 @@ pub enum Command {
     /// cell data: the shell must carry it so the terminal cannot read it as
     /// anything but the clipboard's content (OSC 52 base64).
     CopyToClipboard(String),
+    /// Write the layout preferences beside the store. Fire and forget; a
+    /// failure leaves the defaults for the next run, nothing more.
+    SavePrefs(LayoutPrefs),
     Quit,
 }
 
@@ -260,8 +282,17 @@ impl App {
                 notice: None,
                 grid: grid::GridUi::default(),
                 now: None,
+                layout: LayoutPrefs::default(),
+                layout_unsaved: false,
+                drag: None,
+                clicks: Clicks::default(),
             },
         }
+    }
+
+    /// Starts with the layout the user last left (read by the shell).
+    pub fn set_layout(&mut self, prefs: LayoutPrefs) {
+        self.ui.layout = prefs.sane();
     }
 
     /// Asks for what the first screen needs. Calling it again reloads, and
@@ -319,7 +350,7 @@ impl App {
     pub fn next_deadline(&self) -> Option<Instant> {
         let prefix = match self.ui.mode {
             Mode::Prefix { expires } => Some(expires),
-            Mode::Normal => None,
+            Mode::Normal | Mode::Resize => None,
         };
         [prefix, self.query_deadline()].into_iter().flatten().min()
     }
@@ -369,6 +400,13 @@ impl App {
                     self.perform(action, now, fx);
                 }
             }
+            // The resize mode takes every key: the ones it binds move a divider
+            // or leave it, the rest do nothing.
+            Mode::Resize => {
+                if let Some(action) = self.ui.keys.lookup_resize(&combo) {
+                    self.perform_resize(action, fx);
+                }
+            }
         }
     }
 
@@ -390,6 +428,11 @@ impl App {
             (Action::FocusUp, Results) => Some(Editor),
             (Action::Zoom, _) => {
                 self.ui.zoomed = !self.ui.zoomed;
+                None
+            }
+            (Action::ResizeMode, _) => {
+                self.ui.mode = Mode::Resize;
+                fx.repaint = true;
                 None
             }
             (Action::NewConnection, _) => {
@@ -421,44 +464,135 @@ impl App {
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent, now: Instant, fx: &mut Effects) {
-        let at = (mouse.column, mouse.row).into();
         match mouse.kind {
-            // The wheel scrolls what is under the pointer, focused or not.
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if self.ui.hits.sidebar.contains(at) => {
-                let down = mouse.kind == MouseEventKind::ScrollDown;
-                self.scroll_sidebar(if down { WHEEL_ROWS } else { -WHEEL_ROWS }, fx);
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                self.on_wheel(mouse, fx)
             }
-            // Over the results: the wheel scrolls rows, and with shift (or a
-            // horizontal wheel, where the terminal reports one) columns.
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if self.ui.hits.results.contains(at) => {
-                let step = if mouse.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
-                if mouse.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
-                    self.scroll_grid(0, step, fx);
+            MouseEventKind::Down(MouseButton::Left) => self.on_press(mouse, now, fx),
+            MouseEventKind::Drag(MouseButton::Left) => self.on_drag(mouse, fx),
+            MouseEventKind::Up(MouseButton::Left) => self.on_release(fx),
+            _ => {}
+        }
+    }
+
+    /// The wheel scrolls what is under the pointer, focused or not: the
+    /// sidebar's list, the editor's text, the results' rows. With shift, or a
+    /// horizontal wheel where the terminal reports one, the results scroll by
+    /// columns and the editor sideways.
+    fn on_wheel(&mut self, mouse: MouseEvent, fx: &mut Effects) {
+        let at = (mouse.column, mouse.row).into();
+        let shift = mouse.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+        let (down, sideways) = match mouse.kind {
+            MouseEventKind::ScrollDown => (true, shift),
+            MouseEventKind::ScrollUp => (false, shift),
+            MouseEventKind::ScrollRight => (true, true),
+            _ => (false, true),
+        };
+        let step = if down { 1 } else { -1 };
+        if self.ui.hits.sidebar.contains(at) {
+            if !sideways {
+                self.scroll_sidebar(WHEEL_ROWS * step, fx);
+            }
+        } else if self.ui.hits.editor.contains(at) {
+            let (rows, cols) = if sideways { (0, 4 * step as i16) } else { (WHEEL_ROWS as i16 * step as i16, 0) };
+            fx.repaint |= self.ui.editor.scroll(rows, cols);
+        } else if self.ui.hits.results.contains(at) {
+            if sideways {
+                self.scroll_grid(0, step, fx);
+            } else {
+                self.scroll_grid(WHEEL_ROWS * step, 0, fx);
+            }
+        }
+    }
+
+    /// A left press: a hint, a divider, a scrollbar, or a pane's own content.
+    fn on_press(&mut self, mouse: MouseEvent, now: Instant, fx: &mut Effects) {
+        let at = (mouse.column, mouse.row).into();
+        let (x, y) = (mouse.column, mouse.row);
+        self.ui.drag = None;
+        // A hint in the mode bar does what its key does.
+        if let Some(hit) = self.ui.mode_hints.iter().find(|h| h.rect.contains(at)).copied() {
+            self.ui.clicks.forget();
+            return self.click_hint(hit.action, now, fx);
+        }
+        // A divider is nobody's pane: pressing it takes no focus; dragging it
+        // resizes, and a double-click puts it back.
+        for (vertical, rect) in [(true, self.ui.hits.sidebar_separator), (false, self.ui.hits.divider)] {
+            if rect.contains(at) {
+                if self.ui.clicks.press(now, ClickKey::Divider(vertical)) {
+                    self.reset_divider(vertical, fx);
                 } else {
-                    self.scroll_grid(WHEEL_ROWS * step, 0, fx);
+                    self.ui.drag = Some(if vertical { Drag::Sidebar } else { Drag::Split });
                 }
+                return;
             }
-            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight if self.ui.hits.results.contains(at) => {
-                self.scroll_grid(0, if mouse.kind == MouseEventKind::ScrollRight { 1 } else { -1 }, fx);
+        }
+        if let Some(pane) = self.ui.hits.pane_at(x, y) {
+            if pane != self.ui.focus {
+                self.ui.focus = pane;
+                fx.repaint = true;
             }
-            MouseEventKind::Down(MouseButton::Left) => {
-                // A hint in the mode bar does what its key does.
-                if let Some(hit) = self.ui.mode_hints.iter().find(|h| h.rect.contains(at)).copied() {
-                    return self.click_hint(hit.action, now, fx);
-                }
-                if let Some(pane) = self.ui.hits.pane_at(mouse.column, mouse.row) {
-                    if pane != self.ui.focus {
-                        self.ui.focus = pane;
-                        fx.repaint = true;
+        }
+        if self.ui.hits.sidebar_bar.contains(at) {
+            self.ui.clicks.forget();
+            self.ui.drag = self.press_sidebar_bar(y, fx);
+        } else if self.ui.hits.sidebar_list.contains(at) {
+            self.click_sidebar_row(x, y, now, fx);
+        } else if self.ui.hits.results.contains(at) {
+            if self.ui.grid.bar.contains(at) {
+                self.ui.clicks.forget();
+                self.ui.drag = self.press_grid_bar(y, fx);
+            } else {
+                match self.click_grid(x, y, fx) {
+                    // The second press on a cell opens it.
+                    Some((row, col)) => {
+                        if self.ui.clicks.press(now, ClickKey::Cell(row, col)) {
+                            self.perform_results(Action::OpenCell, now, fx);
+                        }
                     }
-                }
-                if self.ui.hits.sidebar_list.contains(at) {
-                    self.click_sidebar_row(mouse.column, mouse.row, now, fx);
-                }
-                if self.ui.hits.results.contains(at) {
-                    self.click_grid(mouse.column, mouse.row, fx);
+                    None => self.ui.clicks.forget(),
                 }
             }
+        } else if self.ui.hits.editor_text.contains(at) {
+            let text = self.ui.hits.editor_text;
+            let (col, row) = ((x - text.x) as i32, (y - text.y) as i32);
+            let line = self.ui.editor.row_at(col, row);
+            let changed = if self.ui.clicks.press(now, ClickKey::Text(line, 0)) {
+                self.ui.editor.select_word(col, row)
+            } else {
+                self.ui.editor.click(col, row)
+            };
+            fx.repaint |= changed;
+            self.ui.drag = Some(Drag::EditorSelect);
+        } else {
+            self.ui.clicks.forget();
+        }
+    }
+
+    /// The pointer moved with the left button down.
+    fn on_drag(&mut self, mouse: MouseEvent, fx: &mut Effects) {
+        let (x, y) = (mouse.column, mouse.row);
+        match self.ui.drag {
+            Some(Drag::Sidebar) => self.set_sidebar_total(i32::from(x) + 1, fx),
+            Some(Drag::Split) => {
+                let top = i32::from(self.ui.hits.editor.y);
+                self.set_editor_height(i32::from(y) - top, fx)
+            }
+            Some(Drag::SidebarBar { grab }) => self.drag_sidebar_bar(y, grab, fx),
+            Some(Drag::GridBar { grab }) => self.drag_grid_bar(y, grab, fx),
+            Some(Drag::EditorSelect) => {
+                let text = self.ui.hits.editor_text;
+                fx.repaint |= self.ui.editor.drag(i32::from(x) - i32::from(text.x), i32::from(y) - i32::from(text.y));
+            }
+            None => {}
+        }
+    }
+
+    /// The left button is up: a drag ends, and a resized layout is saved.
+    fn on_release(&mut self, fx: &mut Effects) {
+        match self.ui.drag.take() {
+            Some(Drag::Sidebar | Drag::Split) => self.save_layout(fx),
+            Some(Drag::EditorSelect) => fx.repaint |= self.ui.editor.end_drag(),
             _ => {}
         }
     }
@@ -485,6 +619,10 @@ impl App {
     }
 
     fn on_overlay_mouse(&mut self, mouse: MouseEvent, fx: &mut Effects) {
+        // A drag that began before the overlay opened ends here.
+        if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+            self.ui.drag = None;
+        }
         match mouse.kind {
             MouseEventKind::ScrollDown => return self.scroll_viewer(WHEEL_ROWS, fx),
             MouseEventKind::ScrollUp => return self.scroll_viewer(-WHEEL_ROWS, fx),
@@ -536,12 +674,13 @@ impl App {
             OverlayAction::DropSessionYes => self.drop_session(fx),
             OverlayAction::RerunYes => self.confirm_rerun(fx),
             OverlayAction::ViewerCopy => self.copy_viewer(fx),
-            OverlayAction::ViewerToggleRaw => {
-                if let Some(Overlay::CellViewer(v)) = &mut self.ui.overlay {
-                    v.toggle_raw();
-                }
-                fx.repaint = true;
-            }
+            OverlayAction::ViewerToggleRaw => self.toggle_viewer_raw(fx),
+            OverlayAction::ViewerLineDown => self.scroll_viewer_by(Scroll::Line(1), fx),
+            OverlayAction::ViewerLineUp => self.scroll_viewer_by(Scroll::Line(-1), fx),
+            OverlayAction::ViewerPageDown => self.scroll_viewer_by(Scroll::Page(1), fx),
+            OverlayAction::ViewerPageUp => self.scroll_viewer_by(Scroll::Page(-1), fx),
+            OverlayAction::ViewerTop => self.scroll_viewer_by(Scroll::Top, fx),
+            OverlayAction::ViewerBottom => self.scroll_viewer_by(Scroll::Bottom, fx),
             OverlayAction::Dismiss => {
                 self.ui.overlay = None;
                 fx.repaint = true;

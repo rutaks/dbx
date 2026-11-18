@@ -15,7 +15,9 @@ fn main() {
     // Where the store is comes from the environment, read in one place. A
     // failure there, like any store failure, is shown in the client.
     let core = Arc::new(DbxCore::from_env());
-    let result = runtime.block_on(shell::run(core));
+    // The layout preferences sit beside the store, if the store is known.
+    let prefs = core.store_dir().map(shell::prefs::path_in);
+    let result = runtime.block_on(shell::run(core, prefs));
     // The terminal is already restored (the guard is dropped inside `run`). Do not wait for Core calls still in
     // flight: quitting is immediate.
     runtime.shutdown_background();
