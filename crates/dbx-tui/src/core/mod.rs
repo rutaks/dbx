@@ -307,10 +307,47 @@ pub struct ResultSet {
     pub affected: u64,
     /// The statement text that actually ran.
     pub ran: String,
+    /// Whether running `ran` again is safe. "Load more" re-runs the
+    /// statement, so it needs this.
+    pub rerun: Rerun,
+}
+
+/// What is known about running a statement a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rerun {
+    /// A `SELECT`, `WITH ... SELECT`, `VALUES` or `TABLE` that dbx proved
+    /// read-only (`prove_read_only_for_database`): no function in it can
+    /// change data.
+    Proven,
+    /// Read-only as far as dbx's denylist can see, but not proven: it calls a
+    /// function (`select f()`, `select pg_notify(...)`) that may change data.
+    /// Repeating it needs the user's say-so.
+    ReadOnlyUnproven,
+    /// A write, or anything that is not a query. Never repeated.
+    Write,
 }
 
 /// The rows a run fetches unless told otherwise (design section 5).
 pub const DEFAULT_ROW_CAP: usize = 1_000;
+
+/// The most rows "load more" will fetch. dbx builds the whole result in
+/// memory as JSON values before we turn it into text, so every row costs
+/// twice for a moment; 100,000 rows keeps that to tens of megabytes for a
+/// normal table and is already more than anyone reads in a grid. Past it the
+/// answer is a narrower query.
+pub const MAX_ROW_CAP: usize = 100_000;
+
+/// The most cells (rows times columns) "load more" will hold. Measured on the
+/// million-row fixture (3 columns), a result costs about 120 bytes per cell
+/// while it is held, so 2,000,000 cells is about 240 MB at the very most, and
+/// a 120-column result stops near 16,000 rows where a 3-column one reaches
+/// `MAX_ROW_CAP`.
+pub const MAX_CELLS: usize = 2_000_000;
+
+/// The most rows "load more" fetches for a result of `columns` columns.
+pub fn row_ceiling(columns: usize) -> usize {
+    (MAX_CELLS / columns.max(1)).clamp(DEFAULT_ROW_CAP, MAX_ROW_CAP)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HistoryQuery {

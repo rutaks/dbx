@@ -133,6 +133,77 @@ while a run is in flight leaves the same marker. Quitting while a statement may
 still be running prints, once the terminal is restored,
 `dbx-tui: A statement may still be running on <connection / database>.`
 
+## The result grid (results pane)
+
+A run that gives columns shows a grid: a fixed header row, a row-number
+gutter, a cell cursor, a `▕` scrollbar when the rows overflow, and
+`r 501/10,000  c 12/120` on the pane's title row (`+` after the row count when
+the row cap cut the result). Drawing and scrolling are virtual on both axes:
+only the rows and whole columns in the window are touched, and each cell is
+read only as far as a column can show it, so a million-row result or a 10 MB
+cell costs a frame what a small one does. Keys, with the results pane focused
+(all from `Keybinds`, shown in the mode bar and clickable):
+
+| Key | Does |
+|---|---|
+| `h` `j` `k` `l` and the arrows | move the cell cursor |
+| `pagedown` `ctrl+d` `pageup` `ctrl+u` | a page of rows |
+| `home` `0` / `end` `$` | first / last column |
+| `g` / `G` | first / last row |
+| `enter` | open the cell viewer |
+| `y` / `Y` | copy the cell / the row |
+| `m` | load more (only on a truncated result) |
+
+Mouse: a click puts the cursor on a cell, the wheel scrolls rows (three per
+notch), shift+wheel or a horizontal wheel scrolls columns, a click on a hint
+does what its key does.
+
+**Column widths** are the display width (`unicode-width`) of the header and the
+cells in a sample window, clamped to 3..40. The window is the rows from the
+viewport's chunk of 128 rows, two chunks or more, so a column keeps its width
+while the viewport stays inside it, a result of up to two chunks is measured
+whole, and a jump to the end of a million rows measures a few hundred rows,
+not the million. Columns are measured when first needed and cached until the
+result or the window changes. Cells cut with `…`; a line break is `⏎`, a tab
+`⇥`, NULL a dimmed `∅`, a cell a short row lacks `⊘`; numbers are right-aligned.
+
+**The cell viewer** (`enter`) is an overlay with the column, type and row in
+its title (and the value's length in characters and bytes): the whole value wrapped by display width, scrolled by line
+(`j`/`k`), page and `g`/`G`; NULL, `empty string` and the text `NULL` look
+different (so does a cell the row lacks); every hard line break ends in a dimmed `↵` (LF), `←` (CR) or `←↵` (CRLF) and trailing spaces are a dimmed `·`, so values that differ look different; a JSON cell is pretty-printed (whitespace only: keys keep their
+order and numbers their digits) and `r` shows the stored text. Only the lines
+on screen are wrapped; `G` on a huge value wraps it all once. `y` copies the
+stored value, never the pretty form. `esc` closes it.
+
+**Copy** sends `Command::CopyToClipboard`, which the shell writes as an OSC 52
+sequence (`ESC ] 52 ; c ; <base64> BEL`): it works over SSH and in kitty, and
+in tmux with `set-clipboard on`; a terminal that ignores OSC 52 (tmux's
+default `set-clipboard external`, macOS Terminal.app, iTerm2's default) drops it
+silently, so the notice says "Sent cell to the terminal clipboard", not
+"Copied". A cell a short row lacks has nothing to copy. The text is base64, so cell data cannot be read by the terminal as
+anything but the clipboard's content. At most 75,000 bytes (100,000 of
+base64, xterm's default cap) are sent; a larger copy is refused with a notice
+saying so. A row is the cells' exact texts joined by tabs, NULL as an empty
+field; a cell that contains a tab or a line break is copied as it is.
+
+**Load more** (`m`) re-runs `ResultSet.ran` with twice the rows fetched, up to
+`MAX_ROW_CAP` (100,000 rows) and `MAX_CELLS` (2,000,000 cells, so a 120-column
+result stops near 16,000 rows). The result on screen stays navigable under a
+`loading more…` line, and the cursor stays on its row and column when the rows
+land. When they land the old rows are compared once with the start of the new
+ones, and "The rows changed since the last run." says so if they differ (and
+that the cursor moved, if its row had to be clamped). It does nothing on a
+result that was not cut, and is refused with a notice while the tab runs or
+cancels, once the tab's session is another one, at the ceiling, and for a
+statement that changes data; the `m more` hint is not offered where it could
+only be refused. `ResultSet.rerun`, set by `DbxCore`, has three values: a first
+keyword of `SELECT`, `WITH`, `VALUES` or `TABLE` and dbx's
+`classify_sql_risk_for_database` saying read-only (a denylist) are needed for
+anything but `Write`; then dbx's `prove_read_only_for_database` (an allowlist
+of pure functions) decides between `Proven` (loads as is) and
+`ReadOnlyUnproven` (`select f()`, `select pg_notify(..)`: `m` opens a question
+naming the statement's first line, `enter` re-runs, `esc` cancels).
+
 ## Tests
 
 Run every command from the dbx workspace root.
@@ -143,7 +214,7 @@ Run every command from the dbx workspace root.
 | Store: `DbxCore` on scratch stores (layer 1) | `cargo test -p dbx-tui --test store -- --test-threads=1` | nothing external; temp dirs, key files, a local TCP port |
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `cancel`, `first-query` and `quit-mid-run` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `cancel`, `first-query`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live
@@ -178,6 +249,10 @@ printed at the end. `browse-pagila` also starts a throwaway local socket that ac
   checked by SHA-256 (current Pagila master needs Postgres 18).
 - `edge`: our edge-case schema (`edge/*.sql`), values whose exact text is
   known: NULL vs `''` vs `'NULL'`, wide text, integers beyond 2^53, NaN and
-  Infinity, time zones, odd identifiers, a second schema.
+  Infinity, time zones, odd identifiers, a second schema. For the result
+  grid: `wide_120` (120 columns `c001`..`c120` of text, numeric, jsonb and
+  integer, 400 rows; every value encodes its own column and row), `million_rows`
+  (id, text, number; a million rows by `generate_series`, about a second to
+  load) and `width_text` (wide characters, combining marks, joiners).
 
 `up.sh` starts it and waits until it answers queries; `down.sh` removes it.

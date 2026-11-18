@@ -362,6 +362,7 @@ pub(super) fn rows_of(rows: &[&[&str]]) -> ResultSet {
         messages: vec![],
         affected: 0,
         ran: "select v".into(),
+        rerun: crate::core::Rerun::Proven,
     }
 }
 
@@ -413,15 +414,18 @@ async fn integers_are_right_aligned_and_null_the_empty_string_and_the_text_null_
         messages: vec![],
         affected: 0,
         ran: "select ...".into(),
+        rerun: crate::core::Rerun::Proven,
     };
     let mut h = ran(Ok(set)).await;
     let rows = results_rows(&mut h);
     let header = rows.iter().position(|r| r.contains("label")).expect("a header row");
     assert!(rows[header].contains("id") && rows[header].contains('v'), "{rows:#?}");
     // Right-aligned: the last digit of each id is in the same column.
-    let ends: Vec<u16> = ["1 ", "22 ", "333 "].iter().map(|t| {
+    // (Each id is looked up with the label after it: the row-number gutter
+    // on the left holds digits too.)
+    let ends: Vec<u16> = ["1  null", "22  empty", "333  text"].iter().map(|t| {
         let (x, _) = in_results(&mut h, t).unwrap_or_else(|| panic!("{t:?} in {rows:#?}"));
-        x + t.trim_end().len() as u16
+        x + t.split_whitespace().next().unwrap().len() as u16
     }).collect();
     assert!(ends.windows(2).all(|w| w[0] == w[1]), "ids end at {ends:?}: {rows:#?}");
     // NULL is a dimmed glyph; the text NULL is text; the empty string is nothing.
@@ -446,6 +450,7 @@ async fn a_result_without_column_types_still_renders_left_aligned() {
         messages: vec![],
         affected: 0,
         ran: "select n".into(),
+        rerun: crate::core::Rerun::Proven,
     };
     let mut h = ran(Ok(set)).await;
     let (a, _) = in_results(&mut h, "5").unwrap();
@@ -493,7 +498,8 @@ async fn a_truncated_result_says_plus_after_the_count_in_the_mode_bar() {
     assert!(mode_bar(&mut h).contains("1,000+ rows  12ms"), "{}", mode_bar(&mut h));
     // Only what fits is drawn: the last row on screen is still in the pane.
     let rows = results_rows(&mut h);
-    assert!(rows.last().unwrap().trim().parse::<usize>().unwrap() < 30, "{rows:#?}");
+    // (The row-number gutter comes first on each row, then the value, then the scrollbar.)
+    assert!(rows.last().unwrap().split_whitespace().rfind(|t| t.chars().all(|c| c.is_ascii_digit())).unwrap().parse::<usize>().unwrap() < 30, "{rows:#?}");
 }
 
 #[tokio::test]

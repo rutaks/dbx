@@ -783,7 +783,7 @@ fn statement_to_run(request: &RunRequest, db_type: DatabaseType) -> String {
 /// dbx's result as ours. Each column's kind comes from the database's type
 /// name (`column_types`); a column dbx gives no type name for is `Other`. Every cell is NULL or text:
 /// numbers keep the digits dbx gave, never passing through a float.
-fn result_set(result: dbx_core::db::QueryResult, ran: String) -> ResultSet {
+fn result_set(result: dbx_core::db::QueryResult, ran: String, database_type: DatabaseType) -> ResultSet {
     let columns = result
         .columns
         .iter()
@@ -805,7 +805,50 @@ fn result_set(result: dbx_core::db::QueryResult, ran: String) -> ResultSet {
         elapsed: std::time::Duration::from_millis(result.execution_time_ms.min(u64::MAX as u128) as u64),
         messages,
         affected: result.affected_rows,
+        rerun: rerun_of(&ran, database_type),
         ran,
+    }
+}
+
+/// What is known about running `sql` again, which "load more" needs because it
+/// repeats the statement. Three steps:
+///
+/// 1. The statement must start with `SELECT`, `WITH`, `VALUES` or `TABLE`
+///    (so `SHOW` and `EXPLAIN`, which dbx also calls read-only, are left out).
+/// 2. dbx's `classify_sql_risk_for_database` must say read-only. It is a
+///    denylist: it sees through `WITH ... DELETE ... RETURNING`, `SELECT
+///    INTO`, locking clauses and several statements in one, but it calls
+///    `select f()`, `select * from f()`, `select pg_notify(..)` and
+///    `select set_config(.., false)` read-only, because it cannot know what a
+///    function does. Failing it is `Write`.
+/// 3. dbx's `prove_read_only_for_database` (an allowlist of pure functions)
+///    decides between `Proven` and `ReadOnlyUnproven`.
+fn rerun_of(sql: &str, database_type: DatabaseType) -> Rerun {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, r)| r).trim_start();
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, r)| r).trim_start();
+        } else if let Some(after) = rest.strip_prefix('(') {
+            rest = after.trim_start();
+        } else {
+            break;
+        }
+    }
+    let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect::<String>().to_ascii_lowercase();
+    if !matches!(word.as_str(), "select" | "with" | "values" | "table") {
+        return Rerun::Write;
+    }
+    // dbx calls `TABLE name` a write (it fails closed on what it cannot
+    // read); it is `SELECT * FROM name`, and is judged as that.
+    let judged = if word == "table" { format!("select * from {}", &rest[word.len()..]) } else { sql.to_string() };
+    if !matches!(dbx_core::sql_risk::classify_sql_risk_for_database(&judged, database_type), Ok(dbx_core::sql_risk::SqlRisk::ReadOnly)) {
+        return Rerun::Write;
+    }
+    match dbx_core::sql_risk::prove_read_only_for_database(&judged, database_type) {
+        dbx_core::sql_risk::ReadProof::ProvenReadOnly => Rerun::Proven,
+        dbx_core::sql_risk::ReadProof::Unproven => Rerun::ReadOnlyUnproven,
     }
 }
 
@@ -1133,7 +1176,7 @@ impl Core for DbxCore {
         };
         match (result, timeout) {
             (Err(QueryExecutionError::Canceled { .. }), Some(secs)) if timed_out => Err(timeout_error(secs, stopped, &statement)),
-            (result, _) => result.map(|r| result_set(r, statement.clone())).map_err(|e| run_error(e, &statement, &config.password, timeout)),
+            (result, _) => result.map(|r| result_set(r, statement.clone(), config.db_type)).map_err(|e| run_error(e, &statement, &config.password, timeout)),
         }
     }
     fn cancel(&self, run: RunId) {
@@ -1172,6 +1215,58 @@ impl Core for DbxCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_selects_dbx_proves_read_only_are_proven_rerunnable() {
+        for sql in [
+            "select 1",
+            "SELECT * FROM film WHERE x = 1;",
+            "  /* c */ select 1",
+            "-- note\nselect 1",
+            "(select 1) union (select 2)",
+            "with a as (select 1) select * from a",
+            "select id, upper(title) from film order by id",
+            "values (1)",
+            "values (1), (2)",
+            "table film",
+        ] {
+            assert_eq!(rerun_of(sql, DatabaseType::Postgres), Rerun::Proven, "{sql:?} can be run again");
+        }
+    }
+
+    #[test]
+    fn a_select_that_calls_a_function_dbx_cannot_vouch_for_is_read_only_but_unproven() {
+        for sql in [
+            "select f()",
+            "select * from f()",
+            "select pg_notify('a', 'b')",
+            "select set_config('x.y', '1', false)",
+            "select my_func(id) from film",
+        ] {
+            assert_eq!(rerun_of(sql, DatabaseType::Postgres), Rerun::ReadOnlyUnproven, "{sql:?} asks first");
+        }
+    }
+
+    #[test]
+    fn writes_and_what_is_not_a_query_are_never_rerun() {
+        for sql in [
+            "update t set a = 1 returning *",
+            "insert into t values (1) returning id",
+            "delete from t returning *",
+            "with d as (delete from t returning *) select * from d",
+            "select * into newt from t",
+            "select * from t for update",
+            "select * from t for share",
+            "select nextval('s')",
+            "explain analyze delete from t",
+            "show search_path",
+            "create table x as select 1",
+            "",
+            "select 1; delete from t",
+        ] {
+            assert_eq!(rerun_of(sql, DatabaseType::Postgres), Rerun::Write, "{sql:?} must not be run again");
+        }
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let owned: Vec<(String, OsString)> = pairs.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect();
@@ -1242,7 +1337,7 @@ mod tests {
             "truncated": true,
             "messages": [{"severity": "NOTICE", "message": "hello"}]
         }));
-        let set = result_set(r, "select ...".into());
+        let set = result_set(r, "select ...".into(), DatabaseType::Postgres);
         let kinds: Vec<CellKind> = set.columns.iter().map(|c| c.kind).collect();
         use CellKind::*;
         assert_eq!(kinds, vec![Integer, Integer, Decimal, Float, Bool, Text, Temporal, Json, Binary, Other]);
@@ -1284,14 +1379,14 @@ mod tests {
             "affected_rows": 0,
             "execution_time_ms": 1
         }));
-        let set = result_set(r, String::new());
+        let set = result_set(r, String::new(), DatabaseType::Postgres);
         assert!(set.columns.iter().all(|c| c.kind == CellKind::Other && c.db_type.is_empty()), "{:?}", set.columns);
         assert_eq!(set.rows[1][0], Cell::Value("3".into()));
         // Types for only some columns: the ones without are `Other`.
         let r = query_result(serde_json::json!({
             "columns": ["a", "b"], "column_types": ["int4"], "rows": [[1, 2]], "affected_rows": 0, "execution_time_ms": 1
         }));
-        let kinds: Vec<CellKind> = result_set(r, String::new()).columns.iter().map(|c| c.kind).collect();
+        let kinds: Vec<CellKind> = result_set(r, String::new(), DatabaseType::Postgres).columns.iter().map(|c| c.kind).collect();
         assert_eq!(kinds, vec![CellKind::Integer, CellKind::Other]);
     }
 
@@ -1307,7 +1402,7 @@ mod tests {
     #[test]
     fn a_statement_without_a_result_set_reports_the_rows_it_changed() {
         let r = query_result(serde_json::json!({ "columns": [], "rows": [], "affected_rows": 3, "execution_time_ms": 4 }));
-        let set = result_set(r, "delete from t".into());
+        let set = result_set(r, "delete from t".into(), DatabaseType::Postgres);
         assert!(set.columns.is_empty());
         assert_eq!(set.affected, 3);
     }

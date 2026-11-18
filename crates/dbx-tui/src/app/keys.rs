@@ -122,6 +122,9 @@ pub enum Scope {
     /// (`f5`, `alt+enter`): keys no pane uses for anything else.
     Direct,
     Sidebar,
+    /// Read by the results pane when it has focus, and by the cell viewer
+    /// (neither takes text, so neither needs the prefix).
+    Results,
 }
 
 /// A named thing the client can do, to which keys are bound.
@@ -161,6 +164,26 @@ pub enum Action {
     RemoveConnection,
     /// Make the database under the cursor the one the query tab runs on.
     UseTarget,
+    // The results pane's own keys (and the cell viewer's).
+    GridLeft,
+    GridRight,
+    GridUp,
+    GridDown,
+    GridPageUp,
+    GridPageDown,
+    GridFirstCol,
+    GridLastCol,
+    GridFirstRow,
+    GridLastRow,
+    /// Open the cell under the cursor in the viewer.
+    OpenCell,
+    /// Copy the cell (or, in the viewer, its raw value), or the whole row.
+    CopyCell,
+    CopyRow,
+    /// Fetch more rows of a truncated result.
+    LoadMore,
+    /// In the viewer: JSON as pretty-printed, or as stored.
+    ToggleRaw,
 }
 
 impl Action {
@@ -185,6 +208,17 @@ impl Action {
             Action::EditConnection => "edit",
             Action::RemoveConnection => "remove",
             Action::UseTarget => "use",
+            Action::GridLeft | Action::GridRight | Action::GridUp | Action::GridDown => "move",
+            Action::GridPageUp | Action::GridPageDown => "page",
+            Action::GridFirstCol => "first col",
+            Action::GridLastCol => "last col",
+            Action::GridFirstRow => "first row",
+            Action::GridLastRow => "last row",
+            Action::OpenCell => "view",
+            Action::CopyCell => "copy",
+            Action::CopyRow => "copy row",
+            Action::LoadMore => "more",
+            Action::ToggleRaw => "raw",
         }
     }
 
@@ -201,6 +235,21 @@ impl Action {
             | Action::Cancel
             | Action::OpenPrefix => Scope::Prefix,
             Action::RunDirect | Action::CancelDirect => Scope::Direct,
+            Action::GridLeft
+            | Action::GridRight
+            | Action::GridUp
+            | Action::GridDown
+            | Action::GridPageUp
+            | Action::GridPageDown
+            | Action::GridFirstCol
+            | Action::GridLastCol
+            | Action::GridFirstRow
+            | Action::GridLastRow
+            | Action::OpenCell
+            | Action::CopyCell
+            | Action::CopyRow
+            | Action::LoadMore
+            | Action::ToggleRaw => Scope::Results,
             _ => Scope::Sidebar,
         }
     }
@@ -213,6 +262,7 @@ pub struct Keybinds {
     bindings: Vec<(KeyCombo, Action)>,
     direct: Vec<(KeyCombo, Action)>,
     sidebar: Vec<(KeyCombo, Action)>,
+    results: Vec<(KeyCombo, Action)>,
 }
 
 impl Default for Keybinds {
@@ -262,6 +312,31 @@ impl Default for Keybinds {
                 (key("delete"), Action::RemoveConnection),
                 (key("u"), Action::UseTarget),
             ],
+            results: vec![
+                (key("h"), Action::GridLeft),
+                (key("left"), Action::GridLeft),
+                (key("l"), Action::GridRight),
+                (key("right"), Action::GridRight),
+                (key("k"), Action::GridUp),
+                (key("up"), Action::GridUp),
+                (key("j"), Action::GridDown),
+                (key("down"), Action::GridDown),
+                (key("pageup"), Action::GridPageUp),
+                (key("ctrl+u"), Action::GridPageUp),
+                (key("pagedown"), Action::GridPageDown),
+                (key("ctrl+d"), Action::GridPageDown),
+                (key("home"), Action::GridFirstCol),
+                (key("0"), Action::GridFirstCol),
+                (key("end"), Action::GridLastCol),
+                (key("$"), Action::GridLastCol),
+                (key("g"), Action::GridFirstRow),
+                (key("G"), Action::GridLastRow),
+                (key("enter"), Action::OpenCell),
+                (key("y"), Action::CopyCell),
+                (key("Y"), Action::CopyRow),
+                (key("m"), Action::LoadMore),
+                (key("r"), Action::ToggleRaw),
+            ],
         }
     }
 }
@@ -282,8 +357,14 @@ impl Keybinds {
         self.sidebar.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
 
+    /// The action the results pane (or the cell viewer) binds to `key`.
+    pub fn lookup_results(&self, key: &KeyCombo) -> Option<Action> {
+        self.results.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+    }
+
     fn table(&self, scope: Scope) -> &[(KeyCombo, Action)] {
         match scope {
+            Scope::Results => &self.results,
             Scope::Prefix => &self.bindings,
             Scope::Direct => &self.direct,
             Scope::Sidebar => &self.sidebar,
@@ -305,6 +386,7 @@ impl Keybinds {
             Scope::Prefix => &mut self.bindings,
             Scope::Direct => &mut self.direct,
             Scope::Sidebar => &mut self.sidebar,
+            Scope::Results => &mut self.results,
         };
         table.retain(|(k, a)| *a != action && *k != combo);
         table.push((combo, action));

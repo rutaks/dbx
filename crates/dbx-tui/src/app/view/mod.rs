@@ -4,6 +4,9 @@
 mod form;
 mod panel;
 mod results;
+mod viewer;
+
+pub(crate) use results::cell_text;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -40,12 +43,15 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     draw_editor(app, &p, buf, &hits);
     draw_results(app, &p, buf, &hits);
     app.ui.mode_hints = draw_mode_bar(app, &p, buf, &hits);
-    draw_notice(app, &p, buf);
+    // (The viewer says what a copy did inside its own box.)
+    if !matches!(app.ui.overlay, Some(Overlay::CellViewer(_))) {
+        draw_notice(app, &p, buf);
+    }
     // The overlay comes last, over everything else dimmed.
     let drawn = match &mut app.ui.overlay {
         Some(overlay) => {
             panel::dim(buf, buf.area);
-            draw_overlay(overlay, &p, buf)
+            draw_overlay(overlay, &app.ui.keys, app.ui.notice.as_ref(), &p, buf)
         }
         None => Drawn::default(),
     };
@@ -60,7 +66,7 @@ pub(super) struct Drawn {
     pub fields: Vec<FieldHit>,
 }
 
-fn draw_overlay(overlay: &mut Overlay, p: &Painter, buf: &mut Buffer) -> Drawn {
+fn draw_overlay(overlay: &mut Overlay, keys: &super::keys::Keybinds, notice: Option<&super::query::Notice>, p: &Painter, buf: &mut Buffer) -> Drawn {
     let buttons = overlay.buttons();
     match overlay {
         Overlay::Error(e) => {
@@ -92,7 +98,17 @@ fn draw_overlay(overlay: &mut Overlay, p: &Painter, buf: &mut Buffer) -> Drawn {
             let buttons = message_box(p, buf, "Close this tab's session?", &message, buttons, Role::Red, Role::Red);
             Drawn { buttons, fields: Vec::new() }
         }
+        Overlay::ConfirmRerun(ask) => {
+            let message = format!(
+                "Load more runs the statement again: {}. It calls functions that may change data, and dbx cannot \
+                 tell that it is safe to repeat. Run it again?",
+                ask.statement
+            );
+            let buttons = message_box(p, buf, "Run the statement again?", &message, buttons, Role::Red, Role::Red);
+            Drawn { buttons, fields: Vec::new() }
+        }
         Overlay::Form(form) => form::draw(form, buttons, p, buf),
+        Overlay::CellViewer(v) => viewer::draw(v, keys, notice, p, buf),
     }
 }
 
@@ -162,7 +178,7 @@ impl<'a> Painter<'a> {
         }
         let room = self.bounds.right().saturating_sub(x) as usize;
         let text = display_safe(text);
-        let total = UnicodeWidthStr::width(text.as_str());
+        let total = drawn_width(&text);
         let limit = if total > room { room.saturating_sub(1) } else { room };
         let (mut cx, mut used) = (x, 0usize);
         for g in text.graphemes(true) {
@@ -324,8 +340,17 @@ fn draw_scrollbar(p: &Painter, buf: &mut Buffer, track: Rect, total: usize, scro
 }
 
 /// The text `s` takes on screen, as drawn (control characters replaced).
-fn width_of(s: &str) -> u16 {
-    UnicodeWidthStr::width(display_safe(s).as_str()) as u16
+pub(crate) fn width_of(s: &str) -> u16 {
+    drawn_width(&display_safe(s)).min(u16::MAX as usize) as u16
+}
+
+/// The cells `safe` (already `display_safe`) takes as `Painter::put` draws it:
+/// the sum of its graphemes' widths, zero-width ones skipped. The width of the
+/// whole string can differ (a lam-alef pair counts one cell as a string and
+/// two as the graphemes it is drawn as), so every measure of text that is
+/// then drawn goes through this one function.
+pub(crate) fn drawn_width(safe: &str) -> usize {
+    safe.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
 
 /// Writes `right` against the right edge of `row` (one column of margin) and
@@ -423,6 +448,10 @@ fn draw_column(p: &Painter, buf: &mut Buffer, row: Rect, base: u16, label_x: u16
 pub const NULL_MARK: &str = "∅";
 /// A line break inside a cell.
 pub const NEWLINE_MARK: &str = "⏎";
+/// A tab inside a cell.
+pub const TAB_MARK: &str = "⇥";
+/// A cell the row does not have (it is shorter than the header).
+pub const MISSING_MARK: &str = "⊘";
 
 /// Marks a primary key column.
 pub const KEY_MARK: &str = "◆";
@@ -469,7 +498,7 @@ fn editor_placeholder(app: &App) -> String {
 }
 
 /// The results title sits on the divider: `├─ results ────` in `surface_dim`.
-fn draw_results(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
+fn draw_results(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     let r = hits.results;
     if r.is_empty() {
         return;
@@ -486,6 +515,13 @@ fn draw_results(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     pr.title(buf, r.x + 1, r.y, " results ", app.ui.focus == PaneId::Results);
     let area = Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(1), r.height.saturating_sub(1));
     results::draw(app, p, buf, area.intersection(r));
+    // Where the cursor is, on the divider row, against the right edge.
+    if let Some(text) = results::position(app) {
+        let x = r.right().saturating_sub(width_of(&text) + 1);
+        if x > r.x + 12 {
+            pr.put(buf, x, r.y, &text, pr.fg(Role::Overlay0));
+        }
+    }
 }
 
 /// The hints for the mode bar in normal mode: only keys that work now.
@@ -515,6 +551,9 @@ fn normal_hints(app: &App) -> Vec<Hint> {
         hints.extend(one(Action::RunDirect, "run"));
         hints.push(prefix);
         return hints;
+    }
+    if app.ui.focus == PaneId::Results {
+        return results_hints(app, hints, prefix);
     }
     if app.ui.focus != PaneId::Sidebar || !matches!(&app.model.connections, Loadable::Ready(_)) {
         hints.push(prefix);
@@ -550,6 +589,41 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     }
     hints.push(Hint { keys: moves, desc: "move" });
     general_hints(app, hints)
+}
+
+/// The results pane's hints, from the live bindings: what the cursor's cell
+/// can do (view, copy, load more when the result was cut), then moving. Only
+/// while the pane shows rows; otherwise the prefix alone. A hint that does not
+/// fit is dropped, and the ones after it, so the most useful come first.
+fn results_hints(app: &App, mut hints: Vec<Hint>, prefix: Hint) -> Vec<Hint> {
+    let Some(set) = super::grid::shown(&app.tab().outcome) else {
+        hints.push(prefix);
+        return hints;
+    };
+    let keys = &app.ui.keys;
+    let one = |action: Action, desc: &'static str| keys.key_for(action).map(|k| Hint { keys: vec![(k, action)], desc });
+    let several = |actions: &[Action], desc: &'static str| Hint {
+        keys: actions.iter().filter_map(|a| keys.key_for(*a).map(|k| (k, *a))).collect(),
+        desc,
+    };
+    if !set.rows.is_empty() {
+        hints.extend(one(Action::OpenCell, "view"));
+        hints.extend(one(Action::CopyCell, "copy"));
+        hints.extend(one(Action::CopyRow, "copy row"));
+        // Not offered where the key could only be refused (a run in flight, a
+        // write, another session, the ceiling).
+        if set.truncated && app.load_more_refusal().is_none() {
+            hints.extend(one(Action::LoadMore, "more"));
+        }
+        hints.push(several(&[Action::GridLeft, Action::GridDown, Action::GridUp, Action::GridRight], "move"));
+    }
+    hints.push(prefix);
+    if !set.rows.is_empty() {
+        hints.push(several(&[Action::GridPageDown, Action::GridPageUp], "page"));
+        hints.push(several(&[Action::GridFirstRow, Action::GridLastRow], "top/bottom"));
+    }
+    hints.retain(|h| !h.keys.is_empty());
+    hints
 }
 
 /// The hints that apply wherever the cursor is, after `hints`: adding a
@@ -688,7 +762,7 @@ pub(super) fn affected_text(n: u64) -> String {
 }
 
 /// A count with thousands separators: `1,000`.
-pub(super) fn thousands(n: usize) -> String {
+pub(crate) fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {

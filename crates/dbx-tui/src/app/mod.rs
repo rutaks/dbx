@@ -4,6 +4,7 @@
 mod connection_ui;
 pub mod editor;
 pub mod form;
+pub mod grid;
 pub mod keys;
 pub mod layout;
 pub mod overlay;
@@ -13,6 +14,7 @@ pub mod sidebar;
 pub mod text_field;
 pub mod theme;
 pub mod tree;
+pub mod viewer;
 pub(crate) mod view;
 
 #[cfg(test)]
@@ -21,6 +23,8 @@ mod cancel_tests;
 mod connections_tests;
 #[cfg(test)]
 mod form_tests;
+#[cfg(test)]
+mod grid_tests;
 #[cfg(test)]
 mod run_tests;
 #[cfg(test)]
@@ -142,6 +146,8 @@ pub struct Ui {
     /// The SQL editor of the query tab.
     pub editor: editor::Editor,
     pub notice: Option<Notice>,
+    /// The results pane's cell cursor and window.
+    pub grid: grid::GridUi,
     /// The `now` of the last update: what the view measures elapsed time by.
     pub now: Option<Instant>,
 }
@@ -202,6 +208,10 @@ pub enum Command {
     /// End one session of a query tab, on one database, once a run still in
     /// flight in it has ended (or a moment has passed). Fire and forget.
     CloseSession(SessionId, DatabasePath),
+    /// Put this text on the user's clipboard. Fire and forget. The text is
+    /// cell data: the shell must carry it so the terminal cannot read it as
+    /// anything but the clipboard's content (OSC 52 base64).
+    CopyToClipboard(String),
     Quit,
 }
 
@@ -246,6 +256,7 @@ impl App {
                 note: None,
                 editor: editor::Editor::new(),
                 notice: None,
+                grid: grid::GridUi::default(),
                 now: None,
             },
         }
@@ -345,7 +356,7 @@ impl App {
                         PaneId::Sidebar => self.on_sidebar_key(combo, fx),
                         // The editor takes text: every other key is its own.
                         PaneId::Editor => fx.repaint |= self.ui.editor.key(key),
-                        PaneId::Results => {}
+                        PaneId::Results => self.on_results_key(combo, now, fx),
                     }
                 }
             }
@@ -415,6 +426,19 @@ impl App {
                 let down = mouse.kind == MouseEventKind::ScrollDown;
                 self.scroll_sidebar(if down { WHEEL_ROWS } else { -WHEEL_ROWS }, fx);
             }
+            // Over the results: the wheel scrolls rows, and with shift (or a
+            // horizontal wheel, where the terminal reports one) columns.
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if self.ui.hits.results.contains(at) => {
+                let step = if mouse.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
+                if mouse.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                    self.scroll_grid(0, step, fx);
+                } else {
+                    self.scroll_grid(WHEEL_ROWS * step, 0, fx);
+                }
+            }
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight if self.ui.hits.results.contains(at) => {
+                self.scroll_grid(0, if mouse.kind == MouseEventKind::ScrollRight { 1 } else { -1 }, fx);
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 // A hint in the mode bar does what its key does.
                 if let Some(hit) = self.ui.mode_hints.iter().find(|h| h.rect.contains(at)).copied() {
@@ -429,6 +453,9 @@ impl App {
                 if self.ui.hits.sidebar_list.contains(at) {
                     self.click_sidebar_row(mouse.column, mouse.row, now, fx);
                 }
+                if self.ui.hits.results.contains(at) {
+                    self.click_grid(mouse.column, mouse.row, fx);
+                }
             }
             _ => {}
         }
@@ -439,6 +466,9 @@ impl App {
             return;
         }
         let combo = KeyCombo::from_event(&key);
+        if matches!(self.ui.overlay, Some(Overlay::CellViewer(_))) {
+            return self.on_viewer_key(combo, fx);
+        }
         let Some(overlay) = &self.ui.overlay else { return };
         let action = overlay.buttons().iter().find(|b| KeyCombo::parse(b.key) == Some(combo)).map(|b| b.action);
         if let Some(action) = action {
@@ -453,6 +483,11 @@ impl App {
     }
 
     fn on_overlay_mouse(&mut self, mouse: MouseEvent, fx: &mut Effects) {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => return self.scroll_viewer(WHEEL_ROWS, fx),
+            MouseEventKind::ScrollUp => return self.scroll_viewer(-WHEEL_ROWS, fx),
+            _ => {}
+        }
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
         }
@@ -497,6 +532,14 @@ impl App {
             }
             OverlayAction::RemoveYes => self.confirm_remove(fx),
             OverlayAction::DropSessionYes => self.drop_session(fx),
+            OverlayAction::RerunYes => self.confirm_rerun(fx),
+            OverlayAction::ViewerCopy => self.copy_viewer(fx),
+            OverlayAction::ViewerToggleRaw => {
+                if let Some(Overlay::CellViewer(v)) = &mut self.ui.overlay {
+                    v.toggle_raw();
+                }
+                fx.repaint = true;
+            }
             OverlayAction::Dismiss => {
                 self.ui.overlay = None;
                 fx.repaint = true;
@@ -522,7 +565,7 @@ impl App {
             (Target::TestConnection(serial), CoreReply::Tested(result)) => self.on_tested(serial, result),
             (Target::SaveConnection(serial), CoreReply::Saved(result)) => self.on_saved(serial, result, fx),
             (Target::RemoveConnection(id), CoreReply::Removed(result)) => self.on_removed(id, result, fx),
-            (Target::Run(_), CoreReply::Ran(result)) => self.on_ran(result),
+            (Target::Run(_), CoreReply::Ran(result)) => self.on_ran(result, fx),
             (Target::Children(node), CoreReply::Listed(result)) => {
                 if !self.on_listed(node, result, fx) {
                     return;

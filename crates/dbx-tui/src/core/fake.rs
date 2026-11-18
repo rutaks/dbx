@@ -322,6 +322,7 @@ mod tests {
             messages: vec![],
             affected: 0,
             ran: "select 1".into(),
+            rerun: crate::core::Rerun::Proven,
         }
     }
 

@@ -902,3 +902,136 @@ async fn closing_the_session_of_a_run_whose_cancel_is_slow_leaves_no_connection_
     eprintln!("OBSERVED pagila connections while running {during:?}, after {after:?}");
     assert_eq!(after.len(), during.len() - 1, "no connection is left, or opened again, for the closed session");
 }
+
+// ---- slice 07: the result grid's tables, the row cap and "rerunnable" -------
+
+async fn run_capped(core: &DbxCore, id: &ConnectionId, sql: &str, cap: usize) -> dbx_tui::core::ResultSet {
+    let request = RunRequest { row_cap: cap, ..run_request(id, "edge", 1, sql) };
+    core.run(RunId(rand_id()), request).await.unwrap_or_else(|e| panic!("{sql}: {e}"))
+}
+
+#[tokio::test]
+async fn only_a_proven_select_comes_back_rerunnable_and_one_calling_functions_is_unproven() {
+    use dbx_tui::core::Rerun::{Proven, ReadOnlyUnproven, Write};
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    for (sql, want) in [
+        ("select id from text_values order by id", Proven),
+        ("with t as (select 1 as a) select * from t", Proven),
+        ("values (1), (2)", Proven),
+        ("table text_values", Proven),
+        // Read-only to dbx's denylist, but a function it cannot vouch for.
+        ("select set_config('dbxtui.scratch', '1', false)", ReadOnlyUnproven),
+        // Writes that change nothing here (no row matches), but that dbx and we
+        // still know must not be repeated.
+        ("update text_values set v = v where false returning id", Write),
+        ("delete from text_values where false returning id", Write),
+        ("with d as (delete from text_values where false returning id) select * from d", Write),
+        ("select * from text_values for update", Write),
+    ] {
+        let set = run_capped(&core, &id, sql, 10).await;
+        assert_eq!(set.rerun, want, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn the_120_column_table_comes_back_whole_and_every_cell_names_its_own_column_and_row() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let started = std::time::Instant::now();
+    let set = run_capped(&core, &id, "select * from wide_120 order by id", DEFAULT_ROW_CAP).await;
+    eprintln!("OBSERVED wide_120: {} columns x {} rows in {:?}; c003 of row 7: {:?}", set.columns.len(), set.rows.len(), started.elapsed(), set.rows[6][3]);
+    assert_eq!((set.columns.len(), set.rows.len(), set.truncated), (121, 400, false));
+    assert_eq!(set.columns[1].name, "c001");
+    assert_eq!(set.columns[120].name, "c120");
+    let kinds: Vec<CellKind> = set.columns.iter().skip(1).take(4).map(|c| c.kind).collect();
+    assert_eq!(kinds, vec![CellKind::Text, CellKind::Decimal, CellKind::Json, CellKind::Integer]);
+    for (r, row) in set.rows.iter().enumerate() {
+        let id = r + 1;
+        assert_eq!(row.len(), 121, "row {id} is as wide as the header");
+        for (n, cell) in row.iter().enumerate().skip(1) {
+            let cell = match cell {
+                Cell::Value(v) => v.clone(),
+                Cell::Null => panic!("c{n:03} of row {id} is NULL"),
+            };
+            match n % 4 {
+                1 => assert_eq!(cell, format!("c{n:03}-r{id:03}")),
+                2 => assert_eq!(cell, format!("{}.50", n * 1000 + id)),
+                3 => assert!(cell.replace(' ', "").contains(&format!("\"c\":{n}")) && cell.contains(&format!("{id}")), "{cell}"),
+                _ => assert_eq!(cell, (n * 1000 + id).to_string()),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_million_row_table_is_cut_at_the_cap_and_a_larger_cap_gives_the_same_rows_first() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let sql = "select id, txt, num from million_rows order by id";
+    let small = run_capped(&core, &id, sql, 1_000).await;
+    let started = std::time::Instant::now();
+    let big = run_capped(&core, &id, sql, 2_000).await;
+    eprintln!("OBSERVED million_rows: cap 1,000 in {:?}, cap 2,000 in {:?}", small.elapsed, started.elapsed());
+    assert_eq!((small.rows.len(), small.truncated), (1_000, true));
+    assert_eq!((big.rows.len(), big.truncated), (2_000, true));
+    assert_eq!(big.rows[..1_000], small.rows[..], "the first rows are the same ones: load more only appends");
+    assert_eq!(texts(&big.rows)[1_999][1].as_deref(), Some("row 2000"));
+    assert!(small.rerun == dbx_tui::core::Rerun::Proven && big.rerun == dbx_tui::core::Rerun::Proven);
+    assert_eq!(big.ran, sql, "the statement that ran is what load more repeats");
+    let all = run_capped(&core, &id, "select id from million_rows where id <= 1500 order by id", 2_000).await;
+    assert_eq!((all.rows.len(), all.truncated), (1_500, false), "not cut when the cap is not reached");
+}
+
+#[tokio::test]
+async fn wide_and_combining_text_comes_back_exactly() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let set = run_capped(&core, &id, "select id, v from width_text order by id", 100).await;
+    let v: Vec<String> = texts(&set.rows).into_iter().map(|r| r[1].clone().unwrap()).collect();
+    assert_eq!(v[1], "日本語のテキスト");
+    assert_eq!(v[4], "e\u{301}e\u{301}e\u{301} a\u{308}");
+    assert_eq!(v[5], "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}");
+    assert_eq!(v[9], "\u{1F1EF}\u{1F1F5}");
+    assert_eq!(v[7], "ｱｲｳｴｵ");
+}
+
+/// Loads a million rows once and reports what it cost. Not part of the suite
+/// (`cargo test -p dbx-tui --test live -- --ignored observe`): it takes a few
+/// seconds and a few hundred megabytes.
+#[tokio::test]
+#[ignore]
+async fn observe_loading_a_million_rows() {
+    require_fixtures().await;
+    let rss = || {
+        let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().unwrap_or(0)
+    };
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let _warm = run_capped(&core, &id, "select 1", 10).await;
+    for cap in [1_000, 10_000, 100_000, 1_000_000] {
+        let before = rss();
+        let started = std::time::Instant::now();
+        let set = run_capped(&core, &id, "select id, txt, num from million_rows order by id", cap).await;
+        let took = started.elapsed();
+        let held = rss();
+        eprintln!(
+            "OBSERVED cap {cap}: {} rows in {took:?}; rss {} MB -> {} MB while held ({} bytes per row)",
+            set.rows.len(),
+            before / 1024,
+            held / 1024,
+            held.saturating_sub(before) * 1024 / set.rows.len() as u64
+        );
+        drop(set);
+    }
+}

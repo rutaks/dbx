@@ -25,14 +25,34 @@ pub use terminal::TerminalGuard;
 
 /// The Core calls in flight, by request, so the app can abandon one: aborting
 /// the task drops the Core's future, which is what stops a slow listing.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Tasks {
+    /// Where `Command::CopyToClipboard` text goes: the terminal, in the
+    /// client; nowhere, unless a test gives one.
+    clipboard: ClipboardSink,
     calls: Arc<Mutex<HashMap<RequestId, AbortHandle>>>,
     /// Session closes still running, for quitting to wait on.
     closing: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// The run in flight in each session, with its connection: true once it
     /// has ended (or its task is gone).
     runs: Arc<Mutex<HashMap<SessionId, RunEntry>>>,
+}
+
+/// What puts text on the clipboard.
+pub type ClipboardSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+impl Default for Tasks {
+    fn default() -> Self {
+        Tasks { clipboard: Arc::new(|_| {}), calls: Default::default(), closing: Default::default(), runs: Default::default() }
+    }
+}
+
+impl Tasks {
+    /// The same tasks, copying through `sink`.
+    pub fn with_clipboard(mut self, sink: ClipboardSink) -> Self {
+        self.clipboard = sink;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -150,7 +170,7 @@ pub async fn run(core: Arc<dyn Core>) -> io::Result<Option<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<(RequestId, CoreReply)>();
     let mut events = EventStream::new();
     let mut app = App::new();
-    let tasks = Tasks::default();
+    let tasks = Tasks::default().with_clipboard(Arc::new(terminal::copy_to_terminal));
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -207,6 +227,7 @@ pub(crate) fn execute(
     for command in commands {
         match command {
             Command::Quit => quit = true,
+            Command::CopyToClipboard(text) => (tasks.clipboard)(&text),
             Command::Cancel(run) => core.cancel(run),
             Command::Abandon(id) => tasks.abandon(id),
             Command::Release(at) => {
@@ -325,6 +346,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_copy_command_reaches_the_clipboard_sink_with_the_exact_text_and_touches_no_core_call() {
+        let fake = Arc::new(FakeCore::new());
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let tasks = Tasks::default().with_clipboard(Arc::new(move |text: &str| sink.lock().unwrap().push(text.to_string())));
+        let quit = execute(vec![Command::CopyToClipboard("a\tb\u{1b}[0m".into()), Command::CopyToClipboard(String::new())], &core, &tx, &tasks);
+        assert!(!quit);
+        assert_eq!(*seen.lock().unwrap(), vec!["a\tb\u{1b}[0m".to_string(), String::new()]);
+        assert!(fake.calls().is_empty() && rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn a_release_command_reaches_the_core_and_waits_for_nothing() {
         use crate::core::{ConnectionId, DatabasePath};
         let fake = Arc::new(FakeCore::new());
@@ -426,7 +461,7 @@ mod tests {
         let fake = Arc::new(FakeCore::new());
         // A run that ignores nothing but takes a second to wind down.
         fake.script_run(Scripted::ok(crate::core::ResultSet {
-            columns: vec![], rows: vec![], truncated: false, elapsed: Duration::ZERO, messages: vec![], affected: 0, ran: String::new(),
+            columns: vec![], rows: vec![], truncated: false, elapsed: Duration::ZERO, messages: vec![], affected: 0, ran: String::new(), rerun: crate::core::Rerun::Proven,
         }).after(Duration::from_secs(1)));
         fake.script_close_session(Scripted::ok(()));
         let core: Arc<dyn Core> = fake.clone();

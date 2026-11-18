@@ -142,7 +142,7 @@ key Enter
 type_sql "select 'after ctrl+c' as after_06"
 key F5
 wait_for 13-after '1 row' 4
-expect after "^ *│ after ctrl\+c"
+expect after "^ *│ +1 +after ctrl\+c"  # row 1: the gutter comes first
 expect_not after 'earlier run'
 
 # ---- 2. the prefix, then c, from the sidebar -----------------------------------
@@ -162,7 +162,7 @@ key Enter
 type_sql "select 'after the prefix' as after_06"
 key F5
 wait_for 23-after '1 row' 4
-expect after-prefix "^ *│ after the prefix"
+expect after-prefix "^ *│ +1 +after the prefix"
 
 # ---- 3. a cancel that does not land ----------------------------------------------
 key C-g h

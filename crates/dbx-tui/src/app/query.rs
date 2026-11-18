@@ -41,6 +41,20 @@ pub struct QueryTab {
     /// given another target or lost its connection mid-cancel): each may
     /// still be running on the server until its stale reply says it ended.
     pub abandoned: Vec<Abandoned>,
+    /// The session serial the outcome's rows were fetched in: "load more"
+    /// re-runs a statement, and in another session the `SET` values and
+    /// temporary tables it relied on are gone.
+    pub result_session: u32,
+    /// The run in flight, if it is "load more" of the shown result.
+    pub loading_more: Option<LoadMore>,
+}
+
+/// A "load more" run in flight: the result it replaces stays on screen,
+/// navigable, until it lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadMore {
+    /// The row cap it runs with.
+    pub cap: usize,
 }
 
 /// A run the tab let go of before it ended.
@@ -59,7 +73,7 @@ impl QueryTab {
     }
 
     pub fn new(id: TabId) -> Self {
-        QueryTab { id, target: None, session: 1, run: RunState::Idle, outcome: None, abandoned: Vec::new() }
+        QueryTab { id, target: None, session: 1, run: RunState::Idle, outcome: None, abandoned: Vec::new(), result_session: 1, loading_more: None }
     }
 }
 
@@ -237,6 +251,7 @@ impl App {
         }
         tab.target = to;
         tab.outcome = None;
+        tab.loading_more = None;
         // Nothing of the old target's runs is shown for the new one.
         tab.run = RunState::Idle;
         fx.repaint = true;
@@ -252,6 +267,7 @@ impl App {
             self.model.requests.supersede(Target::Run(id));
             self.remember_abandoned(request);
             self.tab_mut().run = RunState::Idle;
+            self.tab_mut().loading_more = None;
             if matches!(self.ui.overlay, Some(Overlay::ConfirmDropSession(_))) {
                 self.ui.overlay = None;
             }
@@ -296,6 +312,7 @@ impl App {
             t.run = RunState::Idle;
             t.target = None;
             t.outcome = None;
+            t.loading_more = None;
             fx.repaint = true;
         }
     }
@@ -352,6 +369,8 @@ impl App {
                 let tab = self.tab().id;
                 self.model.requests.supersede(Target::Run(tab));
                 self.tab_mut().run = RunState::Cancelling { run, request, started, asked: now, stuck: false };
+                // The rows on screen are the old result; there is no more coming.
+                self.tab_mut().loading_more = None;
                 fx.repaint = true;
             }
             RunState::Cancelling { .. } => {
@@ -428,23 +447,75 @@ impl App {
     }
 
     /// The reply to the tab's current run.
-    pub(super) fn on_ran(&mut self, result: Result<crate::core::ResultSet, CoreError>) {
+    pub(super) fn on_ran(&mut self, result: Result<crate::core::ResultSet, CoreError>, fx: &mut Effects) {
         let now = self.ui.now;
         let tab = self.tab_mut();
         let elapsed = match (now, tab.run.in_flight()) {
             (Some(now), Some((_, _, started))) => now.saturating_duration_since(started),
             _ => Duration::ZERO,
         };
+        let more = tab.loading_more.take();
         tab.run = RunState::Idle;
-        match result {
-            Ok(set) => tab.outcome = Some(Outcome::Rows(set)),
+        match (result, more) {
+            // "Load more" landed: the cursor stays on its row and column.
+            (Ok(set), Some(_)) => self.more_landed(set, fx),
+            // It failed or was cut short: the rows on screen are still the
+            // result, and the user is told.
+            (Err(error), Some(_)) if error.kind != CoreErrorKind::Cancelled => {
+                let what = if error.kind == CoreErrorKind::Timeout { "timed out" } else { "failed" };
+                self.notify(format!("Load more {what}: {}", error.message), true, fx);
+            }
+            (Err(_), Some(_)) => {
+                let tab = self.tab_mut();
+                tab.run = RunState::Cancelled { after: elapsed, statement: None, how: CancelEnd::Stopped };
+            }
+            (Ok(set), None) => {
+                let tab = self.tab_mut();
+                tab.result_session = tab.session;
+                tab.outcome = Some(Outcome::Rows(set));
+                // A new result: back to the corner, nothing measured.
+                self.ui.grid.reset();
+            }
             // Cancelled by something other than this tab (it would have made
             // the reply stale): the run is over, and gave nothing to show.
-            Err(error) if error.kind == CoreErrorKind::Cancelled => {
+            (Err(error), None) if error.kind == CoreErrorKind::Cancelled => {
                 tab.run = RunState::Cancelled { after: elapsed, statement: error.statement, how: CancelEnd::Stopped };
             }
-            Err(error) if error.kind == CoreErrorKind::Timeout => tab.outcome = Some(Outcome::TimedOut { error, elapsed }),
-            Err(error) => tab.outcome = Some(Outcome::Failed { error, elapsed }),
+            (Err(error), None) if error.kind == CoreErrorKind::Timeout => tab.outcome = Some(Outcome::TimedOut { error, elapsed }),
+            (Err(error), None) => tab.outcome = Some(Outcome::Failed { error, elapsed }),
+        }
+    }
+
+    /// The rows of a "load more" arrived. They replace the result; the cursor
+    /// stays on the same row and column, and is brought back inside the new
+    /// result (with a notice) if the data changed and it is now shorter.
+    fn more_landed(&mut self, set: ResultSet, fx: &mut Effects) {
+        let (rows, cols) = (set.rows.len(), set.columns.len());
+        // Load more only appends rows: what was on screen should be the start
+        // of what came back. Compared once, here, not per frame.
+        let changed = match super::grid::shown(&self.model.tabs[0].outcome) {
+            Some(old) => old.columns != set.columns || rows < old.rows.len() || old.rows[..] != set.rows[..old.rows.len()],
+            None => false,
+        };
+        let g = &mut self.ui.grid;
+        let row_moved = g.row >= rows.max(1);
+        g.row = g.row.min(rows.saturating_sub(1));
+        g.col = g.col.min(cols.saturating_sub(1));
+        // The rows changed under the column widths and the window.
+        g.widths.clear();
+        let loaded = rows;
+        let tab = self.tab_mut();
+        tab.result_session = tab.session;
+        tab.outcome = Some(Outcome::Rows(set));
+        let loaded_text = super::view::thousands(loaded);
+        if changed {
+            let mut text = "The rows changed since the last run.".to_string();
+            if row_moved {
+                text.push_str(&format!(" The statement now returns {loaded_text} rows, so the cursor moved to the last."));
+            }
+            self.notify(text, false, fx);
+        } else {
+            self.notify(format!("Loaded {loaded_text} rows."), false, fx);
         }
     }
 

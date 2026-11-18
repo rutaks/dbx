@@ -43,6 +43,29 @@ pub fn frame_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
     (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect()
 }
 
+/// The screen as one string per row, as a terminal shows it: the cell a wide
+/// character covers is skipped, so a row reads as text (`日本語`, not
+/// `日 本 語`), and the width of a prefix is its column.
+pub fn frame_text(app: &mut App, w: u16, h: u16) -> Vec<String> {
+    let buf = render(app, w, h);
+    (0..h)
+        .map(|y| {
+            let mut row = String::new();
+            let mut skip = 0;
+            for x in 0..w {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                let symbol = buf[(x, y)].symbol();
+                skip = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
+                row.push_str(symbol);
+            }
+            row
+        })
+        .collect()
+}
+
 /// Where `text` first appears on screen.
 pub fn find_text(app: &mut App, w: u16, h: u16, text: &str) -> Option<(u16, u16)> {
     frame_rows(app, w, h).iter().enumerate().find_map(|(y, row)| {
@@ -95,4 +118,11 @@ pub fn click(app: &mut App, rect: Rect) -> Effects {
     let down = app.update(Event::Mouse(ev(MouseEventKind::Down(MouseButton::Left))), base());
     let up = app.update(Event::Mouse(ev(MouseEventKind::Up(MouseButton::Left))), base());
     Effects { repaint: down.repaint || up.repaint, commands: [down.commands, up.commands].concat() }
+}
+
+/// Whether the cell at (x, y) is dimmed, as the screen behind an overlay is.
+pub fn dimmed_at(app: &mut App, x: u16, y: u16) -> bool {
+    let area = app.ui.hits.area;
+    let (w, h) = if area.width == 0 { (100, 30) } else { (area.width, area.height) };
+    render(app, w, h)[(x, y)].modifier.contains(ratatui::style::Modifier::DIM)
 }

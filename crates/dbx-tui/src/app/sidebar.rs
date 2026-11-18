@@ -465,6 +465,7 @@ impl App {
                 self.ui.mode = Mode::Prefix { expires: now + self.ui.prefix_timeout };
                 fx.repaint = true;
             }
+            a if a.scope() == super::keys::Scope::Results => self.perform_results(a, now, fx),
             a if a.scope() != super::keys::Scope::Sidebar => self.perform(a, now, fx),
             a => self.perform_sidebar(a, fx),
         }
