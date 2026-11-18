@@ -14,7 +14,7 @@ use async_trait::async_trait;
 pub use dbx::{DbxCore, KeySource, StoreOptions};
 #[cfg(feature = "test-support")]
 pub use dbx::check_seed_dir;
-pub use fake::{Call, FakeCore, Scripted};
+pub use fake::{Call, FakeCore, Scripted, SyntaxCalls};
 
 // ---- identifiers -----------------------------------------------------------
 
@@ -263,6 +263,47 @@ fn byte_offset(buffer: &str, at: Cursor) -> usize {
     buffer.len()
 }
 
+/// Where the statement `text` (what dbx's statement finder returned for
+/// `cursor`) is in `buffer`: its first and last position, the end exclusive.
+/// dbx returns only the text, so it is searched for. When it occurs once that
+/// is the place; when it occurs several times the one the caret is in or at
+/// the edge of; when there is no such copy, or none at all, `None`.
+pub fn locate_statement(buffer: &str, cursor: Cursor, text: &str) -> Option<(Cursor, Cursor)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // Every place the text occurs (copies may overlap).
+    let mut found: Vec<usize> = Vec::new();
+    let mut from = 0;
+    while let Some(i) = buffer[from..].find(text) {
+        found.push(from + i);
+        from += i + buffer[from + i..].chars().next().map_or(1, char::len_utf8);
+    }
+    let at = byte_offset(buffer, cursor);
+    let start = match found.as_slice() {
+        [] => return None,
+        [only] => *only,
+        many => {
+            let mut holding = many.iter().filter(|&&s| s <= at && at <= s + text.len());
+            match (holding.next(), holding.next()) {
+                (Some(&s), None) => s,
+                _ => return None,
+            }
+        }
+    };
+    Some((cursor_at(buffer, start), cursor_at(buffer, start + text.len())))
+}
+
+/// The position of byte `index` of `buffer`: its row, and the character
+/// within the row.
+fn cursor_at(buffer: &str, index: usize) -> Cursor {
+    let before = &buffer[..index];
+    let row = before.matches('\n').count();
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    Cursor { row, col: before[line_start..].chars().count() }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellKind {
     Integer,
@@ -411,9 +452,27 @@ impl std::error::Error for CoreError {}
 
 // ---- the seam --------------------------------------------------------------
 
+/// What the editor asks of dbx that needs no I/O: answered at once from data
+/// compiled into the client, so the view can ask while it draws. The app
+/// caches the answers (types once per kind of database, the statement range
+/// once per text and caret), so nothing here is asked per frame.
+pub trait Syntax: Send + Sync {
+    /// The names of the data types of a kind of database
+    /// (`list_dialect_type_names`).
+    fn type_names(&self, kind: &DbKind) -> Vec<String>;
+
+    /// Where in `buffer` the statement a run would send is, with the caret at
+    /// `cursor` and nothing selected. It is the statement `Core::run` picks
+    /// (the same function), located in the buffer; `None` when there is no
+    /// statement, or when its text cannot be placed unambiguously (the same
+    /// text more than once and the caret in none of the copies, say): then no
+    /// outline is drawn rather than a wrong one.
+    fn statement_range(&self, kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)>;
+}
+
 /// Everything the client asks of dbx (design sections 2 and 10).
 #[async_trait]
-pub trait Core: Send + Sync {
+pub trait Core: Syntax {
     async fn connections(&self) -> Result<Vec<Connection>, CoreError>;
     async fn save_connection(&self, draft: &ConnectionDraft) -> Result<Connection, CoreError>;
     async fn remove_connection(&self, id: &ConnectionId) -> Result<(), CoreError>;
@@ -471,5 +530,56 @@ mod tests {
         assert_eq!(text_between(buffer, at(0, 7), at(2, 6)), "1;\nselect 'é😀' as x;\nselect");
         assert_eq!(text_between(buffer, at(2, 0), at(2, 99)), "select 3;", "clamped");
         assert_eq!(text_between(buffer, at(1, 2), at(1, 2)), "");
+    }
+
+    fn range(a: (usize, usize), b: (usize, usize)) -> Option<(Cursor, Cursor)> {
+        Some((at(a.0, a.1), at(b.0, b.1)))
+    }
+
+    #[test]
+    fn a_statement_that_occurs_once_is_found_wherever_the_caret_is() {
+        let buffer = "select 1;\nselect 2\n  from t;\nselect 3;";
+        for cursor in [at(1, 0), at(2, 3), at(0, 4), at(3, 9)] {
+            assert_eq!(locate_statement(buffer, cursor, "select 2\n  from t"), range((1, 0), (2, 8)), "{cursor:?}");
+        }
+    }
+
+    #[test]
+    fn the_text_dbx_returns_is_trimmed_before_it_is_searched_for() {
+        let buffer = "select 1;\n\n  select 2;";
+        assert_eq!(locate_statement(buffer, at(2, 3), "\n  select 2;\n"), range((2, 2), (2, 11)));
+        assert_eq!(locate_statement(buffer, at(2, 3), "   "), None);
+        assert_eq!(locate_statement(buffer, at(2, 3), ""), None);
+    }
+
+    #[test]
+    fn positions_are_characters_even_after_multi_byte_text() {
+        let buffer = "select 'é😀', 'x';\nselect 2;";
+        assert_eq!(locate_statement(buffer, at(1, 2), "select 2;"), range((1, 0), (1, 9)));
+        assert_eq!(locate_statement(buffer, at(0, 3), "select 'é😀', 'x';"), range((0, 0), (0, 17)));
+    }
+
+    #[test]
+    fn a_statement_that_occurs_twice_is_the_copy_the_caret_is_in() {
+        let buffer = "select 1;\nselect 1;\nselect 2;";
+        assert_eq!(locate_statement(buffer, at(0, 3), "select 1;"), range((0, 0), (0, 9)));
+        assert_eq!(locate_statement(buffer, at(1, 3), "select 1;"), range((1, 0), (1, 9)));
+        assert_eq!(locate_statement(buffer, at(1, 9), "select 1;"), range((1, 0), (1, 9)), "at its end");
+    }
+
+    #[test]
+    fn a_statement_that_occurs_twice_with_the_caret_in_neither_is_not_placed() {
+        let buffer = "select 1;\n\nselect 1;";
+        assert_eq!(locate_statement(buffer, at(1, 0), "select 1;"), None, "on the blank line between them");
+        // A copy inside another statement does not make a text ambiguous for a caret in the longer one.
+        let buffer = "select 1 from t;\nselect 1";
+        assert_eq!(locate_statement(buffer, at(1, 2), "select 1"), range((1, 0), (1, 8)));
+        assert_eq!(locate_statement(buffer, at(0, 2), "select 1"), range((0, 0), (0, 8)));
+    }
+
+    #[test]
+    fn text_that_is_not_in_the_buffer_is_not_placed() {
+        assert_eq!(locate_statement("select 1;", at(0, 0), "select 2;"), None);
+        assert_eq!(locate_statement("", at(0, 0), "select 2;"), None);
     }
 }

@@ -20,7 +20,7 @@ expect listed 'j/k move'
 
 # The cursor row is drawn on selection_bg: the escape-coded capture shows the
 # background moving from the first row to the second.
-row_bg() { tm capture-pane -e -p -t "$SESSION" | grep -- "$1" | grep -c '\[48;' || true; }
+row_bg() { tm capture-pane -e -p -t "$SESSION" | grep -- "$1" | grep -c '48;2;49;50;68' || true; }
 [ "$(row_bg 'local pg')" -ge 1 ] || fail "cursor not on the first row"
 [ "$(row_bg 'shop')" -eq 0 ] || fail "second row highlighted before moving"
 tm send-keys -t "$SESSION" j

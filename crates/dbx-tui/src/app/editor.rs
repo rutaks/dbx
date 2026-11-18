@@ -2,16 +2,18 @@
 //!
 //! `update` reaches the widget only through this type: the text, the cursor
 //! and the selection in our own `Cursor`, keys, paste and setting the text.
-//! Drawing is the widget's own renderer for now, styled from palette roles
-//! (`style`); slice 10 replaces it with ours (syntax colouring, the statement
-//! about to run outlined) without touching anything that calls this.
+//! The widget edits; `view` draws (slice 10: syntax colours, line numbers,
+//! the statement about to run outlined), reading the lines, caret, selection
+//! and scroll offset from here. The widget cannot style ranges, so its own
+//! renderer is used only (into a scratch buffer, `layout`) to keep its view
+//! following the caret.
 
 use crossterm::event::KeyEvent;
-use ratatui::style::{Modifier, Style};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use ratatui_textarea::{CursorMove, TextArea};
 
-use super::theme::{Palette, Role};
 use crate::core::Cursor;
 
 /// The most a paste may hold, in bytes. The widget rebuilds its screen map on
@@ -27,6 +29,9 @@ type Snapshot = ((usize, usize), Option<((usize, usize), (usize, usize))>, (u16,
 #[derive(Debug, Clone)]
 pub struct Editor {
     area: TextArea<'static>,
+    /// Counts changes to the text: what the highlighter and the statement
+    /// finder key their caches by.
+    revision: u64,
 }
 
 impl Default for Editor {
@@ -37,7 +42,7 @@ impl Default for Editor {
 
 impl Editor {
     pub fn new() -> Self {
-        Editor { area: TextArea::default() }
+        Editor { area: TextArea::default(), revision: 0 }
     }
 
     /// The whole buffer, rows joined with `\n`.
@@ -45,8 +50,19 @@ impl Editor {
         self.area.lines().join("\n")
     }
 
+    /// The buffer's rows.
+    pub fn lines(&self) -> &[String] {
+        self.area.lines()
+    }
+
+    /// Changes whenever the text does (typing, paste, undo, `set_text`).
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Replaces the buffer and puts the cursor at its end.
     pub fn set_text(&mut self, text: &str) {
+        self.revision += 1;
         let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         self.area = TextArea::new(lines);
         self.area.move_cursor(ratatui_textarea::CursorMove::Bottom);
@@ -77,6 +93,7 @@ impl Editor {
     pub fn key(&mut self, key: KeyEvent) -> bool {
         let before = (self.area.cursor(), self.area.selection_range());
         let edited = self.area.input(key);
+        self.revision += u64::from(edited);
         edited || before != (self.area.cursor(), self.area.selection_range())
     }
 
@@ -95,7 +112,9 @@ impl Editor {
                 LINE_LIMIT / 1024
             ));
         }
-        Ok(self.area.insert_str(text))
+        let changed = self.area.insert_str(text);
+        self.revision += u64::from(changed);
+        Ok(changed)
     }
 
     // ---- the mouse ---------------------------------------------------------
@@ -197,27 +216,14 @@ impl Editor {
         before != self.state()
     }
 
-    /// Styles the widget from palette roles: the text, the cursor (reversed),
-    /// the selection on `selection_bg`, the placeholder in `overlay0`.
-    pub fn style(&mut self, theme: &Palette, focused: bool) {
-        let text = Style::default().fg(theme.color(Role::Text));
-        self.area.set_style(text);
-        self.area.set_cursor_line_style(Style::default());
-        self.area.set_selection_style(Style::default().bg(theme.color(Role::SelectionBg)));
-        // An unfocused editor shows no cursor.
-        self.area.set_cursor_style(if focused { text.add_modifier(Modifier::REVERSED) } else { text });
-        self.area.set_placeholder_style(Style::default().fg(theme.color(Role::Overlay0)));
-    }
-
-    /// What the editor shows while it is empty.
-    pub fn set_placeholder(&mut self, text: &str) {
-        if self.area.placeholder_text() != text {
-            self.area.set_placeholder_text(text);
-        }
-    }
-
-    pub fn widget(&self) -> impl Widget + '_ {
-        &self.area
+    /// Lets the widget work out where its view is for `area`: it follows the
+    /// caret while it draws, and records the scroll offset the mouse mapping
+    /// (`at`) and our own painter read. The widget draws into a scratch
+    /// buffer that is thrown away: the screen is painted by `view` from
+    /// `lines`, `cursor`, `selection` and `scroll_top`.
+    pub fn layout(&mut self, area: Rect) {
+        let mut scratch = Buffer::empty(area);
+        Widget::render(&self.area, area, &mut scratch);
     }
 }
 

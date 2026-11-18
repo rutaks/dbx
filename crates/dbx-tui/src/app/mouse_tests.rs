@@ -402,6 +402,20 @@ fn the_proportions_round_trip_to_the_same_column_at_any_realistic_width() {
     }
 }
 
+#[tokio::test]
+async fn a_divider_drag_whose_release_lands_on_an_overlay_is_still_saved() {
+    let mut h = plain().await;
+    let sep = h.app.ui.hits.sidebar_separator;
+    press_at(&mut h, sep.x, 5, later());
+    drag_to(&mut h, 44, 5);
+    assert!(h.app.ui.layout_unsaved);
+    // Something opens an overlay while the button is down.
+    h.app.ui.overlay = Some(Overlay::Error(ErrorOverlay { title: "Store unavailable".into(), message: "Could not open it.".into() }));
+    let fx = release(&mut h, 44, 5);
+    assert_eq!(fx.commands, vec![Command::SavePrefs(h.app.ui.layout)], "the dragged layout is saved");
+    assert!(h.app.ui.drag.is_none() && !h.app.ui.layout_unsaved);
+}
+
 // ---- overlays ------------------------------------------------------------------
 
 /// A harness with overlay number `which` open, drawn.
@@ -778,4 +792,36 @@ async fn a_double_click_in_the_sidebar_toggles_a_node_within_350_ms_and_not_afte
     press_at(&mut h, name.0, name.1, t0() + Duration::from_secs(10));
     press_at(&mut h, name.0, name.1, t0() + Duration::from_secs(10) + Duration::from_millis(351));
     assert_eq!(h.app.ui.sidebar.expanded.len(), 1, "351 ms is two clicks");
+}
+
+#[tokio::test]
+async fn a_new_result_forgets_a_pending_click_so_the_second_press_is_not_a_double_click() {
+    let mut h = focused(text_set(10, 4)).await;
+    draw(&mut h);
+    let (x, y) = super::grid_tests::where_is(&mut h, "r3c2").unwrap();
+    let start = t0() + Duration::from_secs(100);
+    press_at(&mut h, x + 1, y, start);
+    // A new result lands (a run finished) with a cell of the same place.
+    let mut fx = Effects::default();
+    let Some(query::Outcome::Rows(set)) = h.app.model.tabs[0].outcome.clone() else { panic!("a result is shown") };
+    h.app.model.tabs[0].run = query::RunState::Idle;
+    h.app.on_ran(Ok(set), &mut fx);
+    draw(&mut h);
+    press_at(&mut h, x + 1, y, start + Duration::from_millis(100));
+    assert!(h.app.ui.overlay.is_none(), "the first press was on the old result");
+}
+
+#[tokio::test]
+async fn rebuilt_tree_rows_forget_a_pending_click_so_the_second_press_is_not_a_double_click() {
+    let mut h = listed(&["alpha", "beta"]).await;
+    draw(&mut h);
+    let list = h.app.ui.hits.sidebar_list;
+    let name = (list.x + 6, list.y);
+    let start = t0() + Duration::from_secs(200);
+    press_at(&mut h, name.0, name.1, start);
+    // The rows are replaced (a listing arrived, the connection list reloaded).
+    h.app.ui.sidebar.dirty = true;
+    draw(&mut h);
+    press_at(&mut h, name.0, name.1, start + Duration::from_millis(100));
+    assert!(h.app.ui.sidebar.expanded.is_empty(), "the first press was on rows that are gone");
 }

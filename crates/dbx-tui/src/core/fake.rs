@@ -90,6 +90,7 @@ pub struct FakeCore {
     /// The sessions open: opened by a run, forgotten by a close.
     sessions: Mutex<HashSet<(SessionId, DatabasePath)>>,
     default_connections_empty: std::sync::atomic::AtomicBool,
+    syntax_calls: Mutex<SyntaxCalls>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -177,6 +178,49 @@ impl FakeCore {
     }
     pub fn script_history(&self, r: Scripted<Vec<HistoryEntry>>) {
         push(&self.history, r);
+    }
+}
+
+/// How often the fake was asked the synchronous questions (`Syntax`), for
+/// tests that assert the app asks once, not per frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyntaxCalls {
+    pub type_names: Vec<DbKind>,
+    pub statement_ranges: usize,
+}
+
+impl FakeCore {
+    pub fn syntax_calls(&self) -> SyntaxCalls {
+        lock(&self.syntax_calls).clone()
+    }
+}
+
+/// The type names the fake gives unless told otherwise.
+const FAKE_TYPES: [&str; 4] = ["varchar", "timestamptz", "integer", "text"];
+
+impl Syntax for FakeCore {
+    fn type_names(&self, kind: &DbKind) -> Vec<String> {
+        lock(&self.syntax_calls).type_names.push(kind.clone());
+        FAKE_TYPES.iter().map(|t| t.to_string()).collect()
+    }
+
+    /// The statement the caret is in, where statements end at `;` (the `;`
+    /// is not part of the range, as dbx's text leaves it out).
+    fn statement_range(&self, _kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)> {
+        lock(&self.syntax_calls).statement_ranges += 1;
+        let at = byte_offset(buffer, cursor);
+        let mut start = 0;
+        loop {
+            let end = buffer[start..].find(';').map_or(buffer.len(), |i| start + i);
+            // A caret just after the `;` is still in the statement it ends.
+            if at <= end + 1 || end == buffer.len() {
+                let text = &buffer[start..end];
+                let lead = text.len() - text.trim_start().len();
+                let (from, to) = (start + lead, start + lead + text.trim().len());
+                return (to > from).then(|| (cursor_at(buffer, from), cursor_at(buffer, to)));
+            }
+            start = end + 1;
+        }
     }
 }
 

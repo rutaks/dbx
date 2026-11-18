@@ -95,6 +95,16 @@ pub fn role_at(app: &mut App, x: u16, y: u16) -> CellRoles {
     CellRoles { fg: probe.role_of(cell.fg), bg: probe.role_of(cell.bg) }
 }
 
+/// The real colours (not roles) of the cell at (x, y) under the app's own
+/// theme, and its modifiers.
+pub fn style_at(app: &mut App, x: u16, y: u16) -> (ratatui::style::Color, ratatui::style::Color, ratatui::style::Modifier) {
+    let area = app.ui.hits.area;
+    let (w, h) = if area.width == 0 { (100, 30) } else { (area.width, area.height) };
+    let buf = render(app, w, h);
+    let cell = &buf[(x, y)];
+    (cell.fg, cell.bg, cell.modifier)
+}
+
 /// Sends space-separated keys such as `"ctrl+g q"` at `now`, merging effects.
 pub fn press_at(app: &mut App, keys: &str, now: Instant) -> Effects {
     let mut all = Effects::default();

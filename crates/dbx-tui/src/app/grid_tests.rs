@@ -677,6 +677,23 @@ fn g_on_a_value_with_line_breaks_shows_the_same_last_page_a_full_wrap_does() {
 }
 
 #[test]
+fn one_big_move_up_in_an_anchored_viewer_moves_the_whole_distance() {
+    let text: String = (0..200_000).map(|i| format!("row {i} of the value\n")).collect();
+    let reference = full_wrap(&text, 78);
+    let mut v = viewer_of(&text, CellKind::Text);
+    v.scroll_to_end();
+    assert!(v.anchored());
+    // Far more than the doubling of the wrapped tail gives in one step.
+    v.scroll_by(-3_000);
+    let shown: Vec<String> = v.lines(v.scroll, 30).into_iter().map(|l| l.body).collect();
+    assert_eq!(shown, reference[reference.len() - 3_030..reference.len() - 3_000], "{}", v.position(30));
+    // And up to the very top in one move.
+    v.scroll_by(-1_000_000);
+    assert_eq!(v.lines(v.scroll, 1)[0].body, "row 0 of the value");
+    assert_eq!(v.scroll, 0);
+}
+
+#[test]
 fn g_on_a_small_value_is_exact_and_keeps_its_line_numbers() {
     let text: String = (0..100).map(|i| format!("l{i}\n")).collect();
     let mut v = viewer_of(&text, CellKind::Text);

@@ -2880,6 +2880,7 @@ dependencies = [
  "ratatui-textarea",
  "rustls 0.23.43",
  "serde_json",
+ "sqlparser",
  "tempfile",
  "tokio",
  "unicode-segmentation",

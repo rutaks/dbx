@@ -6,6 +6,7 @@ mod resize;
 pub mod editor;
 pub mod form;
 pub mod grid;
+pub mod highlight;
 pub mod keys;
 pub mod layout;
 pub mod overlay;
@@ -15,6 +16,7 @@ pub mod probe;
 pub mod query;
 pub mod requests;
 pub mod sidebar;
+pub mod syntax;
 pub mod text_field;
 pub mod theme;
 pub mod tree;
@@ -33,6 +35,8 @@ mod grid_tests;
 mod mouse_tests;
 #[cfg(test)]
 mod run_tests;
+#[cfg(test)]
+mod syntax_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
@@ -156,6 +160,8 @@ pub struct Ui {
     pub note: Option<SidebarNote>,
     /// The SQL editor of the query tab.
     pub editor: editor::Editor,
+    /// What the editor draws from: colours, type names, the statement range.
+    pub syntax: syntax::SyntaxState,
     pub notice: Option<Notice>,
     /// The results pane's cell cursor and window.
     pub grid: grid::GridUi,
@@ -252,6 +258,16 @@ impl Default for App {
 }
 
 impl App {
+    /// The kind of database the query tab's connection is, once the connection
+    /// list has loaded: which dialect the editor colours for.
+    pub fn active_kind(&self) -> Option<crate::core::DbKind> {
+        let target = self.tab().target.as_ref()?;
+        match &self.model.connections {
+            Loadable::Ready(list) => list.iter().find(|c| c.id == target.connection).map(|c| c.kind.clone()),
+            _ => None,
+        }
+    }
+
     pub fn new() -> Self {
         App {
             model: Model {
@@ -279,6 +295,7 @@ impl App {
                 reload_anchor: None,
                 note: None,
                 editor: editor::Editor::new(),
+                syntax: syntax::SyntaxState::default(),
                 notice: None,
                 grid: grid::GridUi::default(),
                 now: None,
@@ -620,8 +637,9 @@ impl App {
 
     fn on_overlay_mouse(&mut self, mouse: MouseEvent, fx: &mut Effects) {
         // A drag that began before the overlay opened ends here.
+        // A divider drag that ends here is saved all the same.
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
-            self.ui.drag = None;
+            self.on_release(fx);
         }
         match mouse.kind {
             MouseEventKind::ScrollDown => return self.scroll_viewer(WHEEL_ROWS, fx),

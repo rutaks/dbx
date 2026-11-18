@@ -27,7 +27,7 @@ nc -z 127.0.0.1 55433 2>/dev/null || fail "the fixture Postgres is not up: run t
 goto() {
   local n=0
   while [ "$n" -lt 40 ]; do
-    if tm capture-pane -e -p -t "$SESSION" | grep -E -- "$1" | grep -q '\[48;'; then return 0; fi
+    if tm capture-pane -e -p -t "$SESSION" | grep -E -- "$1" | grep -q '48;2;49;50;68'; then return 0; fi
     key j; sleep 0.12; n=$((n + 1))
   done
   capture "goto-failed"; fail "the cursor never reached /$1/"

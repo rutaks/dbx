@@ -1,6 +1,7 @@
 //! Drawing. Every colour is a palette role; every width counts one column per
 //! character, which holds for everything drawn so far (ASCII and box glyphs).
 
+mod editor;
 mod form;
 mod panel;
 mod results;
@@ -204,17 +205,18 @@ impl<'a> Painter<'a> {
         cx
     }
 
-    /// Replaces whatever a widget wrote into the bounds that a terminal would
-    /// act on (control characters, bidirectional overrides), cell by cell.
-    fn clean(&self, buf: &mut Buffer) {
-        for y in self.bounds.top()..self.bounds.bottom() {
-            for x in self.bounds.left()..self.bounds.right() {
-                let cell = &mut buf[(x, y)];
-                if cell.symbol().chars().any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
-                    let safe = display_safe(cell.symbol());
-                    cell.set_symbol(if safe.is_empty() { " " } else { &safe });
-                }
-            }
+    /// One grapheme (`g`, already `display_safe`, `width` cells wide) at
+    /// (x, y), in `style`; the cells a wide one covers hold nothing of their
+    /// own. Nothing outside the bounds is touched, and a wide grapheme that
+    /// would not fit is not drawn half.
+    fn glyph(&self, buf: &mut Buffer, x: u16, y: u16, g: &str, width: usize, style: Style) {
+        let b = self.bounds;
+        if y < b.top() || y >= b.bottom() || x < b.left() || x as usize + width > b.right() as usize || width == 0 {
+            return;
+        }
+        buf[(x, y)].set_symbol(g).set_style(style);
+        for extra in 1..width as u16 {
+            buf[(x + extra, y)].set_symbol("").set_style(style);
         }
     }
 
@@ -475,16 +477,9 @@ fn draw_editor(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     if area.is_empty() {
         return;
     }
-    // Where a click places the caret.
-    app.ui.hits.editor_text = area;
     let placeholder = editor_placeholder(app);
-    let editor = &mut app.ui.editor;
-    editor.set_placeholder(&placeholder);
-    editor.style(p.theme, focused);
-    ratatui::widgets::Widget::render(editor.widget(), area, buf);
-    // The widget draws the buffer as it is; nothing it drew may carry a
-    // control character to the terminal.
-    p.within(area).clean(buf);
+    let kind = app.active_kind();
+    editor::draw(app, p, buf, area, focused, kind.as_ref(), &placeholder);
 }
 
 /// What the empty editor says: what to do next, with the keys that do it.

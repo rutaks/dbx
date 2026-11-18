@@ -35,6 +35,9 @@ pub struct HitMap {
     /// Where the editor's text is drawn (inside its title row and margin): a
     /// click there places the caret. Filled while drawing the editor.
     pub editor_text: Rect,
+    /// The marker and line-number columns left of `editor_text`. Filled
+    /// while drawing the editor.
+    pub editor_gutter: Rect,
     /// The results pane, starting at the divider row that carries its title.
     pub results: Rect,
     /// The row between the editor and the results (the results' title row).

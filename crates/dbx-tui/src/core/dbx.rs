@@ -782,8 +782,14 @@ fn statement_to_run(request: &RunRequest, db_type: DatabaseType) -> String {
     if let Some((a, b)) = request.selection.filter(|(a, b)| a != b) {
         return text_between(&request.buffer, a, b);
     }
-    let cursor = utf16_offset(&request.buffer, request.cursor);
-    dbx_core::sql::find_statement_at_cursor_for_database(&request.buffer, cursor, db_type)
+    statement_at(&request.buffer, request.cursor, db_type)
+}
+
+/// The statement dbx's splitter picks for the caret (`find_statement_at_cursor_
+/// for_database`, which counts the cursor in UTF-16 units). The one place a
+/// statement is chosen: a run sends it, the editor outlines it.
+fn statement_at(buffer: &str, cursor: Cursor, db_type: DatabaseType) -> String {
+    dbx_core::sql::find_statement_at_cursor_for_database(buffer, utf16_offset(buffer, cursor), db_type)
 }
 
 /// dbx's result as ours. Each column's kind comes from the database's type
@@ -948,6 +954,49 @@ fn run_message(raw: &str, secret: &str) -> String {
         out = out.chars().take(3_999).collect::<String>() + "…";
     }
     out
+}
+
+impl Syntax for DbxCore {
+    fn type_names(&self, kind: &DbKind) -> Vec<String> {
+        type_names_for(kind)
+    }
+
+    fn statement_range(&self, kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)> {
+        statement_range_for(kind, buffer, cursor)
+    }
+}
+
+/// The type names of a kind of database, from dbx's dialect files: each
+/// type's name and its aliases. `list_dialect_type_names` gives only the
+/// names (Postgres's `character varying`, not `varchar`; `integer`, not
+/// `int`), and what people type is mostly the alias.
+fn type_names_for(kind: &DbKind) -> Vec<String> {
+    use dbx_core::sql_dialect::dialect_loader::DialectRegistry;
+    let name = kind.display_name();
+    // Also what loads the compiled-in dialect files the registry reads.
+    let mut names = dbx_core::sql_dialect::dialect_types::list_dialect_type_names(name);
+    if let Some(yaml) = DialectRegistry::global().get_yaml(name) {
+        names.extend(yaml.types.into_iter().flat_map(|t| t.aliases));
+    }
+    names
+}
+
+/// dbx's database type for one of our kinds, if dbx has it.
+fn database_type_of(kind: &DbKind) -> Option<DatabaseType> {
+    match kind {
+        DbKind::Postgres => Some(DatabaseType::Postgres),
+        DbKind::MySql => Some(DatabaseType::Mysql),
+        DbKind::Sqlite => Some(DatabaseType::Sqlite),
+        DbKind::Other(name) => DatabaseType::ALL.iter().copied().find(|t| t.as_str() == name),
+    }
+}
+
+/// Where the statement `statement_to_run` would pick for the caret is.
+/// It is `statement_at`, the function a run uses, and its text located in the
+/// buffer (`locate_statement`), so the outline and the run cannot disagree.
+fn statement_range_for(kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)> {
+    let db_type = database_type_of(kind)?;
+    locate_statement(buffer, cursor, &statement_at(buffer, cursor, db_type))
 }
 
 #[async_trait]
@@ -1603,5 +1652,67 @@ mod tests {
             assert!(e.message.contains("DBX_SECRET_KEY_FILE"), "{}", e.message);
         }
         assert!(classify("database is locked", KeySource::Platform).is_none());
+    }
+
+    #[test]
+    fn dbxs_type_names_for_postgres_include_the_ones_a_create_table_uses() {
+        let names: Vec<String> = type_names_for(&DbKind::Postgres).iter().map(|n| n.to_lowercase()).collect();
+        for wanted in ["varchar", "timestamptz", "integer", "text", "jsonb", "uuid"] {
+            assert!(names.iter().any(|n| n == wanted), "{wanted} is missing from {names:?}");
+        }
+        let mysql: Vec<String> = type_names_for(&DbKind::MySql).iter().map(|n| n.to_lowercase()).collect();
+        assert!(mysql.iter().any(|n| n == "varchar"), "{mysql:?}");
+        assert!(!mysql.iter().any(|n| n == "timestamptz"), "MySQL has no timestamptz: {mysql:?}");
+    }
+
+    /// Every caret position of `buffer`, as the editor can put it.
+    fn carets(buffer: &str) -> Vec<Cursor> {
+        buffer.split('\n').enumerate().flat_map(|(row, line)| (0..=line.chars().count()).map(move |col| Cursor { row, col })).collect()
+    }
+
+    #[test]
+    fn the_outlined_statement_is_the_statement_a_run_sends_at_every_caret_position() {
+        let buffers = [
+            "select 1;\nselect 2\n  from film;\nselect 3;",
+            "select '😀😀', 'éé';\nselect 2;\n\n\ncreate table t (a int);\ninsert into t values (1);",
+            "select 1;\nselect 1;\nselect 2;\nselect 1;",
+            "select $$a;b$$;\nselect 'x;y', 2 -- c;\n;select 3",
+            "",
+            "   \n  ",
+        ];
+        let (mut placed, mut duplicated) = (0, 0);
+        for buffer in buffers {
+            for cursor in carets(buffer) {
+                let sent = statement_to_run(&RunRequest { cursor, ..request(buffer, 0, 0) }, DatabaseType::Postgres);
+                let Some((a, b)) = statement_range_for(&DbKind::Postgres, buffer, cursor) else { continue };
+                placed += 1;
+                assert_eq!(text_between(buffer, a, b), sent.trim(), "{buffer:?} caret {cursor:?}");
+                // The right copy, when the statement is duplicated: the one
+                // the caret is in or at the edge of (else no outline at all).
+                if buffer.matches(sent.trim()).count() > 1 {
+                    let key = |c: Cursor| (c.row, c.col);
+                    assert!(key(a) <= key(cursor) && key(cursor) <= key(b), "{buffer:?} caret {cursor:?} outside its outline {a:?}..{b:?}");
+                    duplicated += 1;
+                }
+            }
+        }
+        assert!(placed > 100, "only {placed} positions were outlined");
+        assert!(duplicated > 5, "only {duplicated} positions of duplicated statements were outlined");
+    }
+
+    #[test]
+    fn a_statement_that_is_not_duplicated_is_outlined_at_every_caret_position() {
+        let buffer = "select 1;\nselect 2\n  from film;\n\nselect 3;";
+        for cursor in carets(buffer) {
+            assert!(statement_range_for(&DbKind::Postgres, buffer, cursor).is_some(), "no outline at {cursor:?}");
+        }
+        assert_eq!(statement_range_for(&DbKind::Postgres, buffer, Cursor { row: 2, col: 3 }), Some((Cursor { row: 1, col: 0 }, Cursor { row: 2, col: 11 })), "dbx's text leaves the `;` out");
+    }
+
+    #[test]
+    fn an_empty_buffer_or_an_unknown_kind_has_no_outline() {
+        assert_eq!(statement_range_for(&DbKind::Postgres, "", Cursor::default()), None);
+        assert_eq!(statement_range_for(&DbKind::Postgres, "  \n ", Cursor::default()), None);
+        assert_eq!(statement_range_for(&DbKind::Other("no-such-database".into()), "select 1", Cursor::default()), None);
     }
 }

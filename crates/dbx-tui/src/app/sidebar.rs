@@ -76,6 +76,9 @@ impl App {
         let retry_key = self.ui.keys.key_for(Action::Refresh);
         let sb = &mut self.ui.sidebar;
         if sb.dirty || sb.built_width != width || sb.built_retry_key != retry_key {
+            // The rows are replaced: a press on one of the old ones pairs with nothing.
+            self.ui.clicks.forget();
+            let sb = &mut self.ui.sidebar;
             let before = sb.cursor_key.clone().or_else(|| sb.rows.get(sb.cursor).map(Row::key));
             let connections: &[Connection] = match &self.model.connections {
                 Loadable::Ready(list) => list,

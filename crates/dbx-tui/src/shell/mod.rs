@@ -183,6 +183,9 @@ pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>) -> io::
     let (tx, mut rx) = mpsc::unbounded_channel::<(RequestId, CoreReply)>();
     let mut events = EventStream::new();
     let mut app = App::new();
+    let syntax: Arc<dyn crate::core::Syntax> = core.clone();
+    app.ui.syntax.set_handle(syntax);
+    app.ui.theme = crate::app::theme::Palette::from_setting(std::env::var("DBX_TUI_THEME").ok().as_deref());
     if let Some(path) = &prefs {
         app.set_layout(self::prefs::load(path));
     }

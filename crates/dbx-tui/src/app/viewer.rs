@@ -189,7 +189,10 @@ impl CellViewer {
     /// at the bottom (found by wrapping as far as the page below needs).
     pub fn scroll_by(&mut self, delta: isize) {
         self.sync_width();
-        if delta < 0 && self.wrap.origin > 0 && (self.scroll as isize) + delta < 0 {
+        // One step back doubles the wrapped tail, which may still be shorter
+        // than the move: go on until the whole move fits or the origin is the
+        // start of the value.
+        while delta < 0 && self.wrap.origin > 0 && (self.scroll as isize) + delta < 0 {
             self.extend_back();
         }
         self.scroll = self.scroll.saturating_add_signed(delta);

@@ -474,16 +474,24 @@ impl App {
                 let tab = self.tab_mut();
                 tab.result_session = tab.session;
                 tab.outcome = Some(Outcome::Rows(set));
-                // A new result: back to the corner, nothing measured.
+                // A new result: back to the corner, nothing measured, and a
+                // press on a cell of the old one pairs with nothing.
                 self.ui.grid.reset();
+                self.ui.clicks.forget();
             }
             // Cancelled by something other than this tab (it would have made
             // the reply stale): the run is over, and gave nothing to show.
             (Err(error), None) if error.kind == CoreErrorKind::Cancelled => {
                 tab.run = RunState::Cancelled { after: elapsed, statement: error.statement, how: CancelEnd::Stopped };
             }
-            (Err(error), None) if error.kind == CoreErrorKind::Timeout => tab.outcome = Some(Outcome::TimedOut { error, elapsed }),
-            (Err(error), None) => tab.outcome = Some(Outcome::Failed { error, elapsed }),
+            (Err(error), None) if error.kind == CoreErrorKind::Timeout => {
+                tab.outcome = Some(Outcome::TimedOut { error, elapsed });
+                self.ui.clicks.forget();
+            }
+            (Err(error), None) => {
+                tab.outcome = Some(Outcome::Failed { error, elapsed });
+                self.ui.clicks.forget();
+            }
         }
     }
 
@@ -508,6 +516,7 @@ impl App {
         let tab = self.tab_mut();
         tab.result_session = tab.session;
         tab.outcome = Some(Outcome::Rows(set));
+        self.ui.clicks.forget();
         let loaded_text = super::view::thousands(loaded);
         if changed {
             let mut text = "The rows changed since the last run.".to_string();

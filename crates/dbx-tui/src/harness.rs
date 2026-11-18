@@ -33,7 +33,9 @@ impl Harness {
         let fake = Arc::new(fake);
         let core: Arc<dyn Core> = fake.clone();
         let (tx, rx) = mpsc::unbounded_channel();
+        let syntax: Arc<dyn crate::core::Syntax> = fake.clone();
         let mut h = Harness { app: App::new(), fake, core, tx, rx, tasks: Tasks::default(), quit: false, t0: tokio::time::Instant::now() };
+        h.app.ui.syntax.set_handle(syntax);
         let fx = h.app.start();
         h.run(fx);
         h

@@ -133,6 +133,47 @@ while a run is in flight leaves the same marker. Quitting while a statement may
 still be running prints, once the terminal is restored,
 `dbx-tui: A statement may still be running on <connection / database>.`
 
+## The editor's look (syntax colouring)
+
+The widget (`ratatui-textarea`) still edits; `app/view/editor.rs` draws. It
+reads the lines, caret, selection and scroll offset through `Editor` (the
+widget draws once into a scratch buffer only so its view follows the caret and
+reports `scroll_offset`, which the mouse mapping needs). Left of the text is a
+gutter: a `▎` on the rows of the statement that would run (in the
+range-to-execute colour, no fill, like IntelliJ's outline; none while text is
+selected, since the selection is what runs), then right-aligned line numbers,
+the caret row's brighter. The caret row has a background, the bracket beside
+the caret and its partner have the matched-brace background (brackets inside
+strings and comments are skipped), and the selection background is drawn over
+the syntax colours, which stay the text colour.
+
+Colours come from `app/highlight.rs` (sqlparser 0.62's tokenizer, the dialect
+from the active connection's kind): keyword, type, string, number, comment,
+function (a word directly followed by `(`), identifier, comma and semicolon,
+bad token. "Keyword" is a curated list of core SQL words, not every word
+sqlparser knows (it knows `count`, `name`, `date`). Unterminated strings and
+comments keep the tokens before them and colour the rest as what opened; an
+unterminated quoted name is a bad token (an unterminated `"` run is a string on
+MySQL and its family); any other refusal by the tokenizer marks that word bad
+and tokenizing restarts after it. A word right after a `.` is an identifier
+(`t.key`). The whole buffer is tokenized once per text change, whatever its
+size, so a comment or string opened far above the screen is seen; a repaint,
+a scroll or a caret move tokenizes nothing. The result is kept until the text,
+the kind or the type names (by generation) change (`Highlighter::stats` counts
+the work). In the `terminal` theme the editor's selection is drawn reversed
+(`Palette::modifier(Role::SelectionBg)`), since no colour shows on every
+terminal's own background. Type names come from the new
+sync seam `core::Syntax` (`type_names`: dbx's dialect names and their aliases,
+because `list_dialect_type_names` has `character varying` but not `varchar`),
+asked once per kind. `Syntax::statement_range` places the statement dbx picks
+in the buffer (`statement_at`, the function `run` uses, then
+`locate_statement`) and is asked once per text and caret; when the text occurs
+more than once and the caret is in none of the copies there is no outline.
+
+Themes: `catppuccin` (default), `terminal`, `intellij-dark` (IntelliJ's Dark
+values), chosen with the environment variable `DBX_TUI_THEME` until there is a
+config file.
+
 ## The result grid (results pane)
 
 A run that gives columns shows a grid: a fixed header row, a row-number
@@ -265,7 +306,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `cancel`, `first-query`, `mouse`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `cancel`, `first-query`, `mouse`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live
