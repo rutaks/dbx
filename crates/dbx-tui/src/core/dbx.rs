@@ -170,7 +170,20 @@ pub struct DbxCore {
     /// writes the store and then updates dbx's runtime list, and two of them
     /// interleaved can leave the runtime and the store disagreeing.
     mutations: Mutex<()>,
+    /// Cancels for runs dbx had not registered yet. dbx's
+    /// `RunningQueries::cancel` forgets a cancel for an id it does not know,
+    /// and a run registers only after it has looked up the store and the
+    /// connection, so `ctrl+c` right after `f5` would otherwise be lost. A
+    /// run checks this, under the same lock, as it registers.
+    early_cancels: std::sync::Mutex<std::collections::BTreeSet<RunId>>,
+    /// Sessions closed: a run's wait for its session (`wait_for_session`)
+    /// must not open one of them again.
+    closed_sessions: std::sync::Mutex<std::collections::HashSet<SessionId>>,
 }
+
+/// The most early cancels remembered. A cancel for a run that has already
+/// finished lands here too and is never claimed; the oldest go first.
+const EARLY_CANCELS: usize = 256;
 
 /// Runs a future on a blocking-pool thread. dbx's store calls can block (the
 /// macOS keychain read on a first password save waits for as long as its
@@ -184,13 +197,13 @@ async fn blocking<T: Send + 'static>(fut: impl std::future::Future<Output = T> +
 
 impl DbxCore {
     pub fn new(options: StoreOptions) -> Self {
-        DbxCore { options: Ok(options), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()) }
+        DbxCore { options: Ok(options), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default() }
     }
 
     /// The client's DbxCore: the store named by the environment. If that
     /// cannot be worked out, every call fails with the reason.
     pub fn from_env() -> Self {
-        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()) }
+        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default() }
     }
 
     /// Keys only from the environment or the data directory, never the OS
@@ -286,6 +299,40 @@ impl DbxCore {
         .await
         .map(|_| ())
         .map_err(|e| CoreError::new(CoreErrorKind::Connect, e.to_string()))
+    }
+
+    /// Waits until a tab's session answers again, which is when the statement
+    /// it was running has ended on the server. Returns whether it answered.
+    ///
+    /// After a cancel (or the connection's timeout, which cancels) dbx
+    /// returns as soon as it has sent Postgres's cancel request, or given up
+    /// sending it: a cancel that never reached the server still comes back as
+    /// cancelled, within a fraction of a second, while the statement runs on.
+    /// dbx keeps the session's connection on a cancel, and a statement sent on
+    /// it queues behind the one still running, so a `select 1` there answers
+    /// only once that has ended. Normally this costs one round trip.
+    ///
+    /// It never opens a session: only a session dbx still holds a pool for,
+    /// and that has not been closed, is asked. A close that lands while it
+    /// waits is made good afterwards (closed again), in case dbx reopened it.
+    async fn wait_for_session(&self, state: &AppState, connection: &str, database: &str, session: SessionId) -> bool {
+        let closed = || self.closed_sessions.lock().unwrap_or_else(|p| p.into_inner()).contains(&session);
+        let id = session_id(session);
+        if closed() || !session_pool_exists(state, connection, &id).await {
+            return false;
+        }
+        let options = QueryExecutionOptions {
+            max_rows: Some(1),
+            timeout_secs: Some(0),
+            client_session_id: Some(id.clone()),
+            ..Default::default()
+        };
+        let answered = execute_sql_statement_with_options_typed(state, connection, database, "select 1", None, None, options).await.is_ok();
+        if closed() {
+            let _ = state.close_client_session_pool(connection, Some(database), &id).await;
+            return false;
+        }
+        answered
     }
 
     /// Runs one of dbx's metadata calls for connection `id`.
@@ -539,6 +586,7 @@ fn to_connection(c: &ConnectionConfig) -> Connection {
         username: display_safe(&c.username),
         tls: c.ssl,
         production: c.is_production,
+        query_timeout: query_timeout(c),
     }
 }
 
@@ -681,16 +729,43 @@ fn query_timeout(config: &ConnectionConfig) -> Option<u64> {
     (secs != 0 && config.query_timeout_secs != dbx_core::models::connection::default_query_timeout_secs()).then_some(secs)
 }
 
-/// dbx's session id for a query tab. dbx treats the text before a `:` as an
-/// owner and some suffixes (`:count`, `:export`) as kinds of work, so it has
-/// neither.
-fn session_id(tab: TabId) -> String {
-    format!("dbx-tui-tab-{}", tab.0)
+/// dbx's session id for one session of a query tab. dbx treats the text
+/// before a `:` as an owner and some suffixes (`:count`, `:export`) as kinds
+/// of work, so it has neither.
+fn session_id(session: SessionId) -> String {
+    format!("dbx-tui-tab-{}-{}", session.tab.0, session.serial)
 }
 
 /// The id a run is registered under in dbx's running-query list.
 fn run_key(run: RunId) -> String {
     format!("dbx-tui-run-{}", run.0)
+}
+
+/// Whether dbx holds a pool for client session `id` of `connection`: its
+/// session pools are keyed `<connection>:…:session:<id>`.
+async fn session_pool_exists(state: &AppState, connection: &str, id: &str) -> bool {
+    let (prefix, suffix) = (format!("{connection}:"), format!(":session:{}", id.replace(':', "_")));
+    state.with_connection_pools(|pools| pools.keys().any(|k| k.starts_with(&prefix) && k.ends_with(&suffix))).await
+}
+
+/// The connection's query timeout passed and the run was cancelled for it.
+/// `stopped` says whether the session answered again afterwards, which is
+/// when the statement has ended.
+fn timeout_error(secs: u64, stopped: bool, statement: &str) -> CoreError {
+    let how = if stopped {
+        "and was stopped"
+    } else {
+        "and was cancelled; whether the server has stopped it is not known"
+    };
+    let mut e = CoreError::new(
+        CoreErrorKind::Timeout,
+        format!(
+            "The statement ran longer than this connection's query timeout of {secs} s {how}. \
+             The limit is the connection's \"Query timeout\" setting, set in the dbx desktop app."
+        ),
+    );
+    e.statement = Some(statement.to_string());
+    e
 }
 
 /// The statement a run executes: the selection if there is one, otherwise
@@ -994,21 +1069,35 @@ impl Core for DbxCore {
             return Err(CoreError::new(CoreErrorKind::Other, "There is no statement at the cursor to run."));
         }
         let database = request.database.clone().or_else(|| config.database.clone()).unwrap_or_default();
-        let session = session_id(request.tab);
-        let registered = state.running_queries.register_task(
-            run_key(run),
-            RunningTaskMetadata::query(request.connection.0.clone(), database.clone(), Some(session.clone())),
-        );
+        let session = session_id(request.session);
+        let registered = {
+            let mut early = self.early_cancels.lock().unwrap_or_else(|p| p.into_inner());
+            if early.remove(&run) {
+                let mut e = CoreError::new(CoreErrorKind::Cancelled, "Cancelled before it started.");
+                e.statement = Some(statement);
+                return Err(e);
+            }
+            state.running_queries.register_task(
+                run_key(run),
+                RunningTaskMetadata::query(request.connection.0.clone(), database.clone(), Some(session.clone())),
+            )
+        };
         let timeout = query_timeout(&config);
         let options = QueryExecutionOptions {
             max_rows: Some(request.row_cap),
-            // 0 is dbx's "no limit"; absent would be its 30 s default.
-            timeout_secs: Some(timeout.unwrap_or(0)),
-            client_session_id: Some(session),
+            // Always "no limit" to dbx (absent would be its 30 s default): the
+            // connection's own limit is kept here, below, because dbx's
+            // timeout on Postgres discards the session's connection (its
+            // `pool_error_action`), losing the session's SET values, temporary
+            // tables and transaction, and leaving nothing to tell when the
+            // statement has really stopped.
+            timeout_secs: Some(0),
+            client_session_id: Some(session.clone()),
             execution_id: Some(run_key(run)),
             ..Default::default()
         };
-        let result = execute_sql_statement_with_options_typed(
+        let token = registered.token();
+        let execution = execute_sql_statement_with_options_typed(
             &state,
             &request.connection.0,
             &database,
@@ -1016,15 +1105,47 @@ impl Core for DbxCore {
             None,
             Some(registered.token()),
             options,
-        )
-        .await;
+        );
+        tokio::pin!(execution);
+        // The connection's query timeout: when it passes, the run is
+        // cancelled through its token, exactly as a user's cancel is (dbx
+        // keeps the connection on a cancel), and its outcome is a timeout.
+        let mut timed_out = false;
+        let result = match timeout {
+            Some(secs) => tokio::select! {
+                result = &mut execution => result,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {
+                    timed_out = true;
+                    token.cancel();
+                    execution.await
+                }
+            },
+            None => execution.await,
+        };
         registered.finish_with_late_cancel(&result, false);
-        result.map(|r| result_set(r, statement.clone())).map_err(|e| run_error(e, &statement, &config.password, timeout))
+        let stopped = match &result {
+            // Nothing reached the server: there is nothing to wait for.
+            Err(QueryExecutionError::Canceled { operation_outcome: dbx_core::db::agent_driver::AgentOperationOutcome::NotStarted, .. }) => true,
+            Err(QueryExecutionError::Canceled { .. } | QueryExecutionError::Timeout(_)) => {
+                self.wait_for_session(&state, &request.connection.0, &database, request.session).await
+            }
+            _ => true,
+        };
+        match (result, timeout) {
+            (Err(QueryExecutionError::Canceled { .. }), Some(secs)) if timed_out => Err(timeout_error(secs, stopped, &statement)),
+            (result, _) => result.map(|r| result_set(r, statement.clone())).map_err(|e| run_error(e, &statement, &config.password, timeout)),
+        }
     }
     fn cancel(&self, run: RunId) {
-        // Only a store that is open can have runs to cancel.
-        if let Some(state) = self.opened.get() {
-            state.running_queries.cancel(&run_key(run));
+        // Under the lock `run` registers with, so a cancel is either seen by
+        // dbx or remembered for the run to find: never neither.
+        let mut early = self.early_cancels.lock().unwrap_or_else(|p| p.into_inner());
+        let landed = self.opened.get().is_some_and(|state| state.running_queries.cancel(&run_key(run)));
+        if !landed {
+            early.insert(run);
+            while early.len() > EARLY_CANCELS {
+                early.pop_first();
+            }
         }
     }
     /// Closes the one server connection dbx keeps for this tab's session on
@@ -1032,10 +1153,13 @@ impl Core for DbxCore {
     /// `release` never touches it: that removes only the database's shared
     /// pool, keyed without the session, so collapsing a database in the
     /// sidebar cannot end a tab's session, even mid-run.
-    async fn close_session(&self, tab: TabId, at: &DatabasePath) -> Result<(), CoreError> {
+    async fn close_session(&self, session: SessionId, at: &DatabasePath) -> Result<(), CoreError> {
         let state = self.state().await?;
+        // Before the close, so a run's wait for this session (which could
+        // otherwise open it again) sees it is gone.
+        self.closed_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(session);
         state
-            .close_client_session_pool(&at.connection.0, Some(&at.database), &session_id(tab))
+            .close_client_session_pool(&at.connection.0, Some(&at.database), &session_id(session))
             .await
             .map(|_| ())
             .map_err(|raw| CoreError::new(CoreErrorKind::Other, scrub(&raw, &[])))
@@ -1058,7 +1182,7 @@ mod tests {
         RunRequest {
             connection: ConnectionId("c".into()),
             database: Some("d".into()),
-            tab: TabId(1),
+            session: SessionId { tab: TabId(1), serial: 1 },
             buffer: buffer.into(),
             cursor: Cursor { row, col },
             selection: None,

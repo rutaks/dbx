@@ -3,7 +3,13 @@
 //! Replies are scripted per method, as a queue. Each scripted reply can be a
 //! value or an error and can be held back by a delay. When a queue is empty the
 //! method answers with an empty success, so tests script only what they need.
-//! Every call is recorded, and `cancel` ends a delayed `run` with `Cancelled`.
+//! Every call is recorded, and `cancel` ends a delayed `run` with `Cancelled`
+//! (unless the reply was scripted `deaf`: a cancel that does not land).
+//!
+//! Sessions are modelled as dbx has them: a run opens its session (by
+//! `SessionId` and database), and closing a session forgets it, but does not
+//! end a run in flight on it (dbx returns at once and drops a busy connection
+//! only when the run lets go of it). `session_open` says which are open.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
@@ -19,20 +25,28 @@ use super::*;
 pub struct Scripted<T> {
     result: Result<T, CoreError>,
     delay: Duration,
+    deaf: bool,
 }
 
 impl<T> Scripted<T> {
     pub fn ok(value: T) -> Self {
-        Self { result: Ok(value), delay: Duration::ZERO }
+        Self { result: Ok(value), delay: Duration::ZERO, deaf: false }
     }
 
     pub fn err(kind: CoreErrorKind, message: impl Into<String>) -> Self {
-        Self { result: Err(CoreError::new(kind, message)), delay: Duration::ZERO }
+        Self { result: Err(CoreError::new(kind, message)), delay: Duration::ZERO, deaf: false }
     }
 
     /// Hold the reply back for `delay` (tokio time, so tests can pause it).
     pub fn after(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    /// For a run: a cancel does not stop it (the server never got the
+    /// cancel, or ignores it). It still ends if its session is closed.
+    pub fn deaf(mut self) -> Self {
+        self.deaf = true;
         self
     }
 }
@@ -51,7 +65,7 @@ pub enum Call {
     Release(DatabasePath),
     Run(RunId),
     Cancel(RunId),
-    CloseSession(TabId, DatabasePath),
+    CloseSession(SessionId, DatabasePath),
     History,
 }
 
@@ -73,6 +87,8 @@ pub struct FakeCore {
     calls: Mutex<Vec<Call>>,
     cancelled: Mutex<HashSet<RunId>>,
     cancel_signal: Notify,
+    /// The sessions open: opened by a run, forgotten by a close.
+    sessions: Mutex<HashSet<(SessionId, DatabasePath)>>,
     default_connections_empty: std::sync::atomic::AtomicBool,
 }
 
@@ -114,6 +130,11 @@ impl FakeCore {
         let fake = Self::default();
         fake.default_connections_empty.store(true, std::sync::atomic::Ordering::SeqCst);
         fake
+    }
+
+    /// Whether a run opened `session` on `at` and no close has ended it since.
+    pub fn session_open(&self, session: SessionId, at: &DatabasePath) -> bool {
+        lock(&self.sessions).contains(&(session, at.clone()))
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -200,7 +221,7 @@ impl Core for FakeCore {
         Ok(())
     }
 
-    async fn run(&self, run: RunId, _request: RunRequest) -> Result<ResultSet, CoreError> {
+    async fn run(&self, run: RunId, request: RunRequest) -> Result<ResultSet, CoreError> {
         self.record(Call::Run(run));
         let cancelled = || CoreError::new(CoreErrorKind::Cancelled, "cancelled");
         let is_cancelled = || lock(&self.cancelled).contains(&run);
@@ -208,7 +229,23 @@ impl Core for FakeCore {
         if is_cancelled() {
             return Err(cancelled());
         }
-        let wait = async {
+        let session = (request.session, DatabasePath { connection: request.connection, database: request.database.unwrap_or_default() });
+        lock(&self.sessions).insert(session);
+        let next = lock(&self.run).pop_front();
+        let deaf = next.as_ref().is_some_and(|s| s.deaf);
+        let answer = async {
+            match next {
+                Some(s) => {
+                    tokio::time::sleep(s.delay).await;
+                    s.result
+                }
+                None => unscripted("run"),
+            }
+        };
+        let cancel = async {
+            if deaf {
+                return std::future::pending().await;
+            }
             // Register for the signal before checking the flag, so a cancel
             // that lands in between is not missed.
             loop {
@@ -224,8 +261,8 @@ impl Core for FakeCore {
         // Biased, cancel first: a cancel always beats a reply that is ready.
         tokio::select! {
             biased;
-            _ = wait => Err(cancelled()),
-            r = reply(&self.run, || unscripted("run")) => r,
+            _ = cancel => Err(cancelled()),
+            r = answer => r,
         }
     }
 
@@ -235,9 +272,13 @@ impl Core for FakeCore {
         self.cancel_signal.notify_waiters();
     }
 
-    async fn close_session(&self, tab: TabId, at: &DatabasePath) -> Result<(), CoreError> {
-        self.record(Call::CloseSession(tab, at.clone()));
-        reply(&self.close_session, || unscripted("call")).await
+    async fn close_session(&self, session: SessionId, at: &DatabasePath) -> Result<(), CoreError> {
+        self.record(Call::CloseSession(session, at.clone()));
+        let result = reply(&self.close_session, || unscripted("call")).await;
+        if result.is_ok() {
+            lock(&self.sessions).remove(&(session, at.clone()));
+        }
+        result
     }
 
     async fn history(&self, _query: HistoryQuery) -> Result<Vec<HistoryEntry>, CoreError> {
@@ -254,7 +295,7 @@ mod tests {
     use super::*;
 
     fn conn(name: &str) -> Connection {
-        Connection { id: ConnectionId(name.into()), name: name.into(), kind: DbKind::Postgres, host: "localhost".into(), port: None, database: None, username: String::new(), tls: false, production: false }
+        Connection { id: ConnectionId(name.into()), name: name.into(), kind: DbKind::Postgres, host: "localhost".into(), port: None, database: None, username: String::new(), tls: false, production: false, query_timeout: None }
     }
 
     fn draft() -> ConnectionDraft {
@@ -288,7 +329,7 @@ mod tests {
         RunRequest {
             connection: ConnectionId("a".into()),
             database: None,
-            tab: TabId(1),
+            session: SessionId { tab: TabId(1), serial: 1 },
             buffer: "select 1".into(),
             cursor: Cursor::default(),
             selection: None,
@@ -331,7 +372,7 @@ mod tests {
             core.tables(&schema).await.err(),
             core.columns(&table).await.err(),
             core.run(RunId(1), request()).await.err(),
-            core.close_session(TabId(1), &db).await.err(),
+            core.close_session(SessionId { tab: TabId(1), serial: 1 }, &db).await.err(),
             core.history(HistoryQuery::default()).await.err(),
         ];
         for (i, r) in results.iter().enumerate() {
@@ -389,6 +430,43 @@ mod tests {
         core.cancel(RunId(7));
         let err = task.await.unwrap().unwrap_err();
         assert_eq!(err.kind, CoreErrorKind::Cancelled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deaf_run_ignores_a_cancel_and_ends_only_at_its_scripted_time() {
+        let core = Arc::new(FakeCore::new());
+        core.script_run(Scripted::ok(result_set()).after(Duration::from_secs(10)).deaf());
+        let task = tokio::spawn({
+            let core = core.clone();
+            async move { core.run(RunId(7), request()).await }
+        });
+        tokio::task::yield_now().await;
+        core.cancel(RunId(7));
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "the cancel did not land");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(task.await.unwrap().unwrap(), result_set());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_a_session_forgets_it_but_leaves_a_run_in_flight_on_it_to_finish_as_dbx_does() {
+        let core = Arc::new(FakeCore::new());
+        core.script_run(Scripted::ok(result_set()).after(Duration::from_secs(10)));
+        core.script_close_session(Scripted::ok(()));
+        let here = tokio::spawn({
+            let core = core.clone();
+            async move { core.run(RunId(1), request()).await }
+        });
+        tokio::task::yield_now().await;
+        let at = DatabasePath { connection: ConnectionId("a".into()), database: String::new() };
+        let other = SessionId { tab: TabId(1), serial: 2 };
+        assert!(core.session_open(request().session, &at), "the run opened its session");
+        assert!(!core.session_open(other, &at));
+        core.close_session(request().session, &at).await.unwrap();
+        assert!(!core.session_open(request().session, &at));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(here.await.unwrap().unwrap(), result_set(), "the run was not ended by the close");
     }
 
     #[tokio::test]

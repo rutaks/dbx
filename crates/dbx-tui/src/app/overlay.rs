@@ -20,6 +20,17 @@ pub enum Overlay {
     /// Something the user asked for failed and there is nothing to retry from
     /// here: say why, and let them go on.
     Failure(FailureOverlay),
+    /// A second cancel while the first has not landed: "close this tab's
+    /// session?", naming the database.
+    ConfirmDropSession(ConfirmDropSession),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmDropSession {
+    /// `connection / database`, as the editor's title names it.
+    pub target: String,
+    /// The run ended while the question was open: the box only says so.
+    pub stopped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +80,8 @@ pub enum OverlayAction {
     DiscardNo,
     /// The removal question: remove.
     RemoveYes,
+    /// The second-cancel question: close the session.
+    DropSessionYes,
     /// Close a notice or a question without doing anything.
     Dismiss,
 }
@@ -113,6 +126,12 @@ const DISCARD_BUTTONS: &[ButtonSpec] =
     &[button("↵", "enter", "discard", OverlayAction::DiscardYes), button("esc", "esc", "keep editing", OverlayAction::DiscardNo)];
 const REMOVE_BUTTONS: &[ButtonSpec] =
     &[button("↵", "enter", "remove", OverlayAction::RemoveYes), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
+const STOPPED_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "close", OverlayAction::Dismiss), button("esc", "esc", "close", OverlayAction::Dismiss)];
+const DROP_SESSION_BUTTONS: &[ButtonSpec] = &[
+    button("↵", "enter", "new session", OverlayAction::DropSessionYes),
+    button("esc", "esc", "keep waiting", OverlayAction::Dismiss),
+];
 // `esc` also closes a failure notice (see `App::on_overlay_key`): backing out
 // one level always works.
 const FAILURE_BUTTONS: &[ButtonSpec] = &[button("↵", "enter", "close", OverlayAction::Dismiss)];
@@ -129,6 +148,8 @@ impl Overlay {
             Overlay::Form(_) => FORM_BUTTONS,
             Overlay::ConfirmRemove(_) => REMOVE_BUTTONS,
             Overlay::Failure(_) => FAILURE_BUTTONS,
+            Overlay::ConfirmDropSession(ask) if ask.stopped => STOPPED_BUTTONS,
+            Overlay::ConfirmDropSession(_) => DROP_SESSION_BUTTONS,
         }
     }
 }

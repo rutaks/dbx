@@ -13,7 +13,7 @@ mod common;
 use common::*;
 use dbx_tui::core::{
     Cell, CellKind, ConnectionDraft, ConnectionId, Core, CoreErrorKind, Cursor, DatabasePath, DbxCore, RunId, RunRequest,
-    SchemaPath, TabId, TableKind, TablePath, DEFAULT_ROW_CAP,
+    SchemaPath, SessionId, TabId, TableKind, TablePath, DEFAULT_ROW_CAP,
 };
 
 const FIXTURE_PASSWORD: &str = "dbxtui";
@@ -330,12 +330,17 @@ fn run_request(id: &ConnectionId, database: &str, tab: u32, buffer: &str) -> Run
     RunRequest {
         connection: id.clone(),
         database: Some(database.into()),
-        tab: TabId(tab),
+        session: tab_session(tab),
         buffer: buffer.into(),
         cursor,
         selection: None,
         row_cap: DEFAULT_ROW_CAP,
     }
+}
+
+/// The first session of tab `tab`.
+fn tab_session(tab: u32) -> SessionId {
+    SessionId { tab: TabId(tab), serial: 1 }
 }
 
 fn texts(rows: &[Vec<Cell>]) -> Vec<Vec<Option<String>>> {
@@ -414,14 +419,14 @@ async fn closing_a_tabs_session_ends_it_and_releasing_the_database_does_not() {
     core.release(&database(&id, "edge")).await.unwrap();
     assert_eq!(texts(&run("show search_path").await.unwrap().rows), vec![vec![Some("other".to_string())]]);
     let before = server_connections("edge");
-    core.close_session(TabId(1), &database(&id, "edge")).await.expect("close");
+    core.close_session(tab_session(1), &database(&id, "edge")).await.expect("close");
     let after = wait_for_server_connections("edge", before.len() - 1).await;
     eprintln!("OBSERVED edge connections with the tab's session open: {before:?}; after closing it: {after:?}");
     assert_eq!(after.len(), before.len() - 1, "the session's server connection is gone");
     // The next run starts a new session, with the default search path.
     assert_eq!(texts(&run("show search_path").await.unwrap().rows), vec![vec![Some("\"$user\", public".to_string())]]);
-    core.close_session(TabId(1), &database(&id, "edge")).await.unwrap();
-    core.close_session(TabId(9), &database(&id, "edge")).await.expect("closing a session that never existed is fine");
+    core.close_session(tab_session(1), &database(&id, "edge")).await.unwrap();
+    core.close_session(tab_session(9), &database(&id, "edge")).await.expect("closing a session that never existed is fine");
 }
 
 #[tokio::test]
@@ -454,7 +459,7 @@ async fn a_statement_without_a_result_set_reports_the_rows_it_changed() {
     assert_eq!(set.affected, 3);
     let empty = run("select x from scratch_05 where x > 99").await.unwrap();
     assert_eq!((empty.columns.len(), empty.rows.len()), (1, 0), "an empty result keeps its header");
-    core.close_session(TabId(1), &database(&id, "edge")).await.unwrap();
+    core.close_session(tab_session(1), &database(&id, "edge")).await.unwrap();
 }
 
 #[tokio::test]
@@ -505,12 +510,17 @@ fn rand_id() -> u64 {
 /// The fixture connection saved as another dbx head would, with
 /// `query_timeout_secs` set.
 async fn seeded_with_timeout(core: &DbxCore, secs: u64) -> ConnectionId {
+    seeded_with_timeout_at(core, secs, 55433).await
+}
+
+/// `seeded_with_timeout`, reached through `port` (a proxy).
+async fn seeded_with_timeout_at(core: &DbxCore, secs: u64, port: u16) -> ConnectionId {
     core.seed_config(serde_json::json!({
-        "id": format!("timeout-{secs}"),
+        "id": format!("timeout-{secs}-{port}"),
         "name": format!("timeout {secs}"),
         "db_type": "postgres",
         "host": "127.0.0.1",
-        "port": 55433,
+        "port": port,
         "username": "postgres",
         "password": FIXTURE_PASSWORD,
         "database": "pagila",
@@ -568,4 +578,327 @@ async fn a_cancel_lands_even_while_another_core_call_holds_the_state_lock() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), running).await.expect("cancelled promptly").unwrap();
     eprintln!("OBSERVED cancel under a held lock: {:?} after {:?}", result.as_ref().err(), started.elapsed());
     assert_eq!(result.expect_err("cancelled").kind, CoreErrorKind::Cancelled);
+}
+
+// ---- slice 06: cancel, timeouts, sessions -------------------------------------------
+
+/// How many backends on the fixture are running a statement containing
+/// `tag` (read through `docker exec`, so this query is not one of them).
+fn running_on_server(tag: &str) -> usize {
+    let sql = format!(
+        "select count(*) from pg_stat_activity where query like '%{tag}%' and pid <> pg_backend_pid() and state = 'active'"
+    );
+    let out = std::process::Command::new("docker")
+        .args(["exec", "dbxtui-fixtures-postgres-1", "psql", "-U", "postgres", "-d", "postgres", "--no-psqlrc", "-tA", "-c", &sql])
+        .output()
+        .expect("docker exec psql");
+    assert!(out.status.success(), "psql: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().parse().expect("a count")
+}
+
+/// Waits up to `secs` for nothing to be running with `tag`; returns how long it took.
+async fn gone_within(tag: &str, secs: u64) -> Option<std::time::Duration> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(secs) {
+        if running_on_server(tag) == 0 {
+            return Some(started.elapsed());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// A unique tag for one test's statements.
+fn tag(what: &str) -> String {
+    format!("dbxtui_{what}_{}", std::process::id())
+}
+
+#[tokio::test]
+async fn pg_sleep_30_cancelled_after_a_second_returns_cancelled_within_three_seconds_leaves_nothing_running_and_the_tab_runs_again() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    let id = saved_fixture(&core).await;
+    let probe = tag("cancel");
+    let running = tokio::spawn({
+        let (core, id, sql) = (core.clone(), id.clone(), format!("select pg_sleep(30) as {probe}"));
+        async move { core.run(RunId(1), run_request(&id, "pagila", 1, &sql)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(running_on_server(&probe), 1, "the statement is running on the server");
+    let asked = std::time::Instant::now();
+    core.cancel(RunId(1));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), running).await.expect("within three seconds").unwrap();
+    let took = asked.elapsed();
+    let err = result.expect_err("cancelled");
+    assert_eq!(err.kind, CoreErrorKind::Cancelled, "{err:?}");
+    let gone = gone_within(&probe, 1).await.expect("pg_stat_activity shows no such statement");
+    eprintln!("OBSERVED cancel: the run returned {took:?} after the cancel; the server showed nothing running {gone:?} later");
+    let next = core.run(RunId(2), run_request(&id, "pagila", 1, "select 1")).await.expect("the next run on the same tab");
+    assert_eq!(next.rows, vec![vec![Cell::Value("1".into())]]);
+}
+
+#[tokio::test]
+async fn a_cancel_that_arrives_before_the_run_has_registered_is_not_lost() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let probe = tag("early");
+    // The cancel comes first, as when ctrl+c follows f5 before dbx has
+    // registered the run.
+    core.cancel(RunId(5));
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        core.run(RunId(5), run_request(&id, "pagila", 1, &format!("select pg_sleep(30) as {probe}"))),
+    )
+    .await
+    .expect("a cancelled run returns promptly");
+    assert_eq!(result.expect_err("cancelled").kind, CoreErrorKind::Cancelled);
+    eprintln!("OBSERVED early cancel: returned after {:?}", started.elapsed());
+    assert_eq!(running_on_server(&probe), 0);
+}
+
+#[tokio::test]
+async fn a_one_second_timeout_on_pg_sleep_30_returns_timeout_and_leaves_nothing_running() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = seeded_with_timeout(&core, 1).await;
+    let probe = tag("timeout");
+    let started = std::time::Instant::now();
+    let err = core
+        .run(RunId(1), run_request(&id, "pagila", 1, &format!("select pg_sleep(30) as {probe}")))
+        .await
+        .expect_err("cut");
+    eprintln!("OBSERVED timeout after {:?}: {err:?}", started.elapsed());
+    assert_eq!(err.kind, CoreErrorKind::Timeout, "{err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    let gone = gone_within(&probe, 3).await;
+    eprintln!("OBSERVED after the timeout, nothing running on the server after {gone:?}");
+    assert!(gone.is_some(), "a timed-out statement is stopped on the server too");
+}
+
+#[tokio::test]
+async fn closing_one_session_of_a_tab_leaves_a_later_session_of_the_same_tab_on_the_same_database_open() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let on = |serial: u32, sql: &str| {
+        let mut r = run_request(&id, "edge", 1, sql);
+        r.session = SessionId { tab: TabId(1), serial };
+        r
+    };
+    // The tab on edge (session 1), then elsewhere, then on edge again (session 3).
+    core.run(RunId(1), on(1, "set search_path to other")).await.unwrap();
+    core.run(RunId(2), on(3, "create temp table kept_06 (x int)")).await.unwrap();
+    // The late close of the first session.
+    core.close_session(SessionId { tab: TabId(1), serial: 1 }, &database(&id, "edge")).await.unwrap();
+    let still = core.run(RunId(3), on(3, "select count(*) from kept_06")).await.expect("session 3 still has its temp table");
+    assert_eq!(still.rows, vec![vec![Cell::Value("0".into())]]);
+    let fresh = core.run(RunId(4), on(1, "show search_path")).await.unwrap();
+    assert_eq!(texts(&fresh.rows), vec![vec![Some("\"$user\", public".to_string())]], "session 1 was closed");
+    for serial in [1, 3] {
+        core.close_session(SessionId { tab: TabId(1), serial }, &database(&id, "edge")).await.unwrap();
+    }
+}
+
+/// What the second cancel ("stop waiting") relies on and says: closing a
+/// session whose statement is still running returns at once and does not
+/// stop the statement. dbx keeps a busy Postgres connection until the run
+/// lets go of it; the statement runs to its end and the connection goes after.
+#[tokio::test]
+async fn closing_a_busy_session_returns_at_once_and_its_connection_goes_only_when_the_statement_ends() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    let id = saved_fixture(&core).await;
+    let probe = tag("close_busy");
+    let running = tokio::spawn({
+        let (core, id, sql) = (core.clone(), id.clone(), format!("select pg_sleep(3) as {probe}"));
+        async move { core.run(RunId(1), run_request(&id, "pagila", 1, &sql)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let during = server_connections("pagila");
+    let asked = std::time::Instant::now();
+    core.close_session(tab_session(1), &database(&id, "pagila")).await.expect("close");
+    let close_took = asked.elapsed();
+    eprintln!("OBSERVED close_session of a busy session returned after {close_took:?}");
+    assert!(close_took < std::time::Duration::from_millis(500), "{close_took:?}");
+    assert_eq!(running_on_server(&probe), 1, "the statement still runs");
+    assert_eq!(server_connections("pagila").len(), during.len(), "and its connection is still there");
+    let result = running.await.unwrap();
+    eprintln!("OBSERVED the run under a closed session ended after {:?}: {:?}", asked.elapsed(), result.as_ref().map(|r| r.rows.len()));
+    assert!(result.is_ok(), "it ran to its end");
+    let after = wait_for_server_connections("pagila", during.len() - 1).await;
+    assert_eq!(after.len(), during.len() - 1, "the connection went once the statement ended: {after:?}");
+}
+
+#[tokio::test]
+async fn removing_a_connection_after_its_cancelled_run_has_ended_leaves_nothing_running() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    let id = saved_fixture(&core).await;
+    let probe = tag("remove");
+    let running = tokio::spawn({
+        let (core, id, sql) = (core.clone(), id.clone(), format!("select pg_sleep(30) as {probe}"));
+        async move { core.run(RunId(1), run_request(&id, "pagila", 1, &sql)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // The app cancels first; the shell holds the removal until the run ends.
+    core.cancel(RunId(1));
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), running).await.expect("the run ended");
+    core.remove_connection(&id).await.expect("remove");
+    assert!(gone_within(&probe, 2).await.is_some());
+}
+
+/// A local proxy to the fixture that passes every Postgres connection through
+/// except a cancel request (protocol code 80877102 near the start of a
+/// connection), which it holds open unanswered: a cancel that never reaches
+/// the server. Returns its port.
+async fn cancel_swallowing_proxy() -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let Ok(upstream) = tokio::net::TcpStream::connect("127.0.0.1:55433").await else { return };
+                let (mut cr, mut cw) = client.into_split();
+                let (mut ur, mut uw) = upstream.into_split();
+                let down = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut ur, &mut cw).await;
+                });
+                let mut seen = Vec::new();
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let n = match cr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if seen.len() < 64 {
+                        seen.extend_from_slice(&buf[..n]);
+                        if seen.windows(4).take(60).any(|w| w == 80877102u32.to_be_bytes()) {
+                            // Held: never forwarded, never answered.
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    if uw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = uw.shutdown().await;
+                let _ = down.await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn a_cancel_that_never_reaches_the_server_does_not_end_the_run_before_the_statement_has() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    let port = cancel_swallowing_proxy().await;
+    let id = core
+        .save_connection(&ConnectionDraft { port: Some(port), ..fixture("proxied", FIXTURE_PASSWORD) })
+        .await
+        .expect("save")
+        .id;
+    let probe = tag("unlanded");
+    let running = tokio::spawn({
+        let (core, id, sql) = (core.clone(), id.clone(), format!("select pg_sleep(4) as {probe}"));
+        async move { core.run(RunId(1), run_request(&id, "pagila", 1, &sql)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let asked = std::time::Instant::now();
+    core.cancel(RunId(1));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(running_on_server(&probe), 1, "the cancel did not reach the server");
+    assert!(!running.is_finished(), "so the run has not ended: the statement is still running");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), running).await.expect("ends with the statement").unwrap();
+    eprintln!("OBSERVED a cancel that never reached the server: the run ended {:?} after it, with {:?}", asked.elapsed(), result.as_ref().err().map(|e| e.kind));
+    assert_eq!(result.expect_err("cancelled").kind, CoreErrorKind::Cancelled);
+    assert_eq!(running_on_server(&probe), 0, "when the run ends, the statement has");
+    core.run(RunId(2), run_request(&id, "pagila", 1, "select 1")).await.expect("the session works");
+}
+
+// ---- slice 06 review: the timeout path, and sessions the wait must not reopen -------
+
+#[tokio::test]
+async fn a_timeout_whose_cancel_never_reaches_the_server_is_not_reported_before_the_statement_has_ended() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let port = cancel_swallowing_proxy().await;
+    let id = seeded_with_timeout_at(&core, 1, port).await;
+    let probe = tag("timeout_unlanded");
+    let started = std::time::Instant::now();
+    let err = core
+        .run(RunId(1), run_request(&id, "pagila", 1, &format!("select pg_sleep(4) as {probe}")))
+        .await
+        .expect_err("timed out");
+    eprintln!("OBSERVED a timeout whose cancel never arrived: the run ended after {:?}: {err:?}", started.elapsed());
+    assert_eq!(err.kind, CoreErrorKind::Timeout, "{err:?}");
+    assert_eq!(running_on_server(&probe), 0, "when the run reports the timeout, the statement has ended");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(3_500), "not before: {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_set_made_before_a_timed_out_statement_is_still_in_effect_afterwards_on_the_same_connection() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = seeded_with_timeout(&core, 1).await;
+    let run = |n: u64, sql: &str| core.run(RunId(n), run_request(&id, "pagila", 1, sql));
+    run(1, "set search_path to other").await.expect("set");
+    let pid = texts(&run(2, "select pg_backend_pid()").await.unwrap().rows);
+    let probe = tag("timeout_session");
+    let err = run(3, &format!("select pg_sleep(30) as {probe}")).await.expect_err("timed out");
+    assert_eq!(err.kind, CoreErrorKind::Timeout, "{err:?}");
+    assert!(err.message.contains("was stopped"), "{}", err.message);
+    assert_eq!(running_on_server(&probe), 0);
+    assert_eq!(texts(&run(4, "select pg_backend_pid()").await.unwrap().rows), pid, "the same connection");
+    let path = run(5, "show search_path").await.expect("show");
+    assert_eq!(texts(&path.rows), vec![vec![Some("other".to_string())]], "the session survived the timeout");
+    core.close_session(tab_session(1), &database(&id, "pagila")).await.unwrap();
+}
+
+#[tokio::test]
+async fn closing_the_session_of_a_run_whose_cancel_is_slow_leaves_no_connection_for_it_once_the_run_ends() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(s.core());
+    let port = cancel_swallowing_proxy().await;
+    let id = core
+        .save_connection(&ConnectionDraft { port: Some(port), ..fixture("proxied", FIXTURE_PASSWORD) })
+        .await
+        .expect("save")
+        .id;
+    let probe = tag("slow_close");
+    let running = tokio::spawn({
+        let (core, id, sql) = (core.clone(), id.clone(), format!("select pg_sleep(3) as {probe}"));
+        async move { core.run(RunId(1), run_request(&id, "pagila", 1, &sql)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let during = server_connections("pagila");
+    // Stop waiting: the cancel goes nowhere, and the session is closed while
+    // the statement still runs.
+    core.cancel(RunId(1));
+    let closed = std::time::Instant::now();
+    core.close_session(tab_session(1), &database(&id, "pagila")).await.expect("close");
+    eprintln!("OBSERVED close_session of a busy session returned after {:?}", closed.elapsed());
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), running).await.expect("the run ends").unwrap();
+    eprintln!("OBSERVED the run of a closed session ended with {:?}; still running on the server: {}", result.as_ref().err().map(|e| e.kind), running_on_server(&probe));
+    // Its session is closed, so nothing waits on it: the statement may still
+    // run (the cancel went nowhere) and ends on its own.
+    assert!(gone_within(&probe, 5).await.is_some());
+    let after = wait_for_server_connections("pagila", during.len() - 1).await;
+    eprintln!("OBSERVED pagila connections while running {during:?}, after {after:?}");
+    assert_eq!(after.len(), during.len() - 1, "no connection is left, or opened again, for the closed session");
 }

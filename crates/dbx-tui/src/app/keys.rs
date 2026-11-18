@@ -141,6 +141,12 @@ pub enum Action {
     Run,
     /// The same, from a direct key (`f5`, `alt+enter`).
     RunDirect,
+    /// Cancel the tab's run; while a cancel is waiting to land, offer to drop
+    /// the tab's session.
+    Cancel,
+    /// The same, from a direct key (`ctrl+c`), which works only while the
+    /// editor or the results pane has focus and otherwise does nothing.
+    CancelDirect,
     // The sidebar's own keys.
     MoveDown,
     MoveUp,
@@ -168,6 +174,7 @@ impl Action {
             Action::Quit => "quit",
             Action::OpenPrefix => "prefix",
             Action::Run | Action::RunDirect => "run",
+            Action::Cancel | Action::CancelDirect => "cancel",
             Action::MoveDown | Action::MoveUp => "move",
             Action::Expand => "expand",
             Action::Collapse => "collapse",
@@ -191,8 +198,9 @@ impl Action {
             | Action::NewConnection
             | Action::Quit
             | Action::Run
+            | Action::Cancel
             | Action::OpenPrefix => Scope::Prefix,
-            Action::RunDirect => Scope::Direct,
+            Action::RunDirect | Action::CancelDirect => Scope::Direct,
             _ => Scope::Sidebar,
         }
     }
@@ -221,10 +229,15 @@ impl Default for Keybinds {
                 (plain('l'), Action::FocusRight),
                 (plain('n'), Action::NewConnection),
                 (plain('r'), Action::Run),
+                (plain('c'), Action::Cancel),
                 (plain('z'), Action::Zoom),
                 (plain('q'), Action::Quit),
             ],
-            direct: vec![(key("f5"), Action::RunDirect), (key("alt+enter"), Action::RunDirect)],
+            direct: vec![
+                (key("f5"), Action::RunDirect),
+                (key("alt+enter"), Action::RunDirect),
+                (key("ctrl+c"), Action::CancelDirect),
+            ],
             sidebar: vec![
                 (key("j"), Action::MoveDown),
                 (key("down"), Action::MoveDown),

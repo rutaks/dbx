@@ -16,11 +16,15 @@ fn main() {
     // failure there, like any store failure, is shown in the client.
     let core = Arc::new(DbxCore::from_env());
     let result = runtime.block_on(shell::run(core));
-    // The terminal is already restored. Do not wait for Core calls still in
+    // The terminal is already restored (the guard is dropped inside `run`). Do not wait for Core calls still in
     // flight: quitting is immediate.
     runtime.shutdown_background();
-    if let Err(e) = result {
-        eprintln!("dbx-tui: {e}");
-        std::process::exit(1);
+    match result {
+        Ok(Some(note)) => eprintln!("dbx-tui: {note}"),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("dbx-tui: {e}");
+            std::process::exit(1);
+        }
     }
 }

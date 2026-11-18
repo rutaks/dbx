@@ -7,7 +7,9 @@ ROOT="$(cd "$JOURNEY_DIR/../../../.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="$TARGET_DIR/debug/dbx-tui"
 OUT="${JOURNEY_OUT:-$(mktemp -d)}"
-SOCK="dbxtui-test"
+# One tmux server per journey run, so journeys run side by side cannot kill
+# each other's sessions.
+SOCK="dbxtui-$(basename "$0" .sh)-$$"
 SESSION="journey-$$"
 mkdir -p "$OUT"
 

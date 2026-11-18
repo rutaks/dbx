@@ -76,6 +76,22 @@ fn draw_overlay(overlay: &mut Overlay, p: &Painter, buf: &mut Buffer) -> Drawn {
             let buttons = message_box(p, buf, "Remove connection", &message, buttons, Role::Red, Role::Red);
             Drawn { buttons, fields: Vec::new() }
         }
+        Overlay::ConfirmDropSession(ask) if ask.stopped => {
+            let buttons = message_box(p, buf, "Statement stopped", "The statement has stopped. There is nothing left to stop waiting for.", buttons, Role::Accent, Role::Accent);
+            Drawn { buttons, fields: Vec::new() }
+        }
+        Overlay::ConfirmDropSession(ask) => {
+            let message = format!(
+                "The statement has not stopped yet. This tab can stop waiting and run again at once, in a new session \
+                 on {}. The current session is closed once dbx lets go of the statement: its SET values and temporary \
+                 tables go with it, and an open transaction is rolled back. The statement itself may keep running: a \
+                 write outside a transaction is committed when it ends, and until then it may hold locks that make this \
+                 tab's statements wait.",
+                ask.target
+            );
+            let buttons = message_box(p, buf, "Close this tab's session?", &message, buttons, Role::Red, Role::Red);
+            Drawn { buttons, fields: Vec::new() }
+        }
         Overlay::Form(form) => form::draw(form, buttons, p, buf),
     }
 }
@@ -478,13 +494,31 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     let one = |action: Action, desc: &'static str| keys.key_for(action).map(|k| Hint { keys: vec![(k, action)], desc });
     let mut hints = Vec::new();
     let prefix = Hint { keys: vec![(keys.prefix.to_string(), Action::OpenPrefix)], desc: "prefix" };
+    // While a run is in flight, cancelling it comes first: ctrl+c where it
+    // works (the editor and the results), the prefix command elsewhere.
+    // While the cancel waits to land, pressing it again offers to stop waiting.
+    if let Some(desc) = match app.tab().run {
+        super::query::RunState::Running { .. } => Some("cancel"),
+        super::query::RunState::Cancelling { .. } => Some("stop waiting"),
+        _ => None,
+    } {
+        match app.ui.focus {
+            PaneId::Editor | PaneId::Results => hints.extend(one(Action::CancelDirect, desc)),
+            PaneId::Sidebar => {
+                if let Some(k) = keys.key_for(Action::Cancel) {
+                    hints.push(Hint { keys: vec![(format!("{} {k}", keys.prefix), Action::Cancel)], desc });
+                }
+            }
+        }
+    }
     if app.ui.focus == PaneId::Editor {
         hints.extend(one(Action::RunDirect, "run"));
         hints.push(prefix);
         return hints;
     }
     if app.ui.focus != PaneId::Sidebar || !matches!(&app.model.connections, Loadable::Ready(_)) {
-        return vec![prefix];
+        hints.push(prefix);
+        return hints;
     }
     // Most relevant first, because a hint that does not fit is dropped and
     // the ones after it with it: what the row under the cursor can do, then
@@ -550,7 +584,11 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
         Mode::Prefix { .. } => {
             x = p.put(buf, x + 1, r.y, " PREFIX ", label(Role::Yellow));
             let mut h = app.ui.keys.prefix_hints();
-            h.push(Hint { keys: vec![("esc".to_string(), Action::OpenPrefix)], desc: "cancel" });
+            // Cancel is offered only while there is something to cancel.
+            if app.tab().run.in_flight().is_none() {
+                h.retain(|hint| hint.keys.iter().all(|(_, a)| *a != Action::Cancel));
+            }
+            h.push(Hint { keys: vec![("esc".to_string(), Action::OpenPrefix)], desc: "back" });
             h
         }
     };
@@ -590,15 +628,35 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
     hit_rects
 }
 
-/// The tab's run state for the mode bar: running with its elapsed whole
-/// seconds, then the row count (`+` when the row cap cut it) and duration, or
-/// the failure.
+/// The tab's run state for the mode bar: running or cancelling with its
+/// elapsed whole seconds, cancelled and after how long, then for a run that
+/// gave a result the row count (`+` when the row cap cut it) and duration,
+/// the failure, or the timeout.
 fn run_state(app: &App) -> Option<(String, Role)> {
-    use super::query::{Outcome, RunState};
+    use super::query::{CancelEnd, Outcome, RunState};
     let tab = app.tab();
-    if let RunState::Running { started, .. } = tab.run {
-        let secs = app.ui.now.map_or(0, |now| now.saturating_duration_since(started).as_secs());
-        return Some((format!("running {secs}s"), Role::Yellow));
+    let secs = |started: std::time::Instant| app.ui.now.map_or(0, |now| now.saturating_duration_since(started).as_secs());
+    match &tab.run {
+        RunState::Running { started, .. } => {
+            return Some(match timeout_phase(app, *started) {
+                Some(false) => (format!("timed out: stopping… {}s", secs(*started)), Role::Yellow),
+                Some(true) => (format!("timed out, not stopped yet {}s", secs(*started)), Role::Red),
+                None => (format!("running {}s", secs(*started)), Role::Yellow),
+            })
+        }
+        RunState::Cancelling { started, stuck: false, .. } => return Some((format!("cancelling… {}s", secs(*started)), Role::Yellow)),
+        RunState::Cancelling { started, stuck: true, .. } => {
+            return Some((format!("not stopped yet {}s", secs(*started)), Role::Red))
+        }
+        RunState::Cancelled { after, how, .. } => {
+            return Some(match how {
+                CancelEnd::Stopped => (format!("cancelled after {}", duration_text(*after)), Role::Subtext0),
+                CancelEnd::FinishedFirst => ("finished before the cancel".to_string(), Role::Peach),
+                CancelEnd::Failed(_) => (format!("failed after the cancel, {}", duration_text(*after)), Role::Red),
+                CancelEnd::Abandoned => ("stopped waiting: not confirmed stopped".to_string(), Role::Peach),
+            });
+        }
+        RunState::Idle => {}
     }
     match tab.outcome.as_ref()? {
         Outcome::Rows(set) if set.columns.is_empty() => {
@@ -609,15 +667,19 @@ fn run_state(app: &App) -> Option<(String, Role)> {
             let noun = if set.rows.len() == 1 && !set.truncated { "row" } else { "rows" };
             Some((format!("{}{plus} {noun}  {}", thousands(set.rows.len()), duration_text(set.elapsed)), Role::Subtext0))
         }
-        Outcome::Failed { error, elapsed } => {
-            let what = match error.kind {
-                crate::core::CoreErrorKind::Cancelled => "cancelled",
-                crate::core::CoreErrorKind::Timeout => "timed out",
-                _ => "failed",
-            };
-            Some((format!("{what}  {}", duration_text(*elapsed)), Role::Red))
-        }
+        Outcome::TimedOut { elapsed, .. } => Some((format!("timed out after {}", duration_text(*elapsed)), Role::Peach)),
+        Outcome::Failed { elapsed, .. } => Some((format!("failed  {}", duration_text(*elapsed)), Role::Red)),
     }
+}
+
+/// Where a run started at `started` is against its connection's query
+/// timeout: `None` before it (or with no timeout), `Some(false)` once it has
+/// passed and the run is being cancelled for it, `Some(true)` once the cancel
+/// has not stopped it within `CANCEL_BOUND` either.
+pub(super) fn timeout_phase(app: &App, started: std::time::Instant) -> Option<bool> {
+    let limit = app.tab_timeout()?;
+    let ran = app.ui.now?.saturating_duration_since(started);
+    (ran >= limit).then_some(ran >= limit + super::query::CANCEL_BOUND)
 }
 
 /// `3 rows affected`, `1 row affected`.
@@ -650,6 +712,9 @@ pub(super) fn duration_text(d: std::time::Duration) -> String {
 
 /// The notice: a small bordered card in the bottom right corner, above the
 /// mode bar, with a coloured `●`. It takes no input and expires on its own.
+/// It never covers the mode bar or the head of the results pane (the run's
+/// state and what ran): when the results pane has no room below its head,
+/// the card sits just above the pane instead, over the editor.
 fn draw_notice(app: &App, p: &Painter, buf: &mut Buffer) {
     let Some(notice) = &app.ui.notice else { return };
     let area = buf.area;
@@ -657,9 +722,27 @@ fn draw_notice(app: &App, p: &Painter, buf: &mut Buffer) {
         return;
     }
     let width = (width_of(&notice.text) + 6).min(48).min(area.width - 2);
-    let lines = panel::wrap(&notice.text, width.saturating_sub(6) as usize);
+    let mut lines = panel::wrap(&notice.text, width.saturating_sub(6) as usize);
+    let hits = &app.ui.hits;
+    let results = hits.results;
+    let floor = if hits.mode_bar.is_empty() { area.bottom() } else { hits.mode_bar.y };
+    let (top_limit, bottom) = if results.is_empty() {
+        (area.y, floor)
+    } else {
+        let head = results.y + 1 + results::head_rows(app, results.width.saturating_sub(1));
+        if floor.saturating_sub(head) >= 3 {
+            (head, floor)
+        } else {
+            (area.y, results.y)
+        }
+    };
+    let room = bottom.saturating_sub(top_limit);
+    if room < 3 {
+        return;
+    }
+    lines.truncate((room - 2) as usize);
     let height = lines.len() as u16 + 2;
-    let rect = Rect::new(area.right() - width - 1, area.bottom().saturating_sub(height + 1), width, height).intersection(area);
+    let rect = Rect::new(area.right() - width - 1, bottom - height, width, height).intersection(area);
     let inner = panel::panel(p, buf, rect, "notice", Role::SurfaceDim, Role::Overlay0);
     if inner.is_empty() {
         return;

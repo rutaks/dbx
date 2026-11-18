@@ -29,6 +29,19 @@ pub struct RunId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TabId(pub u32);
 
+/// One database session of a query tab: dbx's `client_session_id`. A tab
+/// starts a new session, with the next `serial`, whenever it is given another
+/// target or its session is dropped. A session is therefore never reopened
+/// once its close has been asked for, and a close that lands late (it waits
+/// for the tab's run to end first) cannot end a session opened after it: a
+/// tab given database A, then B, then A again runs on A in a session other
+/// than the one being closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId {
+    pub tab: TabId,
+    pub serial: u32,
+}
+
 // ---- connections -----------------------------------------------------------
 
 /// The kind of database server a connection reaches.
@@ -78,6 +91,9 @@ pub struct Connection {
     pub tls: bool,
     /// dbx marks the connection as production: writes need confirming.
     pub production: bool,
+    /// The connection's own query timeout in seconds, when it sets one: the
+    /// longest a run may take before it is cancelled. `None` is no limit.
+    pub query_timeout: Option<u64>,
 }
 
 /// `s` made safe to draw: control characters (which a terminal would act on,
@@ -211,7 +227,8 @@ pub struct Cursor {
 pub struct RunRequest {
     pub connection: ConnectionId,
     pub database: Option<String>,
-    pub tab: TabId,
+    /// The tab's session the statement runs in.
+    pub session: SessionId,
     pub buffer: String,
     pub cursor: Cursor,
     pub selection: Option<(Cursor, Cursor)>,
@@ -379,10 +396,10 @@ pub trait Core: Send + Sync {
     /// returns `CoreErrorKind::Cancelled` promptly.
     async fn run(&self, run: RunId, request: RunRequest) -> Result<ResultSet, CoreError>;
     fn cancel(&self, run: RunId);
-    /// Ends the database session query tab `tab` holds on database `at`, if
-    /// it has one: its `SET`s, temporary tables and open transaction go with
-    /// it. The next run of the tab there starts a new session.
-    async fn close_session(&self, tab: TabId, at: &DatabasePath) -> Result<(), CoreError>;
+    /// Ends the database session `session` holds on database `at`, if there
+    /// is one: its `SET`s, temporary tables and open transaction go with it.
+    /// Another session of the same tab is not touched.
+    async fn close_session(&self, session: SessionId, at: &DatabasePath) -> Result<(), CoreError>;
 
     async fn history(&self, query: HistoryQuery) -> Result<Vec<HistoryEntry>, CoreError>;
 }

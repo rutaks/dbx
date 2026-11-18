@@ -29,6 +29,17 @@ pub enum Target {
     RemoveConnection(ConnectionId),
 }
 
+/// What a reply is, by the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settled {
+    /// The reply to the latest request for its target.
+    Current(Target),
+    /// The reply to a request that was superseded.
+    Stale(Target),
+    /// Already taken, forgotten, or never issued.
+    Unknown,
+}
+
 #[derive(Debug, Default)]
 pub struct Requests {
     next_id: u64,
@@ -83,8 +94,23 @@ impl Requests {
     /// reply is current, and `None` when it is stale, already taken or
     /// unknown: the caller drops it without touching state.
     pub fn finish(&mut self, id: RequestId) -> Option<Target> {
-        let (target, generation) = self.pending.remove(&id)?;
-        (self.generations.get(&target) == Some(&generation)).then_some(target)
+        match self.settle(id) {
+            Settled::Current(target) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// `finish`, telling a stale reply (its target is known, but a newer
+    /// request or a cancel superseded it) from an unknown one. A stale reply
+    /// must not change what is shown; it can still say that the work it
+    /// carried is over (a cancelled run has ended).
+    pub fn settle(&mut self, id: RequestId) -> Settled {
+        let Some((target, generation)) = self.pending.remove(&id) else { return Settled::Unknown };
+        if self.generations.get(&target) == Some(&generation) {
+            Settled::Current(target)
+        } else {
+            Settled::Stale(target)
+        }
     }
 
     fn bump(&mut self, target: &Target) -> u64 {
@@ -141,6 +167,19 @@ mod tests {
         assert!(t.finish(id).is_some());
         assert_eq!(t.finish(id), None);
         assert_eq!(t.finish(RequestId(999)), None);
+    }
+
+    #[test]
+    fn settling_tells_a_stale_reply_from_an_unknown_one() {
+        let mut t = Requests::default();
+        let old = t.begin(Target::Run(TabId(1)));
+        let new = t.begin(Target::Run(TabId(1)));
+        assert_eq!(t.settle(old), Settled::Stale(Target::Run(TabId(1))));
+        assert_eq!(t.settle(old), Settled::Unknown, "taken once");
+        assert_eq!(t.settle(new), Settled::Current(Target::Run(TabId(1))));
+        let forgotten = t.begin(node("a"));
+        t.forget(&node("a"));
+        assert_eq!(t.settle(forgotten), Settled::Unknown, "a forgotten target's reply is not even stale");
     }
 
     #[test]

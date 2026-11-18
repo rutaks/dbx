@@ -25,7 +25,7 @@ wait_for 02-prefix 'PREFIX'
 expect prefix 'h/j/k/l focus'
 expect prefix 'z zoom'
 expect prefix 'q quit'
-expect prefix 'esc cancel'
+expect prefix 'esc back'
 
 # prefix then l: focus moves to the editor
 tm send-keys -t "$SESSION" l

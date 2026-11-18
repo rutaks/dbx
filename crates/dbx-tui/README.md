@@ -67,32 +67,71 @@ gives it the database the connection was saved with.
 ## Running a statement (editor and results)
 
 The query tab owns its target (`editor · <connection> / <database>` in the
-editor's title) and a database session: dbx's `client_session_id` is the tab,
-so `SET`, temporary tables and transactions last from run to run. The session
-is closed when the tab is given another database or connection (a run still in
-flight there is cancelled first, and the close waits for that run to end so the
-cancel reaches the server) and on quit, by key, overlay or signal (the shell
-waits up to 2.5 s for runs to end and sessions to close); collapsing the database in the sidebar does not touch it, because
-`Core::release` removes only the database's shared pool.
+editor's title) and a database session: dbx's `client_session_id` is the tab
+and a serial (`dbx-tui-tab-1-2`), so `SET`, temporary tables and transactions
+last from run to run. The tab starts a new session, with the next serial,
+whenever it is given another database or connection, so a late close of the
+old one can never end the new one (a tab given A, then B, then A again). The
+old session is closed once a run still in flight there has ended (it is
+cancelled first, so the cancel can reach the server) or after 2 s, and on quit,
+by key, overlay or signal (the shell waits up to 2.5 s for runs to end and
+sessions to close); collapsing the database in the sidebar does not touch it,
+because `Core::release` removes only the database's shared pool. Removing a
+connection cancels a run on it first, and the removal waits for that run.
 
 | Key | Does |
 |---|---|
 | `f5`, `alt+enter`, `ctrl+g r` | run the selection, or else the statement under the cursor (dbx splits statements at `;`, and also before a line starting with a keyword such as `CREATE`, `INSERT`, `UPDATE`, `DELETE` or `SET`, but not `SELECT` or `WITH`, after two or more blank lines; a cursor on a blank line after a statement runs that statement) |
+| `ctrl+c` (editor or results focused), `ctrl+g c` (anywhere) | cancel the run; pressed again while the cancel has not landed, ask whether to stop waiting (below). With nothing running, `ctrl+c` does nothing at all |
 | anything else, editor focused | the editor's own (`ratatui-textarea` defaults: shift+arrows select, `ctrl+u`/`ctrl+r` undo/redo) |
-| `ctrl+c` | taken before the editor; cancels a run from slice 06 |
 
 A run has no time limit unless the connection sets its own query timeout in
 the dbx desktop app (dbx's default of 60 counts as unset); a pasted text over
 256 KiB, or with a line over 16 KiB, is refused with a notice.
 
-Only one run at a time per tab: a second is refused with a notice. The mode bar
-shows `running 3s` (woken each second through `next_deadline`), then `N rows
-12ms` (`N+` when the row cap of 1,000 cut the result), `N rows affected` or
-`failed`. The results pane starts with the first line of the statement that
-ran, then shows the header and the rows that fit, numbers
-right-aligned, NULL as a dimmed `∅`, a line break in a cell as `⏎`; a failed
-run shows dbx's message, `line L, column C` when Postgres gives a position, and
-the statement that ran with a `^` under the position.
+Only one run at a time per tab: a second is refused with a notice, while the
+first runs and while it is being cancelled (the session is one connection, and
+a new statement would only queue behind the old one). The run's state is on
+the right of the mode bar and at the top of the results pane:
+
+| State | Mode bar | Results pane |
+|---|---|---|
+| running | `running 3s` (woken each second through `next_deadline`) | `● running 3s`, then the last result, headed `earlier run:` |
+| timed out, stopping | `timed out: stopping… 3s`, once the connection's query timeout has passed | the same |
+| cancelling | `cancelling… 3s` | `● cancelling…`, the last result as above |
+| not stopped yet | `not stopped yet 3s`, red, 2 s after a cancel (or a timeout) the statement has not stopped | says the client cannot tell whether the cancel reached the server, and that `ctrl+c` again offers to stop waiting |
+| cancelled | `cancelled after 1.2s` | the statement cancelled, then the last result, headed `earlier run:` |
+| finished before the cancel | `finished before the cancel` | any changes it made stand; its result is not shown |
+| failed after the cancel | `failed after the cancel` | the error, named (the statement is not called stopped) |
+| stopped waiting | `stopped waiting: not confirmed stopped` | the tab runs in a new session |
+| done | `N rows 12ms` (`N+` when the row cap of 1,000 cut the result), `N rows affected` | the first line of the statement that ran, the header and the rows that fit, numbers right-aligned, NULL as a dimmed `∅`, a line break in a cell as `⏎` |
+| failed | `failed 4ms` | dbx's message, `line L, column C` when Postgres gives a position, and the statement that ran with a `^` under the position |
+| timed out | `timed out after 1.0s`, peach | `● Timed out`, naming the connection's query timeout as the limit, and saying it was stopped only when it was |
+
+A cancel bumps the run's generation, so nothing the run replies is shown; its
+reply only says it has ended, which moves the tab from cancelling to cancelled.
+Postgres never confirms a cancel, so `DbxCore` ends a cancelled run only once
+the tab's session answers a `select 1` again, that is once the statement has
+stopped: dbx itself returns as soon as it has sent the cancel request, even one
+that never arrived. That wait never opens a session (only one dbx still holds,
+and not one the tab has closed). The connection's query timeout is kept by
+`DbxCore`, not dbx: when it passes, the run is cancelled through its token like
+a user's cancel (dbx's own timeout would discard the session's connection, and
+with it the session's `SET`s, temporary tables and transaction), and the
+outcome is a timeout. A cancel lands in under 10 ms on the fixture.
+
+If a cancel has not stopped the statement after 2 s, a second cancel asks
+whether to stop waiting. Yes: the tab runs again at once in a new session, the
+old one is closed when dbx lets go of the statement, and the results pane says
+"an abandoned statement may still be running on <connection / database>"
+until that run's last reply arrives. The statement may keep running on the
+server: a write outside a transaction is committed when it ends, and until then
+it may hold locks that make the tab's statements wait. Closing a busy session
+returns at once but does not stop its statement; dbx drops the connection when
+the statement ends. Giving the tab another target, or removing its connection,
+while a run is in flight leaves the same marker. Quitting while a statement may
+still be running prints, once the terminal is restored,
+`dbx-tui: A statement may still be running on <connection / database>.`
 
 ## Tests
 
@@ -104,7 +143,7 @@ Run every command from the dbx workspace root.
 | Store: `DbxCore` on scratch stores (layer 1) | `cargo test -p dbx-tui --test store -- --test-threads=1` | nothing external; temp dirs, key files, a local TCP port |
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `first-query` and `quit-mid-run` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `add-connection`, `browse-pagila`, `cancel`, `first-query` and `quit-mid-run` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live
@@ -127,7 +166,7 @@ without a scratch key, and the one test that needs "no key at all" uses
 `with_managed_keys`, whose key policy never looks at the keychain. Journeys
 do the same through `lib.sh` (`$CLIENT` runs the binary on a scratch store
 with a scratch key); captures go to `$JOURNEY_OUT`, or a temp directory
-printed at the end. `browse-pagila` also starts a throwaway local socket that accepts and never answers (a listing that hangs, collapsed, and then in flight while the client quits). `examples/seed_store` takes the password from `DBX_TUI_SEED_PASSWORD` when set.
+printed at the end. `browse-pagila` also starts a throwaway local socket that accepts and never answers (a listing that hangs, collapsed, and then in flight while the client quits). `cancel` runs a small local proxy to the fixture that swallows Postgres cancel requests, for a cancel that never lands (the live tests have the same proxy in Rust). `examples/seed_store` saves a connection with a query timeout when `DBX_TUI_SEED_QUERY_TIMEOUT` is set. `examples/seed_store` takes the password from `DBX_TUI_SEED_PASSWORD` when set.
 
 ### Fixture databases
 

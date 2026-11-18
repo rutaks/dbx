@@ -238,7 +238,7 @@ fn mode_bar_hints_come_from_the_live_keybindings() {
     let mut app = ready_app();
     press(&mut app, "ctrl+g");
     let bar = frame_rows(&mut app, 100, 30)[29].clone();
-    for want in ["PREFIX", "h/j/k/l", "focus", "z", "zoom", "q", "quit", "esc", "cancel"] {
+    for want in ["PREFIX", "h/j/k/l", "focus", "z", "zoom", "q", "quit", "esc", "back"] {
         assert!(bar.contains(want), "{want:?} missing from {bar:?}");
     }
     app.ui.keys.rebind(Action::Quit, "x");
@@ -289,6 +289,7 @@ fn a_reply_with_a_stale_generation_changes_no_state() {
         username: String::new(),
         tls: false,
         production: false,
+        query_timeout: None,
     };
     let stale = app.update(Event::Core(old, CoreReply::Connections(Ok(vec![conn.clone()]))), base());
     assert!(!stale.repaint);
@@ -314,6 +315,7 @@ fn a_long_connection_list_stays_inside_the_sidebar_and_off_the_mode_bar() {
             username: String::new(),
             tls: false,
             production: false,
+            query_timeout: None,
         })
         .collect();
     let mut app = ready_app();

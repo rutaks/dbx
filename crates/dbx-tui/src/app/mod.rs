@@ -16,6 +16,8 @@ pub mod tree;
 pub(crate) mod view;
 
 #[cfg(test)]
+mod cancel_tests;
+#[cfg(test)]
 mod connections_tests;
 #[cfg(test)]
 mod form_tests;
@@ -34,12 +36,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
 use ratatui::Frame;
 
 use crate::core::{
-    Connection, ConnectionDraft, ConnectionId, CoreError, DatabasePath, ResultSet, RunId, RunRequest, TabId, DEFAULT_ROW_CAP,
+    Connection, ConnectionDraft, ConnectionId, CoreError, DatabasePath, ResultSet, RunId, RunRequest, SessionId, TabId, DEFAULT_ROW_CAP,
 };
 use keys::{Action, KeyCombo, Keybinds};
 use layout::{HintHit, HitMap};
 use overlay::{ErrorOverlay, FieldHit, Overlay, OverlayAction, OverlayButton};
-use requests::{RequestId, Requests, Target};
+use requests::{RequestId, Requests, Settled, Target};
 use query::{Notice, QueryTab};
 use sidebar::SidebarUi;
 use theme::Palette;
@@ -197,8 +199,9 @@ pub enum Command {
     /// Let the Core drop the server connections it holds for one database
     /// (its node collapsed). Fire and forget: nothing comes back.
     Release(DatabasePath),
-    /// End a query tab's database session on one database. Fire and forget.
-    CloseSession(TabId, DatabasePath),
+    /// End one session of a query tab, on one database, once a run still in
+    /// flight in it has ended (or a moment has passed). Fire and forget.
+    CloseSession(SessionId, DatabasePath),
     Quit,
 }
 
@@ -334,8 +337,9 @@ impl App {
                 } else if let Some(action) = self.ui.keys.lookup_direct(&combo) {
                     self.perform(action, now, fx);
                 } else if combo == CTRL_C {
-                    // Cancels a run (slice 06). It never reaches the editor,
-                    // whose own ctrl+c is a copy into its private buffer.
+                    // Bound to cancel by default (a direct key, above). Even
+                    // if rebound, it never reaches the editor, whose own
+                    // ctrl+c is a copy into its private buffer.
                 } else {
                     match self.ui.focus {
                         PaneId::Sidebar => self.on_sidebar_key(combo, fx),
@@ -385,6 +389,15 @@ impl App {
             }
             (Action::Run | Action::RunDirect, _) => {
                 self.run_statement(now, fx);
+                None
+            }
+            (Action::Cancel, _) => {
+                self.cancel_run(now, fx);
+                None
+            }
+            // ctrl+c cancels only where the run is: the editor and the results.
+            (Action::CancelDirect, Editor | Results) => {
+                self.cancel_run(now, fx);
                 None
             }
             _ => None,
@@ -483,6 +496,7 @@ impl App {
                 fx.repaint = true;
             }
             OverlayAction::RemoveYes => self.confirm_remove(fx),
+            OverlayAction::DropSessionYes => self.drop_session(fx),
             OverlayAction::Dismiss => {
                 self.ui.overlay = None;
                 fx.repaint = true;
@@ -491,8 +505,18 @@ impl App {
     }
 
     fn on_reply(&mut self, id: RequestId, reply: CoreReply, fx: &mut Effects) {
-        // A stale reply is dropped without touching state or repainting.
-        let Some(target) = self.model.requests.finish(id) else { return };
+        // A stale reply is dropped without touching state or repainting,
+        // except that a cancelled run's last word says it has ended.
+        let target = match self.model.requests.settle(id) {
+            Settled::Current(target) => target,
+            Settled::Stale(Target::Run(_)) => {
+                if let CoreReply::Ran(result) = reply {
+                    self.on_ran_after_cancel(id, result, fx);
+                }
+                return;
+            }
+            Settled::Stale(_) | Settled::Unknown => return,
+        };
         match (target, reply) {
             (Target::Connections, CoreReply::Connections(result)) => self.on_connections(result, fx),
             (Target::TestConnection(serial), CoreReply::Tested(result)) => self.on_tested(serial, result),

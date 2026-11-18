@@ -17,6 +17,7 @@ pub fn conn(name: &str, kind: DbKind) -> Connection {
         username: "postgres".into(),
         tls: false,
         production: false,
+        query_timeout: None,
     }
 }
 

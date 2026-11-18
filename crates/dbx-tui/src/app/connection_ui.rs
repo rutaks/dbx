@@ -134,6 +134,14 @@ impl App {
 
     pub(super) fn confirm_remove(&mut self, fx: &mut Effects) {
         let Some(Overlay::ConfirmRemove(ask)) = self.ui.overlay.take() else { return };
+        // A run on the connection is cancelled first: removing it drops dbx's
+        // pools, and with them the context dbx sends Postgres's cancel
+        // through. The shell holds the removal until the run has ended.
+        let on_it = self.tab().target.as_ref().is_some_and(|t| t.connection == ask.id);
+        if on_it && matches!(self.tab().run, super::query::RunState::Running { .. }) {
+            let now = self.ui.now.unwrap_or_else(std::time::Instant::now);
+            self.cancel_run(now, fx);
+        }
         let id = self.model.requests.begin(Target::RemoveConnection(ask.id.clone()));
         fx.commands.push(Command::Core(id, CoreCall::RemoveConnection(ask.id)));
         fx.repaint = true;
@@ -172,12 +180,14 @@ impl App {
         self.model.requests.forget(&super::requests::Target::RemoveConnection(id.clone()));
         match result {
             Ok(()) => {
+                // The tab first, while the connection's name is still known
+                // (it names where an abandoned run may still be running).
+                self.connection_removed(&id, fx);
                 if let Loadable::Ready(list) = &mut self.model.connections {
                     list.retain(|c| c.id != id);
                 }
                 // Its tree, and any listing still on its way, go with it.
                 self.forget_connection(&id, fx);
-                self.connection_removed(&id, fx);
             }
             Err(e) if self.ui.overlay.is_some() => {
                 // Whatever is open (a form with typed text, say) is not ours

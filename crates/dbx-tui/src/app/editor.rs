@@ -69,10 +69,12 @@ impl Editor {
 
     /// A key for the widget (typing, moving, selecting, undo). The caller has
     /// already taken the keys that are the client's (the prefix, run, ctrl+c).
-    /// Returns whether anything visible may have changed.
+    /// Returns whether anything visible changed: the text, the cursor or the
+    /// selection (the view scrolls only with the cursor).
     pub fn key(&mut self, key: KeyEvent) -> bool {
-        self.area.input(key);
-        true
+        let before = (self.area.cursor(), self.area.selection_range());
+        let edited = self.area.input(key);
+        edited || before != (self.area.cursor(), self.area.selection_range())
     }
 
     /// Inserts pasted text at the cursor, replacing any selection. Returns

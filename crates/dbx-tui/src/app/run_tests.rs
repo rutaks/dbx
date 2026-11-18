@@ -14,14 +14,14 @@ use super::view::{NEWLINE_MARK, NULL_MARK};
 use super::*;
 use crate::core::{
     Call, Cell, CellKind, Column, ConnectionId, CoreErrorKind, Cursor, DatabasePath, DbKind, FakeCore, ResultSet, RunId,
-    Scripted, SqlPosition, TabId,
+    Scripted, SessionId, SqlPosition, TabId,
 };
 use crate::harness::Harness;
 
 // ---- helpers ------------------------------------------------------------------
 
 /// A started harness over the Postgres connections `names`.
-async fn started(connections: &[&str]) -> Harness {
+pub(super) async fn started(connections: &[&str]) -> Harness {
     let fake = FakeCore::new();
     fake.script_connections(Scripted::ok(connections.iter().map(|n| conn(n, DbKind::Postgres)).collect()));
     let mut h = Harness::start(fake);
@@ -29,17 +29,22 @@ async fn started(connections: &[&str]) -> Harness {
     h
 }
 
-fn cid(name: &str) -> ConnectionId {
+pub(super) fn cid(name: &str) -> ConnectionId {
     ConnectionId(format!("id-{name}"))
 }
 
-fn dbp(c: &str, db: &str) -> DatabasePath {
+/// The tab's first session.
+pub(super) fn first_session() -> SessionId {
+    SessionId { tab: TabId(1), serial: 1 }
+}
+
+pub(super) fn dbp(c: &str, db: &str) -> DatabasePath {
     DatabasePath { connection: cid(c), database: db.into() }
 }
 
 /// `local pg` opened in the sidebar, showing databases `edge` and `pagila`,
 /// with the cursor on the connection.
-async fn opened() -> Harness {
+pub(super) async fn opened() -> Harness {
     let fake = FakeCore::new();
     fake.script_connections(Scripted::ok(vec![conn("local pg", DbKind::Postgres)]));
     fake.script_databases(Scripted::ok(vec!["edge".into(), "pagila".into()]));
@@ -51,7 +56,7 @@ async fn opened() -> Harness {
 }
 
 /// `opened`, with `pagila` given to the tab (`j j u`) and the editor focused.
-async fn on_pagila() -> Harness {
+pub(super) async fn on_pagila() -> Harness {
     let mut h = opened().await;
     h.press("j j u ctrl+g l");
     assert_eq!(h.app.model.tabs[0].target, Some(dbp("local pg", "pagila")));
@@ -59,7 +64,7 @@ async fn on_pagila() -> Harness {
 }
 
 /// The run commands among `commands`.
-fn runs(commands: &[Command]) -> Vec<(RequestId, RunId, crate::core::RunRequest)> {
+pub(super) fn runs(commands: &[Command]) -> Vec<(RequestId, RunId, crate::core::RunRequest)> {
     commands
         .iter()
         .filter_map(|c| match c {
@@ -70,19 +75,19 @@ fn runs(commands: &[Command]) -> Vec<(RequestId, RunId, crate::core::RunRequest)
 }
 
 /// The editor's title row as drawn.
-fn title(h: &mut Harness) -> String {
+pub(super) fn title(h: &mut Harness) -> String {
     frame_rows(&mut h.app, 114, 30).into_iter().find(|r| r.contains("editor")).unwrap_or_default()
 }
 
-fn mode_bar(h: &mut Harness) -> String {
+pub(super) fn mode_bar(h: &mut Harness) -> String {
     frame_rows(&mut h.app, 114, 30).pop().unwrap()
 }
 
-fn notice_text(h: &Harness) -> String {
+pub(super) fn notice_text(h: &Harness) -> String {
     h.app.ui.notice.as_ref().map(|n| n.text.clone()).unwrap_or_default()
 }
 
-fn key(h: &mut Harness, code: KeyCode, mods: KeyModifiers) -> Vec<Command> {
+pub(super) fn key(h: &mut Harness, code: KeyCode, mods: KeyModifiers) -> Vec<Command> {
     let fx = h.app.update(Event::Key(KeyEvent::new(code, mods)), base());
     let commands = fx.commands.clone();
     h.run(fx);
@@ -218,7 +223,7 @@ async fn run_emits_exactly_one_run_command_with_the_buffer_and_cursor_and_with_a
     assert_eq!(request.buffer, "select 1;\nselect 2;");
     assert_eq!(request.cursor, Cursor { row: 0, col: 9 });
     assert_eq!(request.selection, None);
-    assert_eq!(request.tab, TabId(1));
+    assert_eq!(request.session.tab, TabId(1));
     assert_eq!(request.row_cap, 1_000);
 
     // The run finishes; then select `select` on the second row and run that.
@@ -284,12 +289,15 @@ async fn giving_the_tab_another_database_mid_run_cancels_the_run_closes_the_old_
     let (request, run) = (sent[0].0, sent[0].1);
     let commands = h.press_fx("ctrl+g h k u"); // `edge`
     assert!(commands.contains(&Command::Cancel(run)), "{commands:?}");
-    assert!(commands.contains(&Command::CloseSession(TabId(1), dbp("local pg", "pagila"))), "{commands:?}");
+    assert!(commands.contains(&Command::CloseSession(first_session(), dbp("local pg", "pagila"))), "{commands:?}");
     assert_eq!(h.app.model.tabs[0].run, RunState::Idle);
     assert_eq!(h.app.model.tabs[0].target, Some(dbp("local pg", "edge")));
+    // Until its reply comes, the tab says it may still be running there.
+    assert_eq!(h.app.model.tabs[0].abandoned.len(), 1);
     let fx = h.app.update(Event::Core(request, CoreReply::Ran(Ok(rows_of(&[&["1"]])))), base());
-    assert!(!fx.repaint && fx.commands.is_empty(), "stale");
-    assert_eq!(h.app.model.tabs[0].outcome, None);
+    assert!(fx.commands.is_empty(), "stale");
+    assert_eq!(h.app.model.tabs[0].outcome, None, "its rows never land");
+    assert!(h.app.model.tabs[0].abandoned.is_empty(), "it has ended: the marker goes (the only repaint it causes)");
 }
 
 #[tokio::test]
@@ -308,7 +316,7 @@ async fn a_newer_run_makes_an_older_reply_stale() {
 async fn quitting_closes_the_tabs_session() {
     let mut h = on_pagila().await;
     let commands = h.press_fx("ctrl+g q");
-    assert_eq!(commands, vec![Command::CloseSession(TabId(1), dbp("local pg", "pagila")), Command::Quit]);
+    assert_eq!(commands, vec![Command::CloseSession(first_session(), dbp("local pg", "pagila")), Command::Quit]);
 }
 
 #[tokio::test]
@@ -317,7 +325,7 @@ async fn quitting_mid_run_cancels_the_run_first() {
     h.type_text("select 1");
     let run = runs(&h.press_fx("f5"))[0].1;
     let commands = h.press_fx("ctrl+g q");
-    assert_eq!(commands, vec![Command::Cancel(run), Command::CloseSession(TabId(1), dbp("local pg", "pagila")), Command::Quit]);
+    assert_eq!(commands, vec![Command::Cancel(run), Command::CloseSession(first_session(), dbp("local pg", "pagila")), Command::Quit]);
 }
 
 #[tokio::test]
@@ -340,12 +348,12 @@ async fn removing_the_tabs_connection_takes_its_target_away() {
 
 // ---- helpers for results ----------------------------------------------------------
 
-fn col(name: &str, db_type: &str, kind: CellKind) -> Column {
+pub(super) fn col(name: &str, db_type: &str, kind: CellKind) -> Column {
     Column { name: name.into(), db_type: db_type.into(), kind }
 }
 
 /// A one-column text result with these rows.
-fn rows_of(rows: &[&[&str]]) -> ResultSet {
+pub(super) fn rows_of(rows: &[&[&str]]) -> ResultSet {
     ResultSet {
         columns: vec![col("v", "text", CellKind::Text)],
         rows: rows.iter().map(|r| r.iter().map(|v| Cell::Value(v.to_string())).collect()).collect(),
@@ -358,7 +366,7 @@ fn rows_of(rows: &[&[&str]]) -> ResultSet {
 }
 
 /// Runs `select ...` on pagila and answers it with `reply`.
-async fn ran(reply: Result<ResultSet, crate::core::CoreError>) -> Harness {
+pub(super) async fn ran(reply: Result<ResultSet, crate::core::CoreError>) -> Harness {
     let mut h = on_pagila().await;
     h.type_text("select ...");
     let sent = runs(&h.press_fx("f5"));
@@ -368,7 +376,7 @@ async fn ran(reply: Result<ResultSet, crate::core::CoreError>) -> Harness {
 }
 
 /// The results pane's rows as text (below its title row), trailing blanks cut.
-fn results_rows(h: &mut Harness) -> Vec<String> {
+pub(super) fn results_rows(h: &mut Harness) -> Vec<String> {
     let screen = frame_rows(&mut h.app, 114, 30);
     let r = h.app.ui.hits.results;
     screen[(r.y + 1) as usize..r.bottom() as usize]
@@ -378,7 +386,7 @@ fn results_rows(h: &mut Harness) -> Vec<String> {
 }
 
 /// Where `text` is in the results pane: screen column and row.
-fn in_results(h: &mut Harness, text: &str) -> Option<(u16, u16)> {
+pub(super) fn in_results(h: &mut Harness, text: &str) -> Option<(u16, u16)> {
     let screen = frame_rows(&mut h.app, 114, 30);
     let r = h.app.ui.hits.results;
     (r.y + 1..r.bottom()).find_map(|y| {
@@ -502,7 +510,7 @@ async fn cells_show_newlines_as_a_glyph_cut_wide_text_with_an_ellipsis_and_never
 
 // ---- mode bar hints ---------------------------------------------------------------
 
-fn click_hint(h: &mut Harness, text: &str) -> Vec<Command> {
+pub(super) fn click_hint(h: &mut Harness, text: &str) -> Vec<Command> {
     let bar = mode_bar(h);
     let x = bar.find(text).unwrap_or_else(|| panic!("{text:?} not in {bar:?}"));
     let x = bar[..x].chars().count() as u16;
@@ -564,7 +572,7 @@ async fn quitting_from_an_overlay_or_on_a_signal_cancels_the_run_and_closes_the_
         };
         assert_eq!(
             commands,
-            vec![Command::Cancel(run), Command::CloseSession(TabId(1), dbp("local pg", "pagila")), Command::Quit],
+            vec![Command::Cancel(run), Command::CloseSession(first_session(), dbp("local pg", "pagila")), Command::Quit],
             "{how}"
         );
     }

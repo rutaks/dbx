@@ -5,7 +5,9 @@
 //! Usage: seed_store DATA_DIR NAME KIND HOST PORT [DATABASE]
 //! KIND is postgres, mysql or sqlite. The password saved is a fixed dummy,
 //! unless `DBX_TUI_SEED_PASSWORD` is set (the journeys use it for the Docker
-//! fixture's well-known password).
+//! fixture's well-known password). With `DBX_TUI_SEED_QUERY_TIMEOUT=N` the
+//! connection is saved with dbx's `query_timeout_secs` set to N, as the dbx
+//! desktop app saves it (Postgres only).
 //! DATA_DIR must be under the system temp directory (or set
 //! `DBX_TUI_ALLOW_SEED=1`); the desktop app's store is always refused.
 
@@ -62,6 +64,33 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Ok(secs) = std::env::var("DBX_TUI_SEED_QUERY_TIMEOUT") {
+        let secs: u64 = secs.parse().unwrap_or_else(|_| {
+            eprintln!("seed_store: DBX_TUI_SEED_QUERY_TIMEOUT must be a number of seconds");
+            std::process::exit(2);
+        });
+        let config = serde_json::json!({
+            "id": format!("seeded-timeout-{secs}-{}", std::process::id()),
+            "name": draft.name,
+            "db_type": "postgres",
+            "host": draft.host,
+            "port": draft.port,
+            "username": draft.username,
+            "password": draft.password,
+            "database": draft.database,
+            "ssl": false,
+            "driver_profile": null,
+            "query_timeout_secs": secs,
+        });
+        match rt.block_on(core.seed_config(config)) {
+            Ok(id) => println!("seeded {} ({}) with a query timeout of {secs} s", draft.name, id.0),
+            Err(e) => {
+                eprintln!("seed_store: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     match rt.block_on(dbx_tui::core::Core::save_connection(&core, &draft)) {
         Ok(c) => println!("seeded {} ({})", c.name, c.id.0),
         Err(e) => {
