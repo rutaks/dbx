@@ -452,6 +452,13 @@ impl App {
     }
 
     /// Sends `text` to the clipboard and says what was copied, or why not.
+    /// Returns whether it was sent.
+    pub(super) fn send_to_clipboard(&mut self, text: String, what: &str, fx: &mut Effects) -> bool {
+        let sent = text.len() <= CLIPBOARD_LIMIT;
+        self.copy_text(text, what, fx);
+        sent
+    }
+
     fn copy_text(&mut self, text: String, what: &str, fx: &mut Effects) {
         if text.len() > CLIPBOARD_LIMIT {
             return self.refuse_copy(what, text.len(), fx);

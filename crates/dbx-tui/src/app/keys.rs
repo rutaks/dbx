@@ -16,8 +16,15 @@ impl KeyCombo {
         // Shift is already in the character of a printable key: fold it in, so
         // `shift+q` is `Q` and differs from `q`.
         match code {
-            KeyCode::Char(c) if mods.contains(KeyModifiers::SHIFT) => {
+            // A letter with shift is the capital. Any other character with
+            // shift alone is already the character typed (`?`); with Ctrl, Alt
+            // or Cmd as well, shift is part of the chord (`ctrl+shift+/` is not
+            // `ctrl+/`).
+            KeyCode::Char(c) if mods.contains(KeyModifiers::SHIFT) && c.is_alphabetic() => {
                 Self { code: KeyCode::Char(c.to_ascii_uppercase()), mods: mods - KeyModifiers::SHIFT }
+            }
+            KeyCode::Char(c) if mods.contains(KeyModifiers::SHIFT) && mods == KeyModifiers::SHIFT => {
+                Self { code: KeyCode::Char(c), mods: KeyModifiers::NONE }
             }
             // `shift+tab` is one key, which terminals send as `BackTab` with
             // or without shift set.
@@ -94,10 +101,13 @@ impl fmt::Display for KeyCombo {
         if self.mods.contains(KeyModifiers::SUPER) {
             f.write_str("cmd+")?;
         }
-        if self.mods.contains(KeyModifiers::SHIFT) {
+        // A capital with a modifier is shift held with the letter.
+        let shifted_letter = matches!(self.code, KeyCode::Char(c) if c.is_ascii_uppercase()) && !self.mods.is_empty();
+        if self.mods.contains(KeyModifiers::SHIFT) || shifted_letter {
             f.write_str("shift+")?;
         }
         match self.code {
+            KeyCode::Char(c) if shifted_letter => write!(f, "{}", c.to_ascii_lowercase()),
             KeyCode::Esc => f.write_str("esc"),
             KeyCode::Enter => f.write_str("enter"),
             KeyCode::Tab => f.write_str("tab"),
@@ -116,6 +126,28 @@ impl fmt::Display for KeyCombo {
             KeyCode::Left => f.write_str("left"),
             KeyCode::Right => f.write_str("right"),
             other => write!(f, "{other:?}"),
+        }
+    }
+}
+
+impl KeyCombo {
+    /// Whether a terminal without the kitty keyboard protocol cannot tell this
+    /// key from another: Cmd never arrives; Ctrl with Enter, Backspace or a
+    /// punctuation key, and Ctrl with Shift and a letter, send what a plainer
+    /// key sends; Shift+Enter is Enter. A judgment from how legacy terminals
+    /// encode keys (`^M` is Enter, `^H` is Backspace, `^_` is `ctrl+/`).
+    pub fn needs_protocol(&self) -> bool {
+        let m = self.mods;
+        if m.contains(KeyModifiers::SUPER) {
+            return true;
+        }
+        let ctrl = m.contains(KeyModifiers::CONTROL);
+        match self.code {
+            KeyCode::Enter => ctrl || m.contains(KeyModifiers::SHIFT),
+            KeyCode::Backspace | KeyCode::Tab | KeyCode::Esc => ctrl,
+            KeyCode::Char(' ') => false,
+            KeyCode::Char(c) => ctrl && (c.is_ascii_uppercase() || !c.is_ascii_alphabetic() || matches!(c, 'm' | 'i' | 'h' | 'j')),
+            _ => false,
         }
     }
 }
@@ -140,6 +172,9 @@ pub enum Scope {
     /// Read by the editor while a live template is being filled in, before the
     /// editor itself sees the key.
     Template,
+    /// Read by the focused editor, after the completion popup and template mode
+    /// have had the key.
+    Editor,
 }
 
 /// A named thing the client can do, to which keys are bound.
@@ -242,6 +277,52 @@ pub enum Action {
     /// semicolon: from a direct key, and after the prefix.
     FinishStatementDirect,
     FinishStatement,
+    /// The key help overlay (after the prefix).
+    Help,
+    // The editor's own actions (slice 13). Each is bound in the editor's table
+    // to IntelliJ's macOS key (Cmd), its Windows/Linux key (Ctrl) and, where
+    // one exists, a key every terminal delivers; the prefix has a few more.
+    Duplicate,
+    DeleteLine,
+    MoveLineUp,
+    MoveLineDown,
+    MoveStatementUp,
+    MoveStatementDown,
+    LineComment,
+    BlockComment,
+    ExtendSelection,
+    ShrinkSelection,
+    SelectAll,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    Find,
+    FindNext,
+    FindPrev,
+    GotoLine,
+    NewLineAfter,
+    NewLineBefore,
+    JoinLines,
+    ToggleCase,
+    Indent,
+    Unindent,
+    WordLeft,
+    WordRight,
+    WordLeftSelect,
+    WordRightSelect,
+    DeleteWordBack,
+    DeleteWordForward,
+    LineStart,
+    LineEnd,
+    LineStartSelect,
+    LineEndSelect,
+    TextStart,
+    TextEnd,
+    TextStartSelect,
+    TextEndSelect,
+    MatchingBrace,
 }
 
 impl Action {
@@ -295,6 +376,48 @@ impl Action {
             Action::NextUnresolved => "next error",
             Action::PrevUnresolved => "prev error",
             Action::FinishStatementDirect | Action::FinishStatement => "finish",
+            Action::Help => "help",
+            Action::Duplicate => "duplicate",
+            Action::DeleteLine => "delete line",
+            Action::MoveLineUp => "move line up",
+            Action::MoveLineDown => "move line down",
+            Action::MoveStatementUp => "move statement up",
+            Action::MoveStatementDown => "move statement down",
+            Action::LineComment => "line comment",
+            Action::BlockComment => "block comment",
+            Action::ExtendSelection => "extend selection",
+            Action::ShrinkSelection => "shrink selection",
+            Action::SelectAll => "select all",
+            Action::Undo => "undo",
+            Action::Redo => "redo",
+            Action::Cut => "cut",
+            Action::Copy => "copy",
+            Action::Paste => "paste",
+            Action::Find => "find",
+            Action::FindNext => "find next",
+            Action::FindPrev => "find previous",
+            Action::GotoLine => "go to line",
+            Action::NewLineAfter => "new line after",
+            Action::NewLineBefore => "new line before",
+            Action::JoinLines => "join lines",
+            Action::ToggleCase => "toggle case",
+            Action::Indent => "indent",
+            Action::Unindent => "unindent",
+            Action::WordLeft => "word left",
+            Action::WordRight => "word right",
+            Action::WordLeftSelect => "select word left",
+            Action::WordRightSelect => "select word right",
+            Action::DeleteWordBack => "delete word back",
+            Action::DeleteWordForward => "delete word forward",
+            Action::LineStart => "line start",
+            Action::LineEnd => "line end",
+            Action::LineStartSelect => "select to line start",
+            Action::LineEndSelect => "select to line end",
+            Action::TextStart => "text start",
+            Action::TextEnd => "text end",
+            Action::TextStartSelect => "select to text start",
+            Action::TextEndSelect => "select to text end",
+            Action::MatchingBrace => "matching brace",
         }
     }
 
@@ -311,6 +434,7 @@ impl Action {
             | Action::Cancel
             | Action::ResizeMode
             | Action::FinishStatement
+            | Action::Help
             | Action::OpenPrefix => Scope::Prefix,
             Action::ResizeLeft | Action::ResizeRight | Action::ResizeUp | Action::ResizeDown | Action::ResizeDone => Scope::Resize,
             Action::RunDirect
@@ -344,6 +468,47 @@ impl Action {
             | Action::CopyRow
             | Action::LoadMore
             | Action::ToggleRaw => Scope::Results,
+            Action::Duplicate
+            | Action::DeleteLine
+            | Action::MoveLineUp
+            | Action::MoveLineDown
+            | Action::MoveStatementUp
+            | Action::MoveStatementDown
+            | Action::LineComment
+            | Action::BlockComment
+            | Action::ExtendSelection
+            | Action::ShrinkSelection
+            | Action::SelectAll
+            | Action::Undo
+            | Action::Redo
+            | Action::Cut
+            | Action::Copy
+            | Action::Paste
+            | Action::Find
+            | Action::FindNext
+            | Action::FindPrev
+            | Action::GotoLine
+            | Action::NewLineAfter
+            | Action::NewLineBefore
+            | Action::JoinLines
+            | Action::ToggleCase
+            | Action::Indent
+            | Action::Unindent
+            | Action::WordLeft
+            | Action::WordRight
+            | Action::WordLeftSelect
+            | Action::WordRightSelect
+            | Action::DeleteWordBack
+            | Action::DeleteWordForward
+            | Action::LineStart
+            | Action::LineEnd
+            | Action::LineStartSelect
+            | Action::LineEndSelect
+            | Action::TextStart
+            | Action::TextEnd
+            | Action::TextStartSelect
+            | Action::TextEndSelect
+            | Action::MatchingBrace => Scope::Editor,
             _ => Scope::Sidebar,
         }
     }
@@ -360,6 +525,10 @@ pub struct Keybinds {
     resize: Vec<(KeyCombo, Action)>,
     complete: Vec<(KeyCombo, Action)>,
     template: Vec<(KeyCombo, Action)>,
+    editor: Vec<(KeyCombo, Action)>,
+    /// Prefix keys for editor actions. Active, but not in the prefix mode's
+    /// mode bar (they only work in the editor): the help overlay lists them.
+    editor_prefix: Vec<(KeyCombo, Action)>,
 }
 
 impl Default for Keybinds {
@@ -381,10 +550,19 @@ impl Default for Keybinds {
                 (plain('q'), Action::Quit),
                 (plain('R'), Action::ResizeMode),
                 (plain(';'), Action::FinishStatement),
+                (plain('?'), Action::Help),
             ],
             direct: vec![
+                // `f5` first: it reaches the program in every terminal, so it is
+                // the one the mode bar shows. Cmd is IntelliJ's macOS key, Ctrl
+                // its Windows and Linux one.
                 (key("f5"), Action::RunDirect),
+                (key("cmd+enter"), Action::RunDirect),
+                (key("ctrl+enter"), Action::RunDirect),
+                // With nothing running and a selection, `ctrl+c` copies.
                 (key("ctrl+c"), Action::CancelDirect),
+                (key("ctrl+f2"), Action::CancelDirect),
+                (key("cmd+f2"), Action::CancelDirect),
                 (key("ctrl+space"), Action::CompleteOpen),
                 // The intention actions: where the caret is on a select list's
                 // `*`, it expands it; anywhere else it does nothing. It never runs.
@@ -475,6 +653,75 @@ impl Default for Keybinds {
                 (key("shift+tab"), Action::TemplatePrev),
                 (key("esc"), Action::TemplateDone),
             ],
+            editor: {
+                // (action, keys): IntelliJ's macOS key (Cmd), its Windows and
+                // Linux key (Ctrl), then a fallback every terminal delivers.
+                // Where a Windows/Linux key is something we own (`ctrl+g` is
+                // the prefix, `ctrl+c` cancels) that binding is left out.
+                let table: &[(Action, &[&str])] = &[
+                    (Action::Duplicate, &["cmd+d", "ctrl+d"]),
+                    (Action::DeleteLine, &["cmd+backspace", "ctrl+y"]),
+                    (Action::MoveLineUp, &["alt+shift+up"]),
+                    (Action::MoveLineDown, &["alt+shift+down"]),
+                    (Action::MoveStatementUp, &["cmd+shift+up", "ctrl+shift+up"]),
+                    (Action::MoveStatementDown, &["cmd+shift+down", "ctrl+shift+down"]),
+                    (Action::LineComment, &["cmd+/", "ctrl+/"]),
+                    (Action::BlockComment, &["cmd+alt+/", "ctrl+shift+/"]),
+                    (Action::ExtendSelection, &["ctrl+w", "alt+up"]),
+                    (Action::ShrinkSelection, &["ctrl+shift+w", "alt+down"]),
+                    (Action::SelectAll, &["cmd+a", "ctrl+a"]),
+                    (Action::Undo, &["cmd+z", "ctrl+z"]),
+                    (Action::Redo, &["cmd+shift+z", "ctrl+shift+z"]),
+                    (Action::Cut, &["cmd+x", "ctrl+x"]),
+                    (Action::Copy, &["cmd+c"]),
+                    (Action::Paste, &["cmd+v", "ctrl+v"]),
+                    (Action::Find, &["cmd+f", "ctrl+f"]),
+                    (Action::FindNext, &["cmd+g", "f3"]),
+                    (Action::FindPrev, &["cmd+shift+g", "shift+f3"]),
+                    (Action::GotoLine, &["cmd+l"]),
+                    (Action::NewLineAfter, &["shift+enter"]),
+                    (Action::NewLineBefore, &["cmd+alt+enter", "ctrl+alt+enter"]),
+                    (Action::JoinLines, &["ctrl+shift+j"]),
+                    (Action::ToggleCase, &["cmd+shift+u", "ctrl+shift+u"]),
+                    (Action::Indent, &["tab"]),
+                    (Action::Unindent, &["shift+tab"]),
+                    (Action::WordLeft, &["alt+left", "ctrl+left"]),
+                    (Action::WordRight, &["alt+right", "ctrl+right"]),
+                    (Action::WordLeftSelect, &["alt+shift+left", "ctrl+shift+left"]),
+                    (Action::WordRightSelect, &["alt+shift+right", "ctrl+shift+right"]),
+                    (Action::DeleteWordBack, &["alt+backspace", "ctrl+backspace"]),
+                    (Action::DeleteWordForward, &["alt+delete", "ctrl+delete"]),
+                    (Action::LineStart, &["home", "cmd+left"]),
+                    (Action::LineEnd, &["end", "cmd+right"]),
+                    (Action::LineStartSelect, &["shift+home", "cmd+shift+left"]),
+                    (Action::LineEndSelect, &["shift+end", "cmd+shift+right"]),
+                    (Action::TextStart, &["cmd+up", "cmd+home", "ctrl+home"]),
+                    (Action::TextEnd, &["cmd+down", "cmd+end", "ctrl+end"]),
+                    (Action::TextStartSelect, &["cmd+shift+home", "ctrl+shift+home"]),
+                    (Action::TextEndSelect, &["cmd+shift+end", "ctrl+shift+end"]),
+                    (Action::MatchingBrace, &["ctrl+m", "ctrl+shift+m"]),
+                ];
+                table.iter().flat_map(|(a, keys)| keys.iter().map(move |k| (key(k), *a))).collect()
+            },
+            editor_prefix: [
+                ('d', Action::Duplicate),
+                ('x', Action::DeleteLine),
+                ('/', Action::LineComment),
+                ('*', Action::BlockComment),
+                ('w', Action::ExtendSelection),
+                ('W', Action::ShrinkSelection),
+                ('a', Action::SelectAll),
+                ('u', Action::Undo),
+                ('U', Action::Redo),
+                ('f', Action::Find),
+                ('g', Action::GotoLine),
+                ('J', Action::JoinLines),
+                ('~', Action::ToggleCase),
+                ('%', Action::MatchingBrace),
+            ]
+            .into_iter()
+            .map(|(c, a)| (plain(c), a))
+            .collect(),
         }
     }
 }
@@ -482,7 +729,12 @@ impl Default for Keybinds {
 impl Keybinds {
     /// The action bound to `key` after the prefix.
     pub fn lookup(&self, key: &KeyCombo) -> Option<Action> {
-        self.bindings.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+        self.bindings.iter().chain(&self.editor_prefix).find(|(k, _)| k == key).map(|(_, a)| *a)
+    }
+
+    /// The editing action the focused editor binds to `key`.
+    pub fn lookup_editor(&self, key: &KeyCombo) -> Option<Action> {
+        self.editor.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
 
     /// The action bound directly to `key`, read before any pane sees it.
@@ -532,7 +784,69 @@ impl Keybinds {
             Scope::Resize => &self.resize,
             Scope::Complete => &self.complete,
             Scope::Template => &self.template,
+            Scope::Editor => &self.editor,
         }
+    }
+
+    /// Every key that does `action`, in the order they are listed: its own
+    /// table's, then the prefix's, spelled as typed (`ctrl+g d`).
+    pub fn all_keys(&self, action: Action) -> Vec<String> {
+        self.bindings_of(&[action]).into_iter().map(|b| b.text).collect()
+    }
+
+    /// The keys that do any of `actions`, each with whether a terminal without
+    /// the keyboard protocol can deliver it: the actions' own tables first,
+    /// then the prefix's (`ctrl+g d`).
+    pub fn bindings_of(&self, actions: &[Action]) -> Vec<Binding> {
+        let mut out = Vec::new();
+        for action in actions {
+            if action.scope() != Scope::Prefix {
+                for (k, a) in self.table(action.scope()) {
+                    if a == action {
+                        out.push(Binding { text: k.to_string(), needs_protocol: k.needs_protocol() });
+                    }
+                }
+            }
+            for (k, a) in self.bindings.iter().chain(&self.editor_prefix) {
+                if a == action {
+                    out.push(Binding { text: format!("{} {k}", self.prefix), needs_protocol: self.prefix.needs_protocol() || k.needs_protocol() });
+                }
+            }
+        }
+        out
+    }
+
+    /// Every action with every key that does it, for the help overlay:
+    /// sections of (what it does, its keys). Built from the live bindings, so
+    /// a rebound key shows as it is.
+    pub fn help(&self) -> Vec<HelpSection> {
+        let row = |label: &'static str, actions: &[Action]| (label, self.bindings_of(actions));
+        let run = vec![
+            row("run", &[Action::RunDirect, Action::Run]),
+            row("cancel", &[Action::CancelDirect, Action::Cancel]),
+            row("complete statement", &[Action::FinishStatementDirect, Action::FinishStatement]),
+            row("complete", &[Action::CompleteOpen]),
+            row("expand *", &[Action::ExpandStar]),
+            row("next error", &[Action::NextUnresolved]),
+            row("previous error", &[Action::PrevUnresolved]),
+        ];
+        let edit: Vec<_> = EDIT_ACTIONS.iter().map(|a| row(a.label(), &[*a])).collect();
+        let panes = vec![
+            row("focus left", &[Action::FocusLeft]),
+            row("focus down", &[Action::FocusDown]),
+            row("focus up", &[Action::FocusUp]),
+            row("focus right", &[Action::FocusRight]),
+            row("zoom", &[Action::Zoom]),
+            row("resize", &[Action::ResizeMode]),
+            row("new connection", &[Action::NewConnection]),
+            row("quit", &[Action::Quit]),
+            row("help", &[Action::Help]),
+        ];
+        vec![
+            HelpSection { title: "Run", rows: run },
+            HelpSection { title: "Edit", rows: edit },
+            HelpSection { title: "Panes", rows: panes },
+        ]
     }
 
     /// The key bound to `action`, as shown, if any. When several keys do the
@@ -554,6 +868,7 @@ impl Keybinds {
             Scope::Resize => &mut self.resize,
             Scope::Complete => &mut self.complete,
             Scope::Template => &mut self.template,
+            Scope::Editor => &mut self.editor,
         };
         table.retain(|(k, a)| *a != action && *k != combo);
         table.push((combo, action));
@@ -624,6 +939,66 @@ impl Keybinds {
             .map(|h| (h.keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join("/"), h.desc))
             .collect()
     }
+}
+
+/// A titled run of rows in the help overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpSection {
+    pub title: &'static str,
+    pub rows: Vec<(&'static str, Vec<Binding>)>,
+}
+
+/// The editor's actions in the order the help lists them.
+pub const EDIT_ACTIONS: [Action; 41] = [
+    Action::Duplicate,
+    Action::DeleteLine,
+    Action::MoveLineUp,
+    Action::MoveLineDown,
+    Action::MoveStatementUp,
+    Action::MoveStatementDown,
+    Action::LineComment,
+    Action::BlockComment,
+    Action::ExtendSelection,
+    Action::ShrinkSelection,
+    Action::SelectAll,
+    Action::Undo,
+    Action::Redo,
+    Action::Cut,
+    Action::Copy,
+    Action::Paste,
+    Action::Find,
+    Action::FindNext,
+    Action::FindPrev,
+    Action::GotoLine,
+    Action::NewLineAfter,
+    Action::NewLineBefore,
+    Action::JoinLines,
+    Action::ToggleCase,
+    Action::Indent,
+    Action::Unindent,
+    Action::WordLeft,
+    Action::WordRight,
+    Action::WordLeftSelect,
+    Action::WordRightSelect,
+    Action::DeleteWordBack,
+    Action::DeleteWordForward,
+    Action::LineStart,
+    Action::LineEnd,
+    Action::LineStartSelect,
+    Action::LineEndSelect,
+    Action::TextStart,
+    Action::TextEnd,
+    Action::TextStartSelect,
+    Action::TextEndSelect,
+    Action::MatchingBrace,
+];
+
+/// One key that does an action, as the help overlay lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    pub text: String,
+    /// A terminal without the keyboard protocol cannot deliver it.
+    pub needs_protocol: bool,
 }
 
 /// One hint in the mode bar: the keys (each with the action it does, so a click

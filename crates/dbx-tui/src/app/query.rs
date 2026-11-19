@@ -324,27 +324,46 @@ impl App {
 
     /// Runs the selection, or the statement under the cursor, in the tab.
     pub(super) fn run_statement(&mut self, now: Instant, fx: &mut Effects) {
+        self.run_range(None, now, fx)
+    }
+
+    /// Whether a run can start now; when it cannot, the notice says why.
+    pub(super) fn can_run(&mut self, fx: &mut Effects) -> bool {
         let use_key = self.ui.keys.key_for(Action::UseTarget).unwrap_or_default();
-        let Some(target) = self.tab().target.clone() else {
+        if self.tab().target.is_none() {
             let text = format!("This tab has no database yet: in the sidebar, press {use_key} on one.");
-            return self.notify(text, true, fx);
-        };
+            self.notify(text, true, fx);
+            return false;
+        }
         // The session is one connection: a new run would only queue behind
         // the old one, cancelled or not, so it waits until that has ended.
         match self.tab().run {
             RunState::Running { .. } => {
-                return self.notify("A statement is still running in this tab.".into(), true, fx);
+                self.notify("A statement is still running in this tab.".into(), true, fx);
+                return false;
             }
             RunState::Cancelling { .. } => {
                 let key = self.ui.keys.key_for(Action::CancelDirect).unwrap_or_default();
                 let text = format!("The cancelled statement has not stopped yet: run again once it has, or press {key} to stop waiting.");
-                return self.notify(text, true, fx);
+                self.notify(text, true, fx);
+                return false;
             }
             _ => {}
         }
         if self.ui.editor.text().trim().is_empty() {
-            return self.notify("Nothing to run: type a statement first.".into(), false, fx);
+            self.notify("Nothing to run: type a statement first.".into(), false, fx);
+            return false;
         }
+        true
+    }
+
+    /// Runs `range` of the buffer, or the selection, or else the statement
+    /// under the cursor.
+    pub(super) fn run_range(&mut self, range: Option<(crate::core::Cursor, crate::core::Cursor)>, now: Instant, fx: &mut Effects) {
+        if !self.can_run(fx) {
+            return;
+        }
+        let Some(target) = self.tab().target.clone() else { return };
         let tab = self.tab().id;
         let run = crate::core::RunId(self.model.next_run);
         self.model.next_run += 1;
@@ -356,7 +375,7 @@ impl App {
             session: self.tab().session(),
             buffer: self.ui.editor.text(),
             cursor: self.ui.editor.cursor(),
-            selection: self.ui.editor.selection(),
+            selection: range.or_else(|| self.ui.editor.selection()),
             row_cap: self.model.row_cap,
         };
         self.tab_mut().run = RunState::Running { run, request: id, started: now };

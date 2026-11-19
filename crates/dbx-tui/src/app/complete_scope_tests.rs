@@ -245,7 +245,7 @@ async fn accepting_a_table_after_from_adds_an_alias_made_unique_in_the_statement
     type_and_settle(&mut h, "select * from film_a").await;
     h.press("enter");
     assert_eq!(text(&h), "select * from film_actor fa");
-    h.press("ctrl+u");
+    h.press("ctrl+z");
     assert_eq!(text(&h), "select * from film_a", "one undo step");
 }
 
@@ -357,7 +357,7 @@ async fn alt_enter_on_a_star_expands_it_in_one_undo_step_and_the_mode_bar_says_s
     h.press("alt+enter");
     h.settle().await;
     assert_eq!(text(&h), "select f.film_id, f.title, f.rating from film f");
-    h.press("ctrl+u");
+    h.press("ctrl+z");
     assert_eq!(text(&h), "select * from film f");
     // Two tables: qualified by alias.
     put(&mut h, "select |* from film f join film_actor fa on true");

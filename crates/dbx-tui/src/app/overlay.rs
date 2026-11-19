@@ -28,6 +28,33 @@ pub enum Overlay {
     ConfirmRerun(ConfirmRerun),
     /// One cell's whole value, wrapped and scrollable.
     CellViewer(Box<super::viewer::CellViewer>),
+    /// "What to run?" when the caret is inside a subquery.
+    Chooser(Chooser),
+    /// Every action with all its keys.
+    Help(HelpOverlay),
+}
+
+/// One thing the chooser offers to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// `subquery` or `statement`.
+    pub label: &'static str,
+    /// Its first line.
+    pub preview: String,
+    /// The text that runs, exactly.
+    pub range: (crate::core::Cursor, crate::core::Cursor),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chooser {
+    pub items: Vec<Candidate>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpOverlay {
+    /// The first row shown.
+    pub scroll: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +122,9 @@ pub enum OverlayAction {
     RerunYes,
     /// The second-cancel question: close the session.
     DropSessionYes,
+    /// The statement chooser: run the highlighted entry, or one that was clicked.
+    ChooserRun,
+    ChooserPick(usize),
     /// Close a notice or a question without doing anything.
     Dismiss,
     /// The cell viewer: copy the raw value, and switch between a JSON
@@ -160,6 +190,9 @@ const DROP_SESSION_BUTTONS: &[ButtonSpec] = &[
 ];
 // `esc` also closes a failure notice (see `App::on_overlay_key`): backing out
 // one level always works.
+const CHOOSER_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "run", OverlayAction::ChooserRun), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
+const HELP_BUTTONS: &[ButtonSpec] = &[button("esc", "esc", "close", OverlayAction::Dismiss)];
 const FAILURE_BUTTONS: &[ButtonSpec] = &[button("↵", "enter", "close", OverlayAction::Dismiss)];
 
 impl Overlay {
@@ -178,6 +211,8 @@ impl Overlay {
             Overlay::ConfirmDropSession(ask) if ask.stopped => STOPPED_BUTTONS,
             Overlay::ConfirmDropSession(_) => DROP_SESSION_BUTTONS,
             // Drawn with the live keys, not from this table.
+            Overlay::Chooser(_) => CHOOSER_BUTTONS,
+            Overlay::Help(_) => HELP_BUTTONS,
             Overlay::CellViewer(_) => &[],
         }
     }

@@ -1019,9 +1019,9 @@ async fn one_undo_restores_the_text_from_before_an_acceptance_and_one_redo_puts_
     h.app.ui.complete.popup.select(at);
     h.press("tab");
     assert_eq!(text(&h), "select * from film f");
-    h.press("ctrl+u");
+    h.press("ctrl+z");
     assert_eq!(text(&h), "select * from fil_x", "one undo");
-    h.press("ctrl+r");
+    h.press("ctrl+shift+z");
     assert_eq!(text(&h), "select * from film f", "one redo");
 }
 

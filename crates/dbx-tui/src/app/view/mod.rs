@@ -3,6 +3,7 @@
 
 mod editor;
 mod form;
+mod overlays;
 mod panel;
 mod popup;
 mod results;
@@ -55,7 +56,7 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     let drawn = match &mut app.ui.overlay {
         Some(overlay) => {
             panel::dim(buf, buf.area);
-            draw_overlay(overlay, &app.ui.keys, app.ui.notice.as_ref(), &p, buf)
+            draw_overlay(overlay, &app.ui.keys, app.ui.caps, app.ui.notice.as_ref(), &p, buf)
         }
         None => Drawn::default(),
     };
@@ -70,7 +71,7 @@ pub(super) struct Drawn {
     pub fields: Vec<FieldHit>,
 }
 
-fn draw_overlay(overlay: &mut Overlay, keys: &super::keys::Keybinds, notice: Option<&super::query::Notice>, p: &Painter, buf: &mut Buffer) -> Drawn {
+fn draw_overlay(overlay: &mut Overlay, keys: &super::keys::Keybinds, caps: super::Capabilities, notice: Option<&super::query::Notice>, p: &Painter, buf: &mut Buffer) -> Drawn {
     let buttons = overlay.buttons();
     match overlay {
         Overlay::Error(e) => {
@@ -113,6 +114,8 @@ fn draw_overlay(overlay: &mut Overlay, keys: &super::keys::Keybinds, notice: Opt
         }
         Overlay::Form(form) => form::draw(form, buttons, p, buf),
         Overlay::CellViewer(v) => viewer::draw(v, keys, notice, p, buf),
+        Overlay::Chooser(c) => overlays::draw_chooser(c, p, buf),
+        Overlay::Help(h) => overlays::draw_help(h, keys, caps, p, buf),
     }
 }
 
@@ -482,7 +485,16 @@ fn draw_editor(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     }
     let placeholder = editor_placeholder(app);
     let kind = app.active_kind();
+    // The find or go-to-line bar takes the editor's last row.
+    app.refresh_bar();
+    let (area, bar_row) = match (&app.ui.bar, area.height >= 3) {
+        (Some(_), true) => (Rect { height: area.height - 1, ..area }, Some(Rect { y: area.bottom() - 1, height: 1, ..area })),
+        _ => (area, None),
+    };
     editor::draw(app, p, buf, area, focused, kind.as_ref(), &placeholder);
+    if let Some(row) = bar_row {
+        editor::draw_bar(app, p, buf, row, focused);
+    }
 }
 
 /// What the empty editor says: what to do next, with the keys that do it.
@@ -689,7 +701,8 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
             if app.tab().run.in_flight().is_none() {
                 h.retain(|hint| hint.keys.iter().all(|(_, a)| *a != Action::Cancel));
             }
-            h.push(Hint { keys: vec![("esc".to_string(), Action::OpenPrefix)], desc: "back" });
+            // First, so it is the one a narrow bar keeps: backing out always works.
+            h.insert(0, Hint { keys: vec![("esc".to_string(), Action::OpenPrefix)], desc: "back" });
             h
         }
     };

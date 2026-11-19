@@ -182,10 +182,10 @@ async fn the_whole_expansion_is_one_undo_step() {
     let mut h = editing(pagila()).await;
     expanded(&mut h, "sel").await;
     assert_eq!(text(&h), "select * from ;");
-    h.press("ctrl+u");
+    h.press("ctrl+z");
     assert_eq!(text(&h), "sel", "one undo gives back what was typed");
     assert!(!h.app.ui.template.active());
-    h.press("ctrl+r");
+    h.press("ctrl+shift+z");
     assert_eq!(text(&h), "select * from ;");
 }
 
@@ -197,15 +197,15 @@ async fn an_undo_or_a_redo_leaves_template_mode_and_then_undoes_without_being_mi
     h.type_text("ab");
     assert_eq!(text(&h), "select * from  ab where ab.;");
     assert!(h.app.ui.template.active());
-    h.press("ctrl+u");
+    h.press("ctrl+z");
     assert!(!h.app.ui.template.active(), "an undo ends template mode");
     // From here undo is the editor's own: it walks back to what was typed.
     for _ in 0..30 {
-        h.press("ctrl+u");
+        h.press("ctrl+z");
     }
     assert_eq!(text(&h), "", "undo does not oscillate: it gets back to the empty buffer");
     for _ in 0..30 {
-        h.press("ctrl+r");
+        h.press("ctrl+shift+z");
     }
     assert_eq!(text(&h), "select * from  ab where ab.;", "and redo walks forward");
     assert!(!h.app.ui.template.active());
@@ -214,8 +214,8 @@ async fn an_undo_or_a_redo_leaves_template_mode_and_then_undoes_without_being_mi
     expanded(&mut h, "selw").await;
     h.press("tab");
     h.type_text("a");
-    h.press("ctrl+u");
-    h.press("ctrl+r");
+    h.press("ctrl+z");
+    h.press("ctrl+shift+z");
     assert!(!h.app.ui.template.active());
 }
 
@@ -343,7 +343,7 @@ async fn a_postfix_expansion_is_one_undo_step() {
     let mut h = editing(pagila()).await;
     type_and_settle(&mut h, "film.from").await;
     h.press("tab");
-    h.press("ctrl+u");
+    h.press("ctrl+z");
     assert_eq!(text(&h), "film.from");
 }
 

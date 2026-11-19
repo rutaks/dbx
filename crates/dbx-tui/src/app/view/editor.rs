@@ -115,6 +115,14 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
         let selected = selection.and_then(|(a, b)| {
             (a.row <= row && row <= b.row).then_some((if row == a.row { a.col } else { 0 }, if row == b.row { b.col } else { usize::MAX }))
         });
+        let finds: Vec<(usize, usize)> = ui
+            .bar
+            .as_ref()
+            .map(|b| {
+                let from = b.matches.partition_point(|m| m.0.row < row);
+                b.matches[from..].iter().take_while(|m| m.0.row == row).map(|m| (m.0.col, m.1.col)).collect()
+            })
+            .unwrap_or_default();
         let marked: Vec<usize> = braces.iter().flatten().filter(|(l, _)| *l == row).map(|&(_, c)| c).collect();
         let look = Look {
             theme,
@@ -122,6 +130,7 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
             marks: ui.marks.row(row),
             selected,
             marked: &marked,
+            finds: &finds,
             caret: (focused && at_caret).then_some(caret.col),
             base_bg,
         };
@@ -155,6 +164,8 @@ struct Look<'a> {
     selected: Option<(usize, usize)>,
     /// Characters with the matched-bracket background.
     marked: &'a [usize],
+    /// Columns (start, end) of the find bar's matches on the row.
+    finds: &'a [(usize, usize)],
     /// The caret's character, when it is drawn.
     caret: Option<usize>,
     base_bg: ratatui::style::Color,
@@ -211,6 +222,9 @@ fn paint_line(p: &Painter, buf: &mut Buffer, text: Rect, y: u16, line: &str, lef
         if look.marked.iter().any(|&m| (ch..ch + chars).contains(&m)) {
             style = style.bg(theme.color(Role::MatchedBrace)).add_modifier(theme.modifier(Role::MatchedBrace));
         }
+        if look.finds.iter().any(|&(a, b)| ch < b && ch + chars > a) {
+            style = style.bg(theme.color(Role::FindMatch)).add_modifier(theme.modifier(Role::FindMatch));
+        }
         if look.selected.is_some_and(|(a, b)| ch < b && ch + chars > a) {
             style = style.bg(theme.color(Role::SelectionBg)).add_modifier(theme.modifier(Role::SelectionBg));
         }
@@ -239,4 +253,47 @@ fn paint_line(p: &Painter, buf: &mut Buffer, text: Rect, y: u16, line: &str, lef
         place(buf, " ", 1, col, style);
     }
     Painted { graphemes, end: finished.then_some(col) }
+}
+
+/// The bar on the editor's last row: `find`, the query, and on the right how
+/// many matches there are (or `no match`).
+pub(super) fn draw_bar(app: &mut App, p: &Painter, buf: &mut Buffer, row: Rect, focused: bool) {
+    let lines = app.ui.editor.lines().len();
+    let Some(bar) = app.ui.bar.as_mut() else { return };
+    let theme = p.theme;
+    let pane = p.within(row);
+    let bg = theme.color(Role::Surface0);
+    pane.fill(buf, Style::default().bg(bg).fg(theme.color(Role::Text)));
+    let label = bar.label();
+    let x = pane.put(buf, row.x + 1, row.y, label, Style::default().fg(theme.color(Role::Accent)).bg(bg).add_modifier(Modifier::BOLD));
+    let info = match bar.kind {
+        crate::app::bar::BarKind::Find if bar.field.is_empty() => String::new(),
+        crate::app::bar::BarKind::Find if bar.matches.is_empty() => "no match".to_string(),
+        crate::app::bar::BarKind::Find => {
+            let n = bar.matches.len();
+            let more = if n >= crate::app::bar::MATCH_LIMIT { "+" } else { "" };
+            match bar.current {
+                Some(i) => format!("{}/{n}{more}", i + 1),
+                None => format!("{n}{more} matches"),
+            }
+        }
+        crate::app::bar::BarKind::Goto => format!("1-{lines}"),
+    };
+    let failed = info == "no match";
+    let info_w = UnicodeWidthStr::width(info.as_str()) as u16;
+    let right = row.right().saturating_sub(info_w + 1);
+    let field_x = x + 1;
+    let width = right.saturating_sub(field_x + 1).max(1);
+    let window = bar.field.window(width);
+    pane.put(buf, field_x, row.y, &window.text, Style::default().fg(theme.color(Role::Text)).bg(bg));
+    if focused {
+        let cx = field_x + window.cursor_col;
+        if cx < right {
+            let under = buf[(cx, row.y)].symbol().to_string();
+            let under = if under.trim().is_empty() { " ".to_string() } else { under };
+            pane.put(buf, cx, row.y, &under, Style::default().fg(theme.color(Role::Text)).bg(bg).add_modifier(Modifier::REVERSED));
+        }
+    }
+    let role = if failed { Role::Red } else { Role::Overlay0 };
+    pane.put(buf, right, row.y, &info, Style::default().fg(theme.color(role)).bg(bg));
 }
