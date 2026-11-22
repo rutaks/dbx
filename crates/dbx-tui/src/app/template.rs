@@ -21,7 +21,7 @@ use super::complete_popup::ItemKind;
 use super::complete_scope::generate_alias;
 use super::keys::{Action, KeyCombo};
 use super::{App, Effects, PaneId};
-use crate::core::{Cursor, DbKind, SchemaPath, TablePath};
+use crate::core::{Cursor, SchemaPath, TablePath};
 
 /// One live template.
 pub struct Template {
@@ -590,8 +590,8 @@ impl App {
         self.template_replaced(from, to, new_len, fx);
         let (Some((name, schema)), true) = (table, table_var) else { return };
         if let Some(vi) = self.var_index("alias") {
-            let kind = self.active_kind();
-            self.write_var(vi, &quote_identifier(&generate_alias(&name, std::slice::from_ref(&name)), kind.as_ref()), None, fx);
+            let dialect = self.active_dialect();
+            self.write_var(vi, &quote_identifier(&generate_alias(&name, std::slice::from_ref(&name)), dialect), None, fx);
         }
         if let Some(vi) = self.var_index("columns") {
             self.fill_columns(vi, schema.as_deref(), &name, fx);
@@ -617,7 +617,7 @@ impl App {
     /// The columns of a table go into the `columns` variable, now or when
     /// they have come.
     fn fill_columns(&mut self, vi: usize, schema: Option<&str>, table: &str, fx: &mut Effects) {
-        if self.active_kind() != Some(DbKind::Postgres) {
+        if !self.core_names() {
             return;
         }
         let Some(db) = self.tab().target.clone() else { return };
@@ -637,8 +637,8 @@ impl App {
             return waiting_for(self, needs, fx);
         }
         self.ui.template.columns_for = None;
-        let kind = self.active_kind();
-        let list = cols.iter().map(|c| quote_identifier(&c.name, kind.as_ref())).collect::<Vec<_>>().join(", ");
+        let dialect = self.active_dialect();
+        let list = cols.iter().map(|c| quote_identifier(&c.name, dialect)).collect::<Vec<_>>().join(", ");
         self.write_var(vi, &list, None, fx);
     }
 
@@ -693,13 +693,13 @@ impl App {
             Postfix::Join => ".join",
             Postfix::Cast => ".cast",
         };
-        let kind = self.active_kind();
+        let dialect = self.active_dialect();
         let expr = site.expr.clone();
         let (text, caret) = match site.kind {
             Postfix::From => (format!("select  from {expr}"), 7),
             Postfix::Cast => (format!("cast({expr} as )"), "cast(".len() + expr.chars().count() + " as ".len()),
             Postfix::CFrom | Postfix::Join => {
-                if kind != Some(DbKind::Postgres) {
+                if !self.core_names() {
                     return self.notify(format!("{name} needs a PostgreSQL connection for now."), true, fx);
                 }
                 let Some((schema, table)) = table_of_expr(&expr) else {
@@ -720,7 +720,7 @@ impl App {
                         let waiting = !needs.is_empty() && self.request_completion(needs, fx);
                         return self.wait_for_names(waiting, name, fx);
                     }
-                    let list = cols.iter().map(|c| quote_identifier(&c.name, kind.as_ref())).collect::<Vec<_>>().join(", ");
+                    let list = cols.iter().map(|c| quote_identifier(&c.name, dialect)).collect::<Vec<_>>().join(", ");
                     let text = format!("select {list} from {expr}");
                     let caret = text.chars().count();
                     (text, caret)
@@ -737,7 +737,7 @@ impl App {
                         }
                         Some(first) => {
                             let group: Vec<_> = keys.iter().filter(|k| k.name == first.name).collect();
-                            let q = |n: &str| quote_identifier(n, kind.as_ref());
+                            let q = |n: &str| quote_identifier(n, dialect);
                             let referenced = match &first.ref_schema {
                                 Some(s) if *s != path.schema.schema => format!("{}.{}", q(s), q(&first.ref_table)),
                                 _ => q(&first.ref_table),

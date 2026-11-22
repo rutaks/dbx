@@ -5,11 +5,16 @@
 //! The tree is connection, database, schema, table or view, column. A node is
 //! addressed by its path (`NodeId`), never by position, so a reply can find its
 //! node however the list has moved since the call was made.
+//!
+//! A connection type may lack the database level (SQLite), the schema level
+//! (MySQL) or both, as its `Capabilities` say. The level is then not a node:
+//! the one above lists what is below it, and the paths carry an empty name for
+//! the level that is not there (see `DatabasePath` and `SchemaPath`).
 
 use std::collections::{HashMap, HashSet};
 
 use crate::core::{
-    ColumnInfo, Connection, ConnectionId, CoreError, DatabasePath, DbKind, SchemaPath, Table, TableKind, TablePath,
+    ColumnInfo, Connection, ConnectionId, CoreError, DatabasePath, SchemaPath, Table, TableKind, TablePath,
 };
 
 /// One node of the tree that can have children, addressed by its path.
@@ -47,7 +52,8 @@ impl NodeId {
         match self {
             NodeId::Connection(_) => None,
             NodeId::Database(d) => Some(NodeId::Connection(d.connection.clone())),
-            NodeId::Schema(s) => Some(NodeId::Database(s.database.clone())),
+            NodeId::Schema(s) => Some(database_node(&s.database)),
+            NodeId::Table(t) if t.schema.schema.is_empty() => Some(database_node(&t.schema.database)),
             NodeId::Table(t) => Some(NodeId::Schema(t.schema.clone())),
         }
     }
@@ -88,6 +94,45 @@ impl NodeId {
     }
 }
 
+/// The node a database path names: the connection itself when the path has
+/// no database (the connection has no database level).
+fn database_node(d: &DatabasePath) -> NodeId {
+    if d.database.is_empty() {
+        NodeId::Connection(d.connection.clone())
+    } else {
+        NodeId::Database(d.clone())
+    }
+}
+
+/// The path of the tables a node lists directly (no schema level below it).
+fn tables_path(node: &NodeId) -> Option<SchemaPath> {
+    match node {
+        NodeId::Connection(c) => Some(SchemaPath { database: DatabasePath { connection: c.clone(), database: String::new() }, schema: String::new() }),
+        NodeId::Database(d) => Some(SchemaPath { database: d.clone(), schema: String::new() }),
+        NodeId::Schema(s) => Some(s.clone()),
+        NodeId::Table(_) => None,
+    }
+}
+
+/// The path of the schemas a node lists directly (no database level below it).
+fn schemas_path(node: &NodeId) -> Option<DatabasePath> {
+    match node {
+        NodeId::Connection(c) => Some(DatabasePath { connection: c.clone(), database: String::new() }),
+        NodeId::Database(d) => Some(d.clone()),
+        _ => None,
+    }
+}
+
+/// What a node's listing is of. The app decides it from the connection's
+/// capabilities and the shell asks the Core accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Databases,
+    Schemas,
+    Tables,
+    Columns,
+}
+
 /// What a listing of one node's children came back with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Listing {
@@ -98,15 +143,14 @@ pub enum Listing {
 }
 
 impl Listing {
-    /// Whether this is the kind of listing `node` has.
-    pub fn fits(&self, node: &NodeId) -> bool {
-        matches!(
-            (node, self),
-            (NodeId::Connection(_), Listing::Databases(_))
-                | (NodeId::Database(_), Listing::Schemas(_))
-                | (NodeId::Schema(_), Listing::Tables(_))
-                | (NodeId::Table(_), Listing::Columns(_))
-        )
+    /// What this listing is of.
+    pub fn level(&self) -> Level {
+        match self {
+            Listing::Databases(_) => Level::Databases,
+            Listing::Schemas(_) => Level::Schemas,
+            Listing::Tables(_) => Level::Tables,
+            Listing::Columns(_) => Level::Columns,
+        }
     }
 }
 
@@ -199,18 +243,22 @@ impl SchemaCache {
 
     /// The children of `node` that are nodes themselves, from its listing.
     pub fn child_nodes(&self, node: &NodeId) -> Vec<NodeId> {
-        match (node, self.state(node).listing()) {
-            (NodeId::Connection(c), Some(Listing::Databases(names))) => names
-                .iter()
-                .map(|n| NodeId::Database(DatabasePath { connection: c.clone(), database: n.clone() }))
-                .collect(),
-            (NodeId::Database(d), Some(Listing::Schemas(names))) => {
-                names.iter().map(|n| NodeId::Schema(SchemaPath { database: d.clone(), schema: n.clone() })).collect()
-            }
-            (NodeId::Schema(s), Some(Listing::Tables(tables))) => tables
-                .iter()
-                .map(|t| NodeId::Table(TablePath { schema: s.clone(), table: t.name.clone() }))
-                .collect(),
+        match self.state(node).listing() {
+            Some(Listing::Databases(names)) => match node {
+                NodeId::Connection(c) => names
+                    .iter()
+                    .map(|n| NodeId::Database(DatabasePath { connection: c.clone(), database: n.clone() }))
+                    .collect(),
+                _ => Vec::new(),
+            },
+            Some(Listing::Schemas(names)) => match schemas_path(node) {
+                Some(d) => names.iter().map(|n| NodeId::Schema(SchemaPath { database: d.clone(), schema: n.clone() })).collect(),
+                None => Vec::new(),
+            },
+            Some(Listing::Tables(tables)) => match tables_path(node) {
+                Some(s) => tables.iter().map(|t| NodeId::Table(TablePath { schema: s.clone(), table: t.name.clone() })).collect(),
+                None => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }
@@ -252,8 +300,14 @@ impl SchemaCache {
     /// Every database that has anything cached at or below `node`: the ones
     /// the Core has opened server connections for.
     pub fn databases_at_or_below(&self, node: &NodeId) -> Vec<DatabasePath> {
-        let mut out: Vec<DatabasePath> =
-            self.nodes.keys().filter(|n| n.is_at_or_below(node)).filter_map(|n| n.database_path().cloned()).collect();
+        // A connection with no database level opens no per-database pool.
+        let mut out: Vec<DatabasePath> = self
+            .nodes
+            .keys()
+            .filter(|n| n.is_at_or_below(node))
+            .filter_map(|n| n.database_path().cloned())
+            .filter(|d| !d.database.is_empty())
+            .collect();
         out.sort_by(|a, b| a.database.cmp(&b.database));
         out.dedup();
         out
@@ -352,9 +406,12 @@ pub fn flatten(
             node: node.clone(),
             expanded: open,
         });
-        if open && c.kind != DbKind::Postgres {
+        if open && !c.capabilities.browse {
             // Nothing is asked of dbx for these: it would answer "no schemas".
-            let text = format!("Browsing {} is not supported yet.", c.kind.display_name());
+            let mut text = format!("Browsing {} is not supported yet.", c.kind.display_name());
+            if !c.capabilities.query {
+                text.push_str(" It cannot be queried here either.");
+            }
             ctx.wrapped_note(&node, 1, &text, false);
         } else if open {
             ctx.children(&node, 1);
@@ -426,15 +483,17 @@ impl<W: Fn(&str, usize) -> Vec<String>> Flatten<'_, W> {
                     self.node_row(child, RowKind::Database(name.clone()), depth);
                 }
             }
-            (NodeId::Database(d), Listing::Schemas(names)) => {
+            (_, Listing::Schemas(names)) => {
+                let Some(database) = schemas_path(node) else { return };
                 for name in names {
-                    let child = NodeId::Schema(SchemaPath { database: d.clone(), schema: name.clone() });
+                    let child = NodeId::Schema(SchemaPath { database: database.clone(), schema: name.clone() });
                     self.node_row(child, RowKind::Schema(name.clone()), depth);
                 }
             }
-            (NodeId::Schema(s), Listing::Tables(tables)) => {
+            (_, Listing::Tables(tables)) => {
+                let Some(schema) = tables_path(node) else { return };
                 for t in tables {
-                    let child = NodeId::Table(TablePath { schema: s.clone(), table: t.name.clone() });
+                    let child = NodeId::Table(TablePath { schema: schema.clone(), table: t.name.clone() });
                     self.node_row(child, RowKind::Table { name: t.name.clone(), kind: t.kind }, depth);
                 }
             }

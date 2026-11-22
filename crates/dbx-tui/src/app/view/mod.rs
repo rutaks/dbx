@@ -484,14 +484,14 @@ fn draw_editor(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
         return;
     }
     let placeholder = editor_placeholder(app);
-    let kind = app.active_kind();
+    let (kind, dialect) = (app.active_kind(), app.active_dialect());
     // The find or go-to-line bar takes the editor's last row.
     app.refresh_bar();
     let (area, bar_row) = match (&app.ui.bar, area.height >= 3) {
         (Some(_), true) => (Rect { height: area.height - 1, ..area }, Some(Rect { y: area.bottom() - 1, height: 1, ..area })),
         _ => (area, None),
     };
-    editor::draw(app, p, buf, area, focused, kind.as_ref(), &placeholder);
+    editor::draw(app, p, buf, area, focused, kind.as_ref(), dialect, &placeholder);
     if let Some(row) = bar_row {
         editor::draw_bar(app, p, buf, row, focused);
     }

@@ -8,7 +8,7 @@
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Whitespace};
 
 use super::highlight::dialect_of;
-use crate::core::{Cursor, DbKind};
+use crate::core::{Cursor, Dialect};
 
 /// Text to insert at a place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,11 +32,11 @@ fn at(l: Location) -> Cursor {
 /// nested comments and dollar quotes are what the highlighter shows. The
 /// insertion goes right after the statement's last token that is not a
 /// comment, so a trailing comment stays after it.
-pub fn complete_statement(lines: &[String], caret: Cursor, kind: Option<&DbKind>) -> Result<Option<Edit>, &'static str> {
+pub fn complete_statement(lines: &[String], caret: Cursor, dialect: Option<Dialect>) -> Result<Option<Edit>, &'static str> {
     let text = lines.join("\n");
-    let dialect = dialect_of(kind);
+    let sql_dialect = dialect_of(dialect);
     let mut tokens: Vec<TokenWithSpan> = Vec::new();
-    let result = Tokenizer::new(dialect.as_ref(), &text).tokenize_with_location_into_buf(&mut tokens);
+    let result = Tokenizer::new(sql_dialect.as_ref(), &text).tokenize_with_location_into_buf(&mut tokens);
     // Where the token that failed starts: the end of the last good one.
     let failed_at = result.is_err().then(|| tokens.last().map_or(Cursor::default(), |t| at(t.span.end)));
     let sig: Vec<&TokenWithSpan> = tokens
@@ -92,8 +92,8 @@ impl super::App {
     /// Closes the statement under the caret: one undo step, nothing when
     /// there is nothing to add.
     pub(super) fn finish_statement(&mut self, fx: &mut super::Effects) {
-        let kind = self.active_kind();
-        let edit = match complete_statement(self.ui.editor.lines(), self.ui.editor.cursor(), kind.as_ref()) {
+        let dialect = self.active_dialect();
+        let edit = match complete_statement(self.ui.editor.lines(), self.ui.editor.cursor(), dialect) {
             Ok(Some(edit)) => edit,
             Ok(None) => return,
             Err(why) => return self.notify(format!("Nothing was added: {why}."), true, fx),

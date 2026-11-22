@@ -341,6 +341,18 @@ impl DbxCore {
         answered
     }
 
+    /// The database a path names. An empty name (a connection with no database
+    /// level) is no name: the connection's own database stands in, as it does
+    /// for a run, and dbx is never handed `""` as if it were a database.
+    async fn database_name(&self, connection: &ConnectionId, database: &str) -> String {
+        if !database.is_empty() {
+            return database.to_string();
+        }
+        let Ok(state) = self.state().await else { return String::new() };
+        let own = state.configs.read().await.get(&connection.0).and_then(|c| c.database.clone());
+        own.unwrap_or_default()
+    }
+
     /// Runs one of dbx's metadata calls for connection `id`.
     ///
     /// dbx's metadata functions take no cancel token. The work runs on a
@@ -386,12 +398,13 @@ impl DbxCore {
     /// supported yet, without calling dbx.
     async fn ensure_browsable(&self, id: &ConnectionId) -> Result<(), CoreError> {
         let state = self.state().await?;
-        let kind = state.configs.read().await.get(&id.0).map(|c| kind_of(c.db_type));
-        match kind {
-            Some(kind) if kind != DbKind::Postgres => {
-                Err(CoreError::new(CoreErrorKind::Other, format!("Browsing {} is not supported yet.", kind.display_name())))
-            }
-            // Postgres, or no such connection (dbx says so itself).
+        let db_type = state.configs.read().await.get(&id.0).map(|c| c.db_type);
+        match db_type {
+            Some(db_type) if !capabilities_of(db_type).browse => Err(CoreError::new(
+                CoreErrorKind::Other,
+                format!("Browsing {} is not supported yet.", kind_of(db_type).display_name()),
+            )),
+            // A type that can be browsed, or no such connection (dbx says so itself).
             _ => Ok(()),
         }
     }
@@ -560,6 +573,66 @@ fn not_ready(dir: &Path, p: &MigrationPreflight, source: KeySource) -> CoreError
 
 // ---- connections ---------------------------------------------------------------
 
+/// The connection types this client browses and edits in its form so far.
+/// dbx describes ninety; the adapter behind `Core::schemas`, completion and the
+/// form is built and tested for these only. One line to grow.
+const BROWSED_HERE: [DatabaseType; 1] = [DatabaseType::Postgres];
+
+/// What dbx's descriptor says that its Rust manifest does not carry: the
+/// tree-shape traits and `sqlExplain`, read from the manifest dbx bundles
+/// (`crates/dbx-core/assets/database-drivers.manifest.json`, the same
+/// `plugins/connection-types/*.yaml` data). `dbx_core::database_manifest` is
+/// preferred for everything it does carry.
+#[derive(Debug, Default)]
+struct Descriptor {
+    schema_aware: bool,
+    tree_schema: bool,
+    single_database: bool,
+    sql_explain: bool,
+}
+
+fn descriptor(db_type: DatabaseType) -> Option<Descriptor> {
+    static ALL: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let all = ALL.get_or_init(|| {
+        let json = include_str!("../../../dbx-core/assets/database-drivers.manifest.json");
+        serde_json::from_str(json).unwrap_or_default()
+    });
+    let entry = all.get("drivers")?.as_array()?.iter().find(|d| d["dbType"] == db_type.as_str())?;
+    let flag = |group: &str, name: &str| entry[group][name].as_bool().unwrap_or(false);
+    Some(Descriptor {
+        schema_aware: flag("traits", "schemaAware"),
+        tree_schema: flag("traits", "treeSchema"),
+        single_database: flag("traits", "singleDatabase"),
+        sql_explain: flag("capabilities", "sqlExplain"),
+    })
+}
+
+/// What dbx says a connection type can do and how its tree is shaped.
+fn capabilities_of(db_type: DatabaseType) -> Capabilities {
+    use dbx_core::database_manifest::{self as manifest, DatabaseCapability as Flag};
+    let Some(entry) = manifest::entry(&db_type) else { return Capabilities::default() };
+    let extra = descriptor(db_type).unwrap_or_default();
+    let here = BROWSED_HERE.contains(&db_type);
+    Capabilities {
+        databases: !(entry.local_file || extra.single_database),
+        schemas: extra.schema_aware || extra.tree_schema,
+        query: entry.capability(Flag::QueryExecution),
+        browse: entry.capability(Flag::MetadataBrowse) && here,
+        edit_data: entry.capability(Flag::TableDataEdit),
+        explain: extra.sql_explain,
+        edit_in_form: here,
+        // A file database reports port 0: it has none.
+        default_port: manifest::default_port(&db_type).filter(|p| *p != 0),
+        dialect: match manifest::dialect_name(&db_type) {
+            Some("PostgreSQL") => Dialect::PostgreSql,
+            Some("MySQL" | "Doris" | "StarRocks") => Dialect::MySql,
+            Some("SQLite") => Dialect::Sqlite,
+            _ => Dialect::Generic,
+        },
+        single_connection: entry.single_connection_pool,
+    }
+}
+
 fn kind_of(db_type: DatabaseType) -> DbKind {
     match db_type {
         DatabaseType::Postgres => DbKind::Postgres,
@@ -586,6 +659,7 @@ fn to_connection(c: &ConnectionConfig) -> Connection {
         id: ConnectionId(c.id.clone()),
         name: display_safe(&c.name),
         kind: kind_of(c.db_type),
+        capabilities: capabilities_of(c.db_type),
         host: display_safe(&c.host),
         port: (c.port != 0).then_some(c.port),
         database: c.database.as_deref().filter(|d| !d.is_empty()).map(display_safe),
@@ -624,11 +698,7 @@ fn config_from_draft(draft: &ConnectionDraft, existing: Option<ConnectionConfig>
     };
     config.name = draft.name.trim().to_string();
     config.host = draft.host.trim().to_string();
-    config.port = draft.port.unwrap_or(match config.db_type {
-        DatabaseType::Postgres => 5432,
-        DatabaseType::Mysql => 3306,
-        _ => 0,
-    });
+    config.port = draft.port.unwrap_or(capabilities_of(config.db_type).default_port.unwrap_or(0));
     config.username = draft.username.trim().to_string();
     config.database = draft.database.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
     config.ssl = draft.tls;
@@ -957,6 +1027,10 @@ fn run_message(raw: &str, secret: &str) -> String {
 }
 
 impl Syntax for DbxCore {
+    fn capabilities(&self, kind: &DbKind) -> Capabilities {
+        database_type_of(kind).map(capabilities_of).unwrap_or_default()
+    }
+
     fn type_names(&self, kind: &DbKind) -> Vec<String> {
         type_names_for(kind)
     }
@@ -1110,7 +1184,7 @@ impl Core for DbxCore {
     }
     async fn schemas(&self, at: &DatabasePath) -> Result<Vec<String>, CoreError> {
         self.ensure_browsable(&at.connection).await?;
-        let (conn, database) = (at.connection.0.clone(), at.database.clone());
+        let (conn, database) = (at.connection.0.clone(), self.database_name(&at.connection, &at.database).await);
         let list = self
             .metadata(&at.connection, move |state| async move {
                 dbx_core::schema::list_schemas_core(&state, &conn, &database).await
@@ -1120,7 +1194,7 @@ impl Core for DbxCore {
     }
     async fn tables(&self, at: &SchemaPath) -> Result<Vec<Table>, CoreError> {
         self.ensure_browsable(&at.database.connection).await?;
-        let (conn, database, schema) = (at.database.connection.0.clone(), at.database.database.clone(), at.schema.clone());
+        let (conn, database, schema) = (at.database.connection.0.clone(), self.database_name(&at.database.connection, &at.database.database).await, at.schema.clone());
         let list = self
             .metadata(&at.database.connection, move |state| async move {
                 dbx_core::schema::list_tables_core(&state, &conn, &database, &schema, None, None, None, None, None).await
@@ -1142,7 +1216,12 @@ impl Core for DbxCore {
         self.ensure_browsable(&at.schema.database.connection).await?;
         let schema = &at.schema;
         let (conn, database, schema_name, table) =
-            (schema.database.connection.0.clone(), schema.database.database.clone(), schema.schema.clone(), at.table.clone());
+            (
+                schema.database.connection.0.clone(),
+                self.database_name(&schema.database.connection, &schema.database.database).await,
+                schema.schema.clone(),
+                at.table.clone(),
+            );
         let list = self
             .metadata(&schema.database.connection, move |state| async move {
                 dbx_core::schema::get_columns_core(&state, &conn, &database, &schema_name, &table).await
@@ -1163,7 +1242,12 @@ impl Core for DbxCore {
         self.ensure_browsable(&at.schema.database.connection).await?;
         let schema = &at.schema;
         let (conn, database, schema_name, table) =
-            (schema.database.connection.0.clone(), schema.database.database.clone(), schema.schema.clone(), at.table.clone());
+            (
+                schema.database.connection.0.clone(),
+                self.database_name(&schema.database.connection, &schema.database.database).await,
+                schema.schema.clone(),
+                at.table.clone(),
+            );
         let list = self
             .metadata(&schema.database.connection, move |state| async move {
                 dbx_core::schema::list_foreign_keys_core(&state, &conn, &database, &schema_name, &table).await
@@ -1194,7 +1278,7 @@ impl Core for DbxCore {
         let limit = request.limit.clamp(1, 1000);
         let search = CompletionAssistantRequest {
             connection_id: request.at.connection.0.clone(),
-            database: request.at.database.clone(),
+            database: self.database_name(&request.at.connection, &request.at.database).await,
             schema: request.schema.clone(),
             object_kinds,
             mask: request.prefix.clone(),
@@ -1232,7 +1316,7 @@ impl Core for DbxCore {
     }
     async fn current_schema(&self, at: &DatabasePath) -> Result<Option<String>, CoreError> {
         self.ensure_browsable(&at.connection).await?;
-        let (conn, database) = (at.connection.0.clone(), at.database.clone());
+        let (conn, database) = (at.connection.0.clone(), self.database_name(&at.connection, &at.database).await);
         self.metadata(&at.connection, move |state| async move {
             // Through the query path: dbx has no getter for it. Its own pool
             // for the call, not the tab's session: the search path of a
@@ -1260,7 +1344,8 @@ impl Core for DbxCore {
         // The connection's own pool, under the bare connection id, and the
         // pools of other databases are not touched. A key with no pool is a
         // no-op.
-        state.remove_pool_by_key(&format!("{}:{}", at.connection.0, at.database)).await;
+        let database = self.database_name(&at.connection, &at.database).await;
+        state.remove_pool_by_key(&format!("{}:{database}", at.connection.0)).await;
         Ok(())
     }
     /// Runs one statement on the tab's own database session (dbx's
@@ -1280,7 +1365,7 @@ impl Core for DbxCore {
         if statement.trim().is_empty() {
             return Err(CoreError::new(CoreErrorKind::Other, "There is no statement at the cursor to run."));
         }
-        let database = request.database.clone().or_else(|| config.database.clone()).unwrap_or_default();
+        let database = request.database.clone().filter(|d| !d.is_empty()).or_else(|| config.database.clone()).unwrap_or_default();
         let session = session_id(request.session);
         let registered = {
             let mut early = self.early_cancels.lock().unwrap_or_else(|p| p.into_inner());
@@ -1371,7 +1456,7 @@ impl Core for DbxCore {
         // otherwise open it again) sees it is gone.
         self.closed_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(session);
         state
-            .close_client_session_pool(&at.connection.0, Some(&at.database), &session_id(session))
+            .close_client_session_pool(&at.connection.0, Some(self.database_name(&at.connection, &at.database).await.as_str()).filter(|d| !d.is_empty()), &session_id(session))
             .await
             .map(|_| ())
             .map_err(|raw| CoreError::new(CoreErrorKind::Other, scrub(&raw, &[])))

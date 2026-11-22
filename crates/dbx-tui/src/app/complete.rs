@@ -33,7 +33,7 @@ use super::theme::Role;
 use super::tree::{Listing, NodeId};
 use super::{App, Command, CoreCall, CoreReply, Effects, PaneId};
 use crate::core::{
-    display_safe, Candidate, CandidateKind, ColumnInfo, CompletionRequest, CoreErrorKind, Cursor, DatabasePath, DbKind, ForeignKey, References, SchemaPath,
+    display_safe, Candidate, CandidateKind, ColumnInfo, CompletionRequest, CoreErrorKind, Cursor, DatabasePath, ForeignKey, References, SchemaPath,
     SearchKind, TableKind, TablePath,
 };
 
@@ -482,8 +482,8 @@ impl App {
         if self.ui.complete.session.as_ref().is_none_or(|s| s.word.is_empty()) {
             return false;
         }
-        let kind = self.active_kind();
-        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref());
+        let (kind, dialect) = (self.active_kind(), self.active_dialect());
+        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref(), dialect);
         let caret = self.ui.editor.cursor();
         let Some(before) = caret.col.checked_sub(1) else { return false };
         self.ui
@@ -626,7 +626,7 @@ impl App {
     /// The suggestions for `ctx`, ranked, and what is still missing to make
     /// them complete.
     fn completion_items(&self, ctx: &Context) -> (Vec<Item>, Vec<(Need, String)>) {
-        let kind = self.active_kind();
+        let dialect = self.active_dialect();
         let word = ctx.word.as_str();
         let scope = &ctx.scope;
         let mut cands: Vec<Cand> = Vec::new();
@@ -654,7 +654,7 @@ impl App {
         }
 
         // Names are the Core's for Postgres; other kinds get keywords for now.
-        if kind == Some(DbKind::Postgres) {
+        if self.core_names() {
             if let Some(db) = self.tab().target.clone() {
                 self.metadata_candidates(&db, ctx, &mut cands, &mut needs);
             }
@@ -707,7 +707,7 @@ impl App {
             .map(|(m, _, mut c)| {
                 if ambiguous.contains(&c.name) {
                     if let Some(schema) = &c.schema {
-                        c.insert = Some(format!("{}.{}", quote_identifier(schema, kind.as_ref()), quote_identifier(&c.name, kind.as_ref())));
+                        c.insert = Some(format!("{}.{}", quote_identifier(schema, dialect), quote_identifier(&c.name, dialect)));
                         c.owner = Some(schema.clone());
                     }
                 }
@@ -720,14 +720,14 @@ impl App {
                     (Some(text), _) => text.clone(),
                     (None, ItemKind::Keyword) => keyword_text(word, &c.name),
                     (None, ItemKind::Condition | ItemKind::ColumnList | ItemKind::Select) => c.name.clone(),
-                    (None, _) => quote_identifier(&c.name, kind.as_ref()),
+                    (None, _) => quote_identifier(&c.name, dialect),
                 };
                 let is_table = matches!(c.kind, ItemKind::Table | ItemKind::View | ItemKind::MatView | ItemKind::Foreign);
                 // The statement already calls the table by its own name before a
                 // dot: an alias would make that invalid.
                 let named_by_itself = ctx.qualifiers.iter().any(|q| super::complete_scope::same_name(q, &c.name));
                 let alias = match (&ctx.alias_taken, is_table && settings.alias_on_table && !named_by_itself) {
-                    (Some(taken), true) => Some(quote_identifier(&generate_alias(&c.name, taken), kind.as_ref())),
+                    (Some(taken), true) => Some(quote_identifier(&generate_alias(&c.name, taken), dialect)),
                     _ => None,
                 };
                 Item { name: c.name, insert, kind: c.kind, detail: c.detail, matched: m.positions, owner: c.owner, alias }
@@ -828,8 +828,8 @@ impl App {
     /// column list of an `insert`, and the select list's own expressions.
     fn column_candidates(&self, db: &DatabasePath, current: &str, ctx: &Context, out: &mut Vec<Cand>, needs: &mut Vec<(Need, String)>) {
         let scope = &ctx.scope;
-        let kind = self.active_kind();
-        let q = |n: &str| quote_identifier(n, kind.as_ref());
+        let dialect = self.active_dialect();
+        let q = |n: &str| quote_identifier(n, dialect);
         let table_path = |t: &TableName| TablePath {
             schema: SchemaPath { database: db.clone(), schema: t.schema.clone().unwrap_or_else(|| current.to_string()) },
             table: t.name.clone(),
@@ -923,8 +923,8 @@ impl App {
     /// The conditions the foreign keys between the table just joined and the
     /// tables before it give.
     fn condition_candidates(&self, db: &DatabasePath, current: &str, ctx: &Context, out: &mut Vec<Cand>, needs: &mut Vec<(Need, String)>) {
-        let kind = self.active_kind();
-        let q = |n: &str| quote_identifier(n, kind.as_ref());
+        let dialect = self.active_dialect();
+        let q = |n: &str| quote_identifier(n, dialect);
         let scope = &ctx.scope;
         let tables: Vec<(&Source, &TableName)> = scope
             .sources()
@@ -1141,7 +1141,7 @@ impl App {
     /// the popup. The tokens' scope stands until then, and when the text does
     /// not parse.
     fn use_analysis(&self, ctx: &mut Context) {
-        if self.active_kind() != Some(DbKind::Postgres) || !ctx.scope.has_sources() {
+        if !self.core_names() || !ctx.scope.has_sources() {
             return;
         }
         let Some(db) = self.tab().target.clone() else { return };
@@ -1173,7 +1173,7 @@ impl App {
         let caret = self.ui.editor.cursor();
         let ctx = analyse(self.ui.editor.lines(), caret);
         let Some(db) = self.tab().target.clone() else { return };
-        if self.active_kind() != Some(DbKind::Postgres) {
+        if !self.core_names() {
             return self.notify("Expanding * needs a PostgreSQL connection for now.".to_string(), true, fx);
         }
         let Some(current) = self.model.completions.current_schema.get(&db).cloned() else {
@@ -1200,7 +1200,7 @@ impl App {
         if let Some(why) = refusal {
             return self.notify(format!("Could not expand *: {why}."), true, fx);
         }
-        let kind = self.active_kind();
+        let dialect = self.active_dialect();
         let mut needs = Vec::new();
         let mut parts: Vec<String> = Vec::new();
         let mut empty: Vec<String> = Vec::new();
@@ -1217,8 +1217,8 @@ impl App {
                 empty.push(source.label.clone());
             }
             for (name, _) in cols {
-                let name = quote_identifier(&name, kind.as_ref());
-                parts.push(if qualify { format!("{}.{name}", quote_identifier(&source.label, kind.as_ref())) } else { name });
+                let name = quote_identifier(&name, dialect);
+                parts.push(if qualify { format!("{}.{name}", quote_identifier(&source.label, dialect)) } else { name });
             }
         }
         if !needs.is_empty() && self.request_completion(needs, fx) {
@@ -1297,7 +1297,7 @@ impl App {
                 Need::Columns(t) => CoreCall::TableColumns(t.clone()),
                 Need::ForeignKeys(t) => CoreCall::ForeignKeys(t.clone()),
                 // Only asked for Postgres tabs, so the kind is always known.
-                Need::Parse(..) => CoreCall::AnalyzeReferences(self.active_kind().unwrap_or(DbKind::Postgres), mask),
+                Need::Parse(..) => CoreCall::AnalyzeReferences(self.active_kind().unwrap_or_default(), mask),
                 Need::AllRelations(d) => CoreCall::Complete(CompletionRequest {
                     at: d.clone(),
                     schema: None,

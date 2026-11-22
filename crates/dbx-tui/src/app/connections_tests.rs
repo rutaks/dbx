@@ -10,6 +10,7 @@ pub fn conn(name: &str, kind: DbKind) -> Connection {
     Connection {
         id: ConnectionId(format!("id-{name}")),
         name: name.into(),
+        capabilities: crate::core::Capabilities::like(&kind),
         kind,
         host: "localhost".into(),
         port: Some(5432),

@@ -213,6 +213,8 @@ impl App {
         self.cursor_row().is_some_and(|row| {
             row.node.database_path().is_some()
                 || matches!(&row.kind, RowKind::Connection { default_database: Some(_), .. })
+                || (matches!(&row.kind, RowKind::Connection { .. })
+                    && self.connection(row.node.connection()).is_some_and(|c| !c.capabilities.databases))
         })
     }
 
@@ -332,6 +334,11 @@ impl App {
         let use_key = self.ui.keys.key_for(Action::UseTarget).unwrap_or_default();
         if self.tab().target.is_none() {
             let text = format!("This tab has no database yet: in the sidebar, press {use_key} on one.");
+            self.notify(text, true, fx);
+            return false;
+        }
+        if let Some(c) = self.active_connection().filter(|c| !c.capabilities.query) {
+            let text = format!("{} cannot be queried here: dbx does not run statements on {}.", c.name, c.kind.display_name());
             self.notify(text, true, fx);
             return false;
         }

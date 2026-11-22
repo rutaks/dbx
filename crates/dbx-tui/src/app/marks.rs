@@ -35,7 +35,7 @@ use super::complete_context::{scan, Tok, Token};
 use super::complete_scope::{same_name, text_between_rows, Clause, NamedColumn, Parsed, Scope, Source, TableName};
 use super::theme::Role;
 use super::{App, Effects};
-use crate::core::{ColumnReference, Cursor, DatabasePath, DbKind, References, SchemaPath, Span, TablePath};
+use crate::core::{ColumnReference, Cursor, DatabasePath, Dialect, References, SchemaPath, Span, TablePath};
 
 /// The most text, statements and column references looked at.
 const MAX_TEXT: usize = 64 * 1024;
@@ -70,7 +70,7 @@ struct Key {
     cache: u64,
     tree: u64,
     target: Option<DatabasePath>,
-    kind: Option<DbKind>,
+    dialect: Option<Dialect>,
 }
 
 /// What a statement's marks depend on.
@@ -176,14 +176,14 @@ impl App {
     /// asks for the analyses they want once the text has been still.
     pub(super) fn refresh_marks(&mut self, fx: &mut Effects) {
         let Some(now) = self.ui.now else { return };
-        let kind = self.active_kind();
+        let dialect = self.active_dialect();
         let target = self.tab().target.clone();
         let key = Key {
             revision: self.ui.editor.revision(),
             cache: self.model.completions.version,
             tree: self.model.schema.version(),
             target: target.clone(),
-            kind: kind.clone(),
+            dialect,
         };
         if self.ui.marks.seen != Some(key.revision) {
             self.ui.marks.seen = Some(key.revision);
@@ -196,7 +196,7 @@ impl App {
         self.ui.marks.key = Some(key);
         self.ui.marks.computed += 1;
         let outcome = match target {
-            Some(db) if kind == Some(DbKind::Postgres) => self.compute_marks(&db),
+            Some(db) if self.core_names() => self.compute_marks(&db),
             _ => Outcome::default(),
         };
         let Outcome { found, mut needs, parse, keep, worked } = outcome;

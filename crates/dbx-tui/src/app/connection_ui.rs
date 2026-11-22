@@ -18,15 +18,20 @@ impl App {
 
     pub(super) fn open_new_form(&mut self) {
         let serial = self.next_serial();
-        self.ui.overlay = Some(Overlay::Form(Box::new(ConnectionForm::new_connection(serial))));
+        // The form's own kind (see `DbKind`'s default), with the port dbx
+        // describes for it.
+        let kind: DbKind = Default::default();
+        let port = self.ui.syntax.capabilities(&kind).default_port;
+        self.ui.overlay = Some(Overlay::Form(Box::new(ConnectionForm::new_connection(serial, kind, port))));
         self.ui.mode = Mode::Normal;
     }
 
     pub(super) fn open_edit_form(&mut self, fx: &mut Effects) {
         let Some(connection) = self.selected_connection().cloned() else { return };
-        // The form has Postgres's fields and nothing else's: another kind of
-        // connection would be saved with the wrong shape.
-        if connection.kind != DbKind::Postgres {
+        // The form has the fields of the types it was built for and nothing
+        // else's: another kind of connection would be saved with the wrong
+        // shape.
+        if !connection.capabilities.edit_in_form {
             self.say(format!("Edit it in the dbx app ({} is not handled by this form).", connection.kind.label()), false);
             fx.repaint = true;
             return;

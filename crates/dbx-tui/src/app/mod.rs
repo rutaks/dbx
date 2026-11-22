@@ -66,6 +66,8 @@ mod run_tests;
 #[cfg(test)]
 mod syntax_tests;
 #[cfg(test)]
+mod capabilities_tests;
+#[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
@@ -246,7 +248,9 @@ pub enum CoreCall {
     RemoveConnection(ConnectionId),
     /// List one tree node's children: databases of a connection, schemas of a
     /// database, tables of a schema, columns of a table.
-    List(NodeId),
+    /// The children of a node, and what they are (the level the connection's
+    /// shape puts there).
+    List(NodeId, tree::Level),
     /// Run a statement in a query tab.
     Run(RunId, RunRequest),
     /// A prefix search of names for the completion popup.
@@ -326,14 +330,29 @@ impl Default for App {
 }
 
 impl App {
-    /// The kind of database the query tab's connection is, once the connection
-    /// list has loaded: which dialect the editor colours for.
-    pub fn active_kind(&self) -> Option<crate::core::DbKind> {
+    /// The query tab's connection, once the connection list has loaded.
+    pub fn active_connection(&self) -> Option<&Connection> {
         let target = self.tab().target.as_ref()?;
-        match &self.model.connections {
-            Loadable::Ready(list) => list.iter().find(|c| c.id == target.connection).map(|c| c.kind.clone()),
-            _ => None,
-        }
+        self.connection(&target.connection)
+    }
+
+    /// The kind of database the query tab's connection is: what dbx is asked
+    /// about the editor's text for (type names, statement ranges, parsing).
+    pub fn active_kind(&self) -> Option<crate::core::DbKind> {
+        self.active_connection().map(|c| c.kind.clone())
+    }
+
+    /// The SQL dialect the query tab's connection speaks: what the editor
+    /// colours, formats and quotes for.
+    pub fn active_dialect(&self) -> Option<crate::core::Dialect> {
+        self.active_connection().map(|c| c.capabilities.dialect)
+    }
+
+    /// Whether names, columns and analysis come from the Core for the query
+    /// tab's connection: it speaks PostgreSQL and the client can browse it.
+    /// The dialect alone says how to colour, quote and format, not this.
+    pub fn core_names(&self) -> bool {
+        self.active_connection().is_some_and(|c| c.capabilities.browse && c.capabilities.dialect == crate::core::Dialect::PostgreSql)
     }
 
     pub fn new() -> Self {

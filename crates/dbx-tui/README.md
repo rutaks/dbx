@@ -20,6 +20,40 @@ directory keeps dbx from even looking for its per-user key file. Without
 (`~/Library/Application Support/com.dbx.app` on macOS) and its key from the
 login keychain.
 
+## Capabilities (what a connection can do)
+
+Each `Connection` carries a `Capabilities` value (`src/core/mod.rs`): whether
+its tree has a database level and a schema level, whether dbx runs queries on
+it, browses its metadata, edits its table data and explains statements, the
+default port, the SQL dialect (`Dialect`: what the highlighter, formatter and
+completion quoting choose between) and whether it uses a single server
+connection. `app` reads these and never asks which database it is: a test
+fails if `DbKind::` appears in `src/app` code.
+
+`DbxCore` fills it in (`capabilities_of` in `src/core/dbx.rs`) from dbx's own
+description of the connection type, `plugins/connection-types/*.yaml`:
+
+- from dbx's runtime manifest, `dbx_core::database_manifest` (the generated
+  registry in `dbx-types`): `queryExecution`, `metadataBrowse` and
+  `tableDataEdit` (with the support-level defaults dbx applies), the default
+  port, the dialect name, `localFile` and `singleConnectionPool`;
+- from the manifest dbx bundles
+  (`crates/dbx-core/assets/database-drivers.manifest.json`), because the Rust
+  manifest does not deserialize them: the traits `schemaAware`, `treeSchema`,
+  `singleDatabase` and `capabilities.sqlExplain`.
+
+The tree has a database level unless the type is a local file or
+`singleDatabase`, and a schema level when it is `schemaAware` or `treeSchema`.
+A level that is not there is not a node: the level above lists what is below
+it, and the paths carry an empty database or schema name (the Core uses the
+connection's own database). `browse` and `edit_in_form` are also gated by
+`BROWSED_HERE` in `dbx.rs`, the types whose adapter calls and form this client
+is built and tested for (PostgreSQL only so far): adding a database is one
+line there plus its tests, not edits across `app`. A type whose
+`queryExecution` is false is listed, and running in it says it cannot be
+queried. `Syntax::capabilities(kind)` answers the same for a kind before any
+connection exists (the new-connection form's port).
+
 ## The schema tree (sidebar)
 
 Connection, database, schema, table or view, column, each level loaded on
@@ -52,8 +86,9 @@ may be NULL. Errors are drawn under the node that failed (up to eight lines),
 followed by `press <key> to retry`, the key taken from the live bindings. A
 node that is loading or reloading has a yellow arrow, and a connection's glyph
 is yellow while a call on it runs, even right after a failure.
-A `▕` scrollbar appears when the list is longer than the pane. Only PostgreSQL
-connections can be browsed so far: any other kind shows "Browsing MySQL is not
+A `▕` scrollbar appears when the list is longer than the pane. Only the
+connection types the client was built for can be browsed so far
+(`Capabilities::browse`, see above): any other shows "Browsing MySQL is not
 supported yet." under it and asks dbx nothing. The sidebar is about 30% of the
 width, between 26 and 34 columns (with its separator). Closing a database
 node, or a connection, tells the Core to `release` the databases it opened

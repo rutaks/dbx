@@ -54,7 +54,7 @@ pub(super) fn cell_of(app: &App, at: crate::core::Cursor) -> Option<(u16, u16)> 
 /// Marks the rows of the statement that would run, in the gutter.
 const BAR: &str = "▎";
 
-pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, focused: bool, kind: Option<&DbKind>, placeholder: &str) {
+pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, focused: bool, kind: Option<&DbKind>, dialect: Option<crate::core::Dialect>, placeholder: &str) {
     let lines = app.ui.editor.lines().len();
     let gutter = gutter_width(lines).min(area.width.saturating_sub(8));
     let gutter_area = Rect { width: gutter, ..area };
@@ -66,7 +66,7 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
     app.ui.editor.layout(text);
     let (top, left) = app.ui.editor.scroll_top();
     let ui = &mut app.ui;
-    let range = ui.syntax.prepare(&ui.editor, kind);
+    let range = ui.syntax.prepare(&ui.editor, kind, dialect);
 
     let theme = p.theme;
     let pane = p.within(area);

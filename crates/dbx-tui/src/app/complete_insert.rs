@@ -5,7 +5,7 @@
 //!
 //! Names are otherwise inserted exactly as stored.
 
-use crate::core::DbKind;
+use crate::core::Dialect;
 
 /// Words Postgres will not take as a name without quotes: its reserved words
 /// and those that are reserved as column or table names (`order`, `user`,
@@ -31,17 +31,17 @@ const MYSQL_RESERVED: &[&str] = &[
     "values", "when", "where", "with",
 ];
 
-/// `name` as it must be written in SQL for `kind`: bare when it is a plain
+/// `name` as it must be written in SQL for `dialect`: bare when it is a plain
 /// lower-case name that is not a reserved word, otherwise quoted with the
 /// dialect's quote (`"` for Postgres and most others, a backtick for MySQL),
 /// the quote doubled inside.
-pub fn quote_identifier(name: &str, kind: Option<&DbKind>) -> String {
-    let mysql = matches!(kind, Some(DbKind::MySql));
+pub fn quote_identifier(name: &str, dialect: Option<Dialect>) -> String {
+    let mysql = dialect == Some(Dialect::MySql);
     let mut chars = name.chars();
     let shaped = chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
-    let reserved = match kind {
-        Some(DbKind::Postgres) => POSTGRES_RESERVED.binary_search(&name).is_ok(),
+    let reserved = match dialect {
+        Some(Dialect::PostgreSql) => POSTGRES_RESERVED.binary_search(&name).is_ok(),
         _ if mysql => MYSQL_RESERVED.contains(&name),
         _ => false,
     };
@@ -69,7 +69,7 @@ mod tests {
     use super::*;
 
     fn pg(name: &str) -> String {
-        quote_identifier(name, Some(&DbKind::Postgres))
+        quote_identifier(name, Some(Dialect::PostgreSql))
     }
 
     #[test]
@@ -112,11 +112,11 @@ mod tests {
 
     #[test]
     fn mysql_uses_backticks_and_other_kinds_the_standard_quote() {
-        assert_eq!(quote_identifier("Order Items", Some(&DbKind::MySql)), "`Order Items`");
-        assert_eq!(quote_identifier("order", Some(&DbKind::MySql)), "`order`");
-        assert_eq!(quote_identifier("film", Some(&DbKind::MySql)), "film");
-        assert_eq!(quote_identifier("a`b", Some(&DbKind::MySql)), "`a``b`");
-        assert_eq!(quote_identifier("Order Items", Some(&DbKind::Sqlite)), "\"Order Items\"");
+        assert_eq!(quote_identifier("Order Items", Some(Dialect::MySql)), "`Order Items`");
+        assert_eq!(quote_identifier("order", Some(Dialect::MySql)), "`order`");
+        assert_eq!(quote_identifier("film", Some(Dialect::MySql)), "film");
+        assert_eq!(quote_identifier("a`b", Some(Dialect::MySql)), "`a``b`");
+        assert_eq!(quote_identifier("Order Items", Some(Dialect::Sqlite)), "\"Order Items\"");
         assert_eq!(quote_identifier("Order Items", None), "\"Order Items\"");
     }
 

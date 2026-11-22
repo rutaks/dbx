@@ -1,13 +1,13 @@
 //! Layer 2: the acceptance tests of slice 14 (reformat code). The formatter is
 //! a pure function (`format::format_sql`); the key and the undo go through `App`.
 
-use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
+use sqlparser::dialect::{Dialect as SqlDialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use super::format::{format_sql, same_tokens, CommaPosition, KeywordCase, Options};
 use super::run_tests::on_pagila;
 use super::settings::Settings;
-use crate::core::{Cursor, DbKind};
+use crate::core::{Cursor, Dialect};
 use crate::harness::Harness;
 
 const AWKWARD: &str = include_str!("format_corpus.sql");
@@ -22,16 +22,16 @@ fn fmt(src: &str) -> String {
 }
 
 fn fmt_with(src: &str, opts: &Options) -> String {
-    match format_sql(src, Some(&DbKind::Postgres), opts, 0, 0, &[]) {
+    match format_sql(src, Some(Dialect::PostgreSql), opts, 0, 0, &[]) {
         Ok(f) => f.text,
         Err(why) => panic!("refused {src:?}: {why}"),
     }
 }
 
-fn dialect_for(kind: Option<&DbKind>) -> Box<dyn Dialect> {
+fn dialect_for(kind: Option<Dialect>) -> Box<dyn SqlDialect> {
     match kind {
-        Some(DbKind::MySql) => Box::new(MySqlDialect {}),
-        Some(DbKind::Postgres) => Box::new(PostgreSqlDialect {}),
+        Some(Dialect::MySql) => Box::new(MySqlDialect {}),
+        Some(Dialect::PostgreSql) => Box::new(PostgreSqlDialect {}),
         _ => Box::new(GenericDialect {}),
     }
 }
@@ -40,7 +40,7 @@ fn dialect_for(kind: Option<&DbKind>) -> Box<dyn Dialect> {
 /// token but whitespace, comments trimmed, (when the case is not left) unquoted
 /// words lower-cased, and a `\n` where a newline separated two string literals
 /// (in Postgres that newline is what joins them).
-fn stream_in(text: &str, fold_case: bool, kind: Option<&DbKind>) -> Vec<String> {
+fn stream_in(text: &str, fold_case: bool, kind: Option<Dialect>) -> Vec<String> {
     let dialect = dialect_for(kind);
     let tokens = Tokenizer::new(dialect.as_ref(), text).tokenize().unwrap_or_else(|e| panic!("does not tokenize: {e}"));
     let is_str = |t: &Token| matches!(t, Token::SingleQuotedString(_) | Token::EscapedStringLiteral(_) | Token::NationalStringLiteral(_) | Token::HexStringLiteral(_) | Token::UnicodeStringLiteral(_) | Token::SingleQuotedByteStringLiteral(_));
@@ -71,7 +71,7 @@ fn stream_in(text: &str, fold_case: bool, kind: Option<&DbKind>) -> Vec<String> 
 }
 
 fn stream(text: &str, fold_case: bool) -> Vec<String> {
-    stream_in(text, fold_case, Some(&DbKind::Postgres))
+    stream_in(text, fold_case, Some(Dialect::PostgreSql))
 }
 
 fn comments(text: &str) -> Vec<String> {
@@ -164,27 +164,28 @@ fn upper_case_changes_keywords_and_not_quoted_names_strings_or_comments() {
 
 // ---- safety -------------------------------------------------------------------------
 
-const KINDS: [Option<DbKind>; 3] = [Some(DbKind::Postgres), Some(DbKind::MySql), None];
+const KINDS: [Option<Dialect>; 3] = [Some(Dialect::PostgreSql), Some(Dialect::MySql), None];
 
 fn assert_safe(name: &str, src: &str) {
-    assert_safe_in(name, src, &Some(DbKind::Postgres));
+    assert_safe_in(name, src, &Some(Dialect::PostgreSql));
 }
 
 /// Formats `src` for `kind` under every case setting. The result must keep the
 /// stream; a refusal is safe, and returned as `false`.
-fn assert_safe_in(name: &str, src: &str, kind: &Option<DbKind>) -> bool {
+fn assert_safe_in(name: &str, src: &str, kind: &Option<Dialect>) -> bool {
+    let kind = *kind;
     let mut all = true;
     for case in [KeywordCase::Leave, KeywordCase::Upper, KeywordCase::Lower] {
-        let out = match format_sql(src, kind.as_ref(), &opts(case), 0, 0, &[]) {
+        let out = match format_sql(src, kind, &opts(case), 0, 0, &[]) {
             Ok(f) => f.text,
-            Err(why) if kind == &Some(DbKind::Postgres) => panic!("{name} {case:?}: refused: {why}"),
+            Err(why) if kind == Some(Dialect::PostgreSql) => panic!("{name} {case:?}: refused: {why}"),
             Err(_) => {
                 all = false;
                 continue;
             }
         };
         let fold = case != KeywordCase::Leave;
-        let (before, after) = (stream_in(src, fold, kind.as_ref()), stream_in(&out, fold, kind.as_ref()));
+        let (before, after) = (stream_in(src, fold, kind), stream_in(&out, fold, kind));
         if before != after {
             let at = before.iter().zip(&after).position(|(a, b)| a != b).unwrap_or(before.len().min(after.len()));
             panic!("{name} {kind:?} {case:?}: token streams differ at {at}: {:?} vs {:?}", before.get(at), after.get(at));
@@ -234,12 +235,12 @@ fn formatting_the_output_again_changes_nothing() {
 #[test]
 fn text_that_does_not_tokenize_is_refused_with_the_reason() {
     for src in ["select 'abc", "select /* never closed", "select \"abc", "select $$ open"] {
-        let err = format_sql(src, Some(&DbKind::Postgres), &Options::default(), 0, 0, &[]).unwrap_err();
+        let err = format_sql(src, Some(Dialect::PostgreSql), &Options::default(), 0, 0, &[]).unwrap_err();
         assert!(!err.is_empty(), "{src}");
     }
 }
 
-fn refused_in(src: &str, kind: Option<&DbKind>) -> String {
+fn refused_in(src: &str, kind: Option<Dialect>) -> String {
     match format_sql(src, kind, &Options::default(), 0, 0, &[]) {
         Ok(f) => panic!("{src:?} should be refused, got {:?}", f.text),
         Err(why) => why,
@@ -278,7 +279,7 @@ fn a_newline_between_two_string_literals_is_kept_and_the_check_notices_one_dropp
         assert_eq!(fmt(&out), out, "{src:?}: stable");
     }
     // The check itself: a result that drops the newline is not the same tokens.
-    let pg = Some(&DbKind::Postgres);
+    let pg = Some(Dialect::PostgreSql);
     assert!(!same_tokens("select 'foo'\n'bar'", "select 'foo' 'bar'", pg, false));
     assert!(!same_tokens("select E'foo'\n'bar'", "select E'foo' 'bar'", pg, false));
     assert!(same_tokens("select 'foo'\n'bar'", "select   'foo'\n\n   'bar'", pg, false));
@@ -287,46 +288,46 @@ fn a_newline_between_two_string_literals_is_kept_and_the_check_notices_one_dropp
 
 #[test]
 fn lines_that_are_client_commands_refuse_the_region_with_what_to_do() {
-    let mysql = Some(DbKind::MySql);
-    let cases: [(&str, Option<DbKind>); 7] = [
-        ("DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END//\nDELIMITER ;", mysql.clone()),
+    let mysql = Some(Dialect::MySql);
+    let cases: [(&str, Option<Dialect>); 7] = [
+        ("DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END//\nDELIMITER ;", mysql),
         ("delimiter //\nselect 1//", None),
         ("select 1 from t\nGO\nselect 2 from u\nGO", None),
-        ("select 1\n  go\n", Some(DbKind::Postgres)),
-        ("\\x\n\\d t", Some(DbKind::Postgres)),
-        ("select 1;\n\\d t", Some(DbKind::Postgres)),
-        ("  \\timing on\nselect 1", Some(DbKind::Postgres)),
+        ("select 1\n  go\n", Some(Dialect::PostgreSql)),
+        ("\\x\n\\d t", Some(Dialect::PostgreSql)),
+        ("select 1;\n\\d t", Some(Dialect::PostgreSql)),
+        ("  \\timing on\nselect 1", Some(Dialect::PostgreSql)),
     ];
     for (src, kind) in cases {
-        let why = refused_in(src, kind.as_ref());
+        let why = refused_in(src, kind);
         assert!(why.contains("client command") && why.contains("select"), "{src:?}: {why}");
     }
     // A backslash, `go` or `delimiter` that is not a line of its own is SQL.
-    assert!(format_sql("select 'a\n\\d t\ngo\ndelimiter' from t", Some(&DbKind::Postgres), &Options::default(), 0, 0, &[]).is_ok());
-    assert!(format_sql("select 1 -- a\n-- \\d t\n/* x\ngo\n*/ from t", Some(&DbKind::Postgres), &Options::default(), 0, 0, &[]).is_ok());
+    assert!(format_sql("select 'a\n\\d t\ngo\ndelimiter' from t", Some(Dialect::PostgreSql), &Options::default(), 0, 0, &[]).is_ok());
+    assert!(format_sql("select 1 -- a\n-- \\d t\n/* x\ngo\n*/ from t", Some(Dialect::PostgreSql), &Options::default(), 0, 0, &[]).is_ok());
     assert!(format_sql("select a as go from t", None, &Options::default(), 0, 0, &[]).is_ok());
 }
 
 #[test]
 fn mysql_family_names_are_never_re_cased_only_reserved_words() {
     let upper = opts(KeywordCase::Upper);
-    let run = |src: &str, kind: Option<&DbKind>, o: &Options| format_sql(src, kind, o, 0, 0, &[]).unwrap().text;
-    let my = Some(DbKind::MySql);
-    assert_eq!(run("select * from language", my.as_ref(), &upper), "SELECT\n    *\nFROM language");
+    let run = |src: &str, kind: Option<Dialect>, o: &Options| format_sql(src, kind, o, 0, 0, &[]).unwrap().text;
+    let my = Some(Dialect::MySql);
+    assert_eq!(run("select * from language", my, &upper), "SELECT\n    *\nFROM language");
     assert_eq!(
-        run("select a from film join language l on l.id=film.lid", my.as_ref(), &upper),
+        run("select a from film join language l on l.id=film.lid", my, &upper),
         "SELECT\n    a\nFROM film\nJOIN language l ON l.id = film.lid"
     );
-    assert_eq!(run("insert into language values (1)", my.as_ref(), &upper), "INSERT INTO language\nVALUES\n    (1)");
-    assert_eq!(run("update language set a=1", my.as_ref(), &upper), "UPDATE language\nSET\n    a = 1");
-    assert_eq!(run("select language.id, db.language from language", my.as_ref(), &upper), "SELECT\n    language.id,\n    db.language\nFROM language");
-    assert_eq!(run("SELECT * FROM Language", my.as_ref(), &opts(KeywordCase::Lower)), "select\n    *\nfrom Language");
-    let maria = Some(DbKind::Other("MariaDB".to_string()));
-    assert_eq!(run("select * from language", maria.as_ref(), &upper), "SELECT\n    *\nFROM language");
+    assert_eq!(run("insert into language values (1)", my, &upper), "INSERT INTO language\nVALUES\n    (1)");
+    assert_eq!(run("update language set a=1", my, &upper), "UPDATE language\nSET\n    a = 1");
+    assert_eq!(run("select language.id, db.language from language", my, &upper), "SELECT\n    language.id,\n    db.language\nFROM language");
+    assert_eq!(run("SELECT * FROM Language", my, &opts(KeywordCase::Lower)), "select\n    *\nfrom Language");
+    let maria = Some(Dialect::MySql);
+    assert_eq!(run("select * from language", maria, &upper), "SELECT\n    *\nFROM language");
     assert_eq!(run("select * from language", None, &upper), "SELECT\n    *\nFROM language");
     // Postgres and SQLite stay as they were.
-    for kind in [Some(DbKind::Postgres), Some(DbKind::Sqlite)] {
-        assert_eq!(run("select * from language", kind.as_ref(), &upper), "SELECT\n    *\nFROM LANGUAGE");
+    for kind in [Some(Dialect::PostgreSql), Some(Dialect::Sqlite)] {
+        assert_eq!(run("select * from language", kind, &upper), "SELECT\n    *\nFROM LANGUAGE");
     }
 }
 
@@ -355,7 +356,7 @@ fn two_operators_in_a_row_keep_the_space_the_source_had() {
 fn the_caret_stays_on_the_same_token_and_offset_inside_it() {
     let src = "select a,b from tab where x=1";
     let at = src.find("tab").unwrap() + 2;
-    let f = format_sql(src, Some(&DbKind::Postgres), &Options::default(), 0, 0, &[at, 0, src.len()]).unwrap();
+    let f = format_sql(src, Some(Dialect::PostgreSql), &Options::default(), 0, 0, &[at, 0, src.len()]).unwrap();
     let chars: Vec<char> = f.text.chars().collect();
     assert_eq!(chars[f.carets[0] - 2..f.carets[0] + 1].iter().collect::<String>(), "tab");
     assert_eq!(f.carets[1], 0);
@@ -369,7 +370,7 @@ fn a_2000_line_script_formats_in_one_pass_over_its_tokens() {
     let line = "select a,b from t where x=1 and y=2 order by a;";
     let src = vec![line; 2000].join("\n");
     let start = std::time::Instant::now();
-    let f = format_sql(&src, Some(&DbKind::Postgres), &Options::default(), 0, 0, &[]).unwrap();
+    let f = format_sql(&src, Some(Dialect::PostgreSql), &Options::default(), 0, 0, &[]).unwrap();
     let took = start.elapsed();
     // Work done: every one of the script's tokens went through, once.
     assert_eq!(f.tokens, 2000 * stream(line, false).len());

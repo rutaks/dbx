@@ -100,8 +100,11 @@ pub struct ConnectionForm {
 }
 
 impl ConnectionForm {
-    pub fn new_connection(serial: u64) -> Self {
-        Self::build(serial, None, DbKind::Postgres, ["", "", "5432", "", ""], false, false)
+    /// A form for a new connection of `kind`, its port starting at the type's
+    /// default (`Capabilities::default_port`).
+    pub fn new_connection(serial: u64, kind: DbKind, default_port: Option<u16>) -> Self {
+        let port = default_port.map(|p| p.to_string()).unwrap_or_default();
+        Self::build(serial, None, kind, ["", "", port.as_str(), "", ""], false, false)
     }
 
     /// A form for the connection as the sidebar knows it. The password field

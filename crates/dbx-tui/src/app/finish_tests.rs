@@ -12,7 +12,7 @@ fn rows(sql: &str) -> Vec<String> {
 fn finished(sql: &str) -> Option<String> {
     let lines = rows(sql);
     let end = Cursor { row: lines.len() - 1, col: lines.last().map_or(0, |l| l.chars().count()) };
-    complete_statement(&lines, end, Some(&crate::core::DbKind::Postgres)).ok().flatten().map(|e| {
+    complete_statement(&lines, end, Some(crate::core::Dialect::PostgreSql)).ok().flatten().map(|e| {
         let mut out = lines.clone();
         let line: Vec<char> = out[e.at.row].chars().collect();
         out[e.at.row] = line[..e.at.col].iter().collect::<String>() + &e.text + &line[e.at.col..].iter().collect::<String>();

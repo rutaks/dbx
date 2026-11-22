@@ -54,6 +54,15 @@ pub enum DbKind {
     Other(String),
 }
 
+impl Default for DbKind {
+    /// The kind a new connection starts as in the form, and the one assumed
+    /// for a tab that has no connection yet (statements end at `;` in every
+    /// dialect).
+    fn default() -> Self {
+        DbKind::Postgres
+    }
+}
+
 impl DbKind {
     /// The kind as a person writes it.
     pub fn display_name(&self) -> &str {
@@ -76,12 +85,62 @@ impl DbKind {
     }
 }
 
+/// The SQL dialect a connection speaks, as far as the client chooses between
+/// them: the highlighter's quoting, the formatter's case rules and the
+/// completion's quoting. `Generic` is every dialect the client has no rules
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Dialect {
+    PostgreSql,
+    MySql,
+    Sqlite,
+    #[default]
+    Generic,
+}
+
+/// What a connection can do and what shape its tree has, from dbx's own
+/// description of the connection type (`plugins/connection-types/*.yaml`,
+/// bundled in dbx). Only what the client asks today. Everything here is the
+/// adapter's to fill in; the app reads it and never asks which database it
+/// is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    /// The tree has a level of databases under the connection. When it has
+    /// not, the paths below the connection carry an empty database name and
+    /// the Core uses the connection's own.
+    pub databases: bool,
+    /// The tree has a level of schemas (under each database, or directly
+    /// under the connection when `databases` is false). When it has not, the
+    /// tables hang straight off the level above and their paths carry an
+    /// empty schema name.
+    pub schemas: bool,
+    /// dbx runs statements on it (`queryExecution`).
+    pub query: bool,
+    /// The client can browse its metadata: dbx's `metadataBrowse` and an
+    /// adapter that implements it for this type.
+    pub browse: bool,
+    /// dbx can edit rows of its tables (`tableDataEdit`).
+    pub edit_data: bool,
+    /// dbx can explain a statement (`sqlExplain`).
+    pub explain: bool,
+    /// The connection form has the fields this type needs (host, port, user,
+    /// password, database), so the client can edit it there.
+    pub edit_in_form: bool,
+    /// The port a new connection of this type starts with.
+    pub default_port: Option<u16>,
+    pub dialect: Dialect,
+    /// dbx keeps one server connection for it (a file database), so nothing
+    /// is opened per database.
+    pub single_connection: bool,
+}
+
 /// A saved, named way to reach one database server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connection {
     pub id: ConnectionId,
     pub name: String,
     pub kind: DbKind,
+    pub capabilities: Capabilities,
     pub host: String,
     pub port: Option<u16>,
     /// The database the connection opens by default, if it names one.
@@ -157,12 +216,16 @@ impl fmt::Debug for ConnectionDraft {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DatabasePath {
     pub connection: ConnectionId,
+    /// Empty when the connection has no database level
+    /// (`Capabilities::databases`): the Core uses the connection's own.
     pub database: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SchemaPath {
     pub database: DatabasePath,
+    /// Empty when the connection has no schema level
+    /// (`Capabilities::schemas`).
     pub schema: String,
 }
 
@@ -572,6 +635,10 @@ impl std::error::Error for CoreError {}
 /// caches the answers (types once per kind of database, the statement range
 /// once per text and caret), so nothing here is asked per frame.
 pub trait Syntax: Send + Sync {
+    /// What a kind of database can do, before any connection of it exists
+    /// (the form's starting port). A connection carries its own.
+    fn capabilities(&self, kind: &DbKind) -> Capabilities;
+
     /// The names of the data types of a kind of database
     /// (`list_dialect_type_names`).
     fn type_names(&self, kind: &DbKind) -> Vec<String>;

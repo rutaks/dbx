@@ -117,6 +117,56 @@ pub struct FakeCore {
     syntax_calls: Mutex<SyntaxCalls>,
     /// What `analyze_references` answers, by the exact text asked about.
     analyses: Mutex<Vec<(String, References)>>,
+    /// What `capabilities` answers for a kind, when a test set it.
+    kind_capabilities: Mutex<Vec<(DbKind, Capabilities)>>,
+}
+
+impl Capabilities {
+    /// A PostgreSQL-shaped connection: databases, schemas, everything on.
+    pub fn postgres() -> Self {
+        Capabilities {
+            databases: true,
+            schemas: true,
+            query: true,
+            browse: true,
+            edit_data: true,
+            explain: true,
+            edit_in_form: true,
+            default_port: Some(5432),
+            dialect: Dialect::PostgreSql,
+            single_connection: false,
+        }
+    }
+
+    /// A MySQL-shaped connection: databases and then tables, no schemas.
+    pub fn mysql() -> Self {
+        Capabilities { schemas: false, edit_in_form: false, default_port: Some(3306), dialect: Dialect::MySql, ..Self::postgres() }
+    }
+
+    /// A SQLite-shaped connection: a file with tables, no databases and no
+    /// schemas, one server connection.
+    pub fn sqlite() -> Self {
+        Capabilities {
+            databases: false,
+            schemas: false,
+            explain: false,
+            edit_in_form: false,
+            default_port: None,
+            dialect: Dialect::Sqlite,
+            single_connection: true,
+            ..Self::postgres()
+        }
+    }
+
+    /// The shape a fake connection of `kind` has unless a test gives it one.
+    pub fn like(kind: &DbKind) -> Self {
+        match kind {
+            DbKind::Postgres => Self::postgres(),
+            DbKind::MySql => Self::mysql(),
+            DbKind::Sqlite => Self::sqlite(),
+            DbKind::Other(_) => Capabilities::default(),
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -231,6 +281,13 @@ pub struct SyntaxCalls {
 }
 
 impl FakeCore {
+    /// What the fake says a kind of database can do (`Syntax::capabilities`).
+    pub fn script_capabilities(&self, kind: DbKind, capabilities: Capabilities) {
+        let mut all = lock(&self.kind_capabilities);
+        all.retain(|(k, _)| k != &kind);
+        all.push((kind, capabilities));
+    }
+
     pub fn syntax_calls(&self) -> SyntaxCalls {
         lock(&self.syntax_calls).clone()
     }
@@ -240,6 +297,11 @@ impl FakeCore {
 const FAKE_TYPES: [&str; 4] = ["varchar", "timestamptz", "integer", "text"];
 
 impl Syntax for FakeCore {
+    fn capabilities(&self, kind: &DbKind) -> Capabilities {
+        let set = lock(&self.kind_capabilities).iter().find(|(k, _)| k == kind).map(|(_, c)| c.clone());
+        set.unwrap_or_else(|| Capabilities::like(kind))
+    }
+
     fn type_names(&self, kind: &DbKind) -> Vec<String> {
         lock(&self.syntax_calls).type_names.push(kind.clone());
         FAKE_TYPES.iter().map(|t| t.to_string()).collect()
@@ -453,7 +515,7 @@ mod tests {
     use super::*;
 
     fn conn(name: &str) -> Connection {
-        Connection { id: ConnectionId(name.into()), name: name.into(), kind: DbKind::Postgres, host: "localhost".into(), port: None, database: None, username: String::new(), tls: false, production: false, query_timeout: None }
+        Connection { id: ConnectionId(name.into()), name: name.into(), kind: DbKind::Postgres, capabilities: Capabilities::postgres(), host: "localhost".into(), port: None, database: None, username: String::new(), tls: false, production: false, query_timeout: None }
     }
 
     fn draft() -> ConnectionDraft {

@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::app::requests::RequestId;
-use crate::app::tree::{Listing, NodeId};
+use crate::app::tree::{Level, Listing, NodeId};
 use crate::app::{App, Command, CoreCall, CoreReply, Effects, Event};
 use crate::core::{ConnectionId, Core, SessionId};
 
@@ -319,7 +319,7 @@ pub(crate) fn execute(
                         CoreCall::TestConnection(draft) => CoreReply::Tested(core.test_connection(&draft).await),
                         CoreCall::SaveConnection(draft) => CoreReply::Saved(core.save_connection(&draft).await),
                         CoreCall::RemoveConnection(id) => CoreReply::Removed(core.remove_connection(&id).await),
-                        CoreCall::List(node) => CoreReply::Listed(list(core.as_ref(), node).await),
+                        CoreCall::List(node, level) => CoreReply::Listed(list(core.as_ref(), node, level).await),
                         CoreCall::Run(run, request) => CoreReply::Ran(core.run(run, request).await),
                         CoreCall::Complete(request) => CoreReply::Completed(core.complete(&request).await),
                         CoreCall::CurrentSchema(at) => CoreReply::CurrentSchema(core.current_schema(&at).await),
@@ -341,12 +341,24 @@ pub(crate) fn execute(
 }
 
 /// The Core call that lists `node`'s children.
-async fn list(core: &dyn Core, node: NodeId) -> Result<Listing, crate::core::CoreError> {
-    match node {
-        NodeId::Connection(id) => core.databases(&id).await.map(Listing::Databases),
-        NodeId::Database(at) => core.schemas(&at).await.map(Listing::Schemas),
-        NodeId::Schema(at) => core.tables(&at).await.map(Listing::Tables),
-        NodeId::Table(at) => core.columns(&at).await.map(Listing::Columns),
+async fn list(core: &dyn Core, node: NodeId, level: Level) -> Result<Listing, crate::core::CoreError> {
+    use crate::core::{DatabasePath, SchemaPath};
+    // The paths of a level that is not there carry an empty name.
+    let (databases, schemas) = match &node {
+        NodeId::Connection(c) => (DatabasePath { connection: c.clone(), database: String::new() }, None),
+        NodeId::Database(d) => (d.clone(), None),
+        NodeId::Schema(s) => (s.database.clone(), Some(s.clone())),
+        NodeId::Table(t) => (t.schema.database.clone(), Some(t.schema.clone())),
+    };
+    match (level, node) {
+        (Level::Databases, _) => core.databases(&databases.connection).await.map(Listing::Databases),
+        (Level::Schemas, _) => core.schemas(&databases).await.map(Listing::Schemas),
+        (Level::Tables, _) => {
+            let at = schemas.unwrap_or(SchemaPath { database: databases, schema: String::new() });
+            core.tables(&at).await.map(Listing::Tables)
+        }
+        (Level::Columns, NodeId::Table(at)) => core.columns(&at).await.map(Listing::Columns),
+        (Level::Columns, _) => Ok(Listing::Columns(Vec::new())),
     }
 }
 
@@ -418,7 +430,7 @@ mod tests {
         let core: Arc<dyn Core> = fake.clone();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let tasks = Tasks::default();
-        let list = |n: u64| Command::Core(RequestId(n), CoreCall::List(NodeId::Connection(ConnectionId("c".into()))));
+        let list = |n: u64| Command::Core(RequestId(n), CoreCall::List(NodeId::Connection(ConnectionId("c".into())), Level::Databases));
 
         execute(vec![list(1)], &core, &tx, &tasks);
         tokio::task::yield_now().await;

@@ -158,7 +158,7 @@ async fn expanding_a_connection_emits_one_databases_call_and_shows_loading_and_e
     let commands = h.press_fx("enter");
     let calls: Vec<_> = commands.iter().filter(|c| matches!(c, Command::Core(..))).collect();
     assert_eq!(calls.len(), 1, "{commands:?}");
-    let Some((_, CoreCall::List(NodeId::Connection(id)))) = first_call(&commands) else { panic!("{commands:?}") };
+    let Some((_, CoreCall::List(NodeId::Connection(id), _))) = first_call(&commands) else { panic!("{commands:?}") };
     assert_eq!(id, cid("local pg"));
     h.settle().await;
     assert_eq!(h.fake.calls(), vec![Call::Connections, Call::Databases(cid("local pg"))]);
@@ -217,7 +217,7 @@ async fn a_failed_reply_renders_dbxs_message_under_that_node_and_refresh_retries
 
     // `r` (on the node or on its message) asks again, once.
     let commands = h.press_fx("r");
-    assert!(matches!(first_call(&commands), Some((_, CoreCall::List(NodeId::Connection(_))))), "{commands:?}");
+    assert!(matches!(first_call(&commands), Some((_, CoreCall::List(NodeId::Connection(_), _)))), "{commands:?}");
     h.settle().await;
     let text = tree_text(&mut h);
     assert!(text.contains("pagila") && !text.contains("failed"), "{text}");
@@ -261,7 +261,7 @@ fn a_reply_for_a_node_whose_connection_was_removed_meanwhile_is_dropped() {
     app.model.connections = Loadable::Ready(vec![conn("pg", DbKind::Postgres)]);
     app.touch_rows();
     let fx = press(&mut app, "enter");
-    let Some((id, CoreCall::List(node))) = first_call(&fx.commands) else { panic!("{:?}", fx.commands) };
+    let Some((id, CoreCall::List(node, _))) = first_call(&fx.commands) else { panic!("{:?}", fx.commands) };
 
     // The connection is removed while its databases are still being listed.
     let fx = press(&mut app, "d enter");
@@ -561,7 +561,7 @@ async fn r_refreshes_the_node_under_the_cursor_and_what_it_dropped_goes_from_the
     h.press("g j");
     // on database `a`: refresh it; its schemas are asked again, nothing else is
     let commands = h.press_fx("r");
-    assert!(matches!(first_call(&commands), Some((_, CoreCall::List(NodeId::Database(_))))), "{commands:?}");
+    assert!(matches!(first_call(&commands), Some((_, CoreCall::List(NodeId::Database(_), _)))), "{commands:?}");
     assert_eq!(commands.len(), 1);
     // While it loads, a second `r` asks nothing.
     assert!(h.press_fx("r").is_empty());
@@ -595,7 +595,7 @@ async fn collapsing_a_node_that_is_loading_abandons_the_listing_and_expanding_ag
 
     // Expanding again is a new call, and only its reply counts.
     let second = h.press_fx("enter");
-    assert!(matches!(first_call(&second), Some((_, CoreCall::List(_)))));
+    assert!(matches!(first_call(&second), Some((_, CoreCall::List(..)))));
     h.settle().await;
     tokio::time::advance(Duration::from_secs(6)).await;
     h.settle().await;
@@ -1213,7 +1213,7 @@ async fn r_on_a_column_row_refreshes_its_open_table_and_does_not_drop_it() {
     h.press("j"); // on a column of the open table `actor`
     h.fake.script_columns(Scripted::ok(vec![col("only", "text", false, false)]));
     let commands = h.press_fx("r");
-    assert!(matches!(first_call(&commands), Some((_, CoreCall::List(NodeId::Table(_))))), "{commands:?}");
+    assert!(matches!(first_call(&commands), Some((_, CoreCall::List(NodeId::Table(_), _)))), "{commands:?}");
 }
 
 fn releases(commands: &[Command]) -> Vec<DatabasePath> {
@@ -1446,7 +1446,7 @@ async fn a_failed_row_names_the_key_that_retries_from_the_live_bindings() {
 }
 
 #[test]
-fn a_listing_of_the_wrong_kind_for_its_node_repaints_nothing() {
+fn a_listing_of_the_wrong_kind_for_its_node_leaves_it_not_loaded() {
     let mut app = ready_app();
     app.model.connections = Loadable::Ready(vec![conn("pg", DbKind::Postgres)]);
     app.touch_rows();
@@ -1454,8 +1454,9 @@ fn a_listing_of_the_wrong_kind_for_its_node_repaints_nothing() {
     let Some((id, _)) = first_call(&fx.commands) else { panic!("{:?}", fx.commands) };
     // The wrong kind of listing for the node.
     let fx = app.update(Event::Core(id, CoreReply::Listed(Ok(Listing::Schemas(names(&["x"]))))), base());
-    assert!(!fx.repaint, "a listing that does not fit its node");
-
+    // Its spinner is gone, not stuck: the node is simply not loaded.
+    assert!(fx.repaint, "the node stopped loading");
+    assert!(matches!(app.model.schema.state(&NodeId::Connection(cid("pg"))), Children::NotLoaded));
 }
 
 #[test]
@@ -1472,9 +1473,14 @@ fn a_listing_for_a_connection_that_is_no_longer_in_the_list_repaints_nothing() {
 }
 
 #[tokio::test]
-async fn a_connection_that_is_not_postgres_says_it_cannot_be_browsed_yet_and_asks_dbx_nothing() {
+async fn a_connection_that_cannot_be_browsed_yet_says_so_and_asks_dbx_nothing() {
     let fake = FakeCore::new();
-    fake.script_connections(Scripted::ok(vec![conn("lite", DbKind::Sqlite), conn("my", DbKind::MySql)]));
+    let unbrowsable = |name: &str, kind: DbKind| {
+        let mut c = conn(name, kind);
+        c.capabilities.browse = false;
+        c
+    };
+    fake.script_connections(Scripted::ok(vec![unbrowsable("lite", DbKind::Sqlite), unbrowsable("my", DbKind::MySql)]));
     let mut h = Harness::start(fake);
     h.settle().await;
     let commands = h.press_fx("enter");

@@ -12,10 +12,10 @@ use std::time::Instant;
 use super::keys::Action;
 use super::pointer::{self, ClickKey, Drag};
 use super::requests::Target;
-use super::tree::{self, Children, Health, Listing, NodeId, Row, RowKey, RowKind};
+use super::tree::{self, Children, Health, Level, Listing, NodeId, Row, RowKey, RowKind};
 use super::view;
 use super::{App, Command, CoreCall, Effects, Loadable, Mode, SidebarNote};
-use crate::core::{Connection, ConnectionId, CoreError, CoreErrorKind, DbKind};
+use crate::core::{Connection, ConnectionId, CoreError, CoreErrorKind};
 
 /// The sidebar's cursor, scroll position, expanded nodes and visible rows.
 #[derive(Debug)]
@@ -127,7 +127,7 @@ impl App {
     }
 
     /// The saved connection `id` names, if it is still in the list.
-    fn connection(&self, id: &ConnectionId) -> Option<&Connection> {
+    pub(super) fn connection(&self, id: &ConnectionId) -> Option<&Connection> {
         match &self.model.connections {
             Loadable::Ready(list) => list.iter().find(|c| &c.id == id),
             _ => None,
@@ -242,6 +242,19 @@ impl App {
         fx.repaint = true;
     }
 
+    /// What `node`'s children are, by the shape of its connection: a level
+    /// the connection does not have is skipped. A connection not (yet) in the
+    /// list is taken to be shaped like PostgreSQL.
+    fn level_below(&self, node: &NodeId) -> Level {
+        let (databases, schemas) = self.connection(node.connection()).map_or((true, true), |c| (c.capabilities.databases, c.capabilities.schemas));
+        match node {
+            NodeId::Connection(_) if databases => Level::Databases,
+            NodeId::Connection(_) | NodeId::Database(_) if schemas => Level::Schemas,
+            NodeId::Connection(_) | NodeId::Database(_) | NodeId::Schema(_) => Level::Tables,
+            NodeId::Table(_) => Level::Columns,
+        }
+    }
+
     /// Asks the Core for `node`'s children, replacing any listing in flight.
     /// A node that already has a listing keeps it (and keeps drawing it)
     /// until the new one arrives.
@@ -264,14 +277,15 @@ impl App {
             None => Children::Loading,
         };
         self.model.schema.set(node.clone(), next);
-        fx.commands.push(Command::Core(id, CoreCall::List(node)));
+        let level = self.level_below(&node);
+        fx.commands.push(Command::Core(id, CoreCall::List(node, level)));
         self.touch_rows();
         fx.repaint = true;
     }
 
     /// Whether `node` is a connection of a kind the tree cannot browse yet.
     fn browsing_unsupported(&self, node: &NodeId) -> bool {
-        matches!(node, NodeId::Connection(c) if self.connection(c).is_some_and(|k| k.kind != DbKind::Postgres))
+        matches!(node, NodeId::Connection(c) if self.connection(c).is_some_and(|k| !k.capabilities.browse))
     }
 
     /// Lets go of everything at or below `node` that is in flight, and the
@@ -366,7 +380,7 @@ impl App {
         }
         let connection = node.connection().clone();
         match result {
-            Ok(listing) if listing.fits(&node) => {
+            Ok(listing) if listing.level() == self.level_below(&node) => {
                 self.model.schema.set(node.clone(), Children::Loaded(listing));
                 // A refresh can drop children; what was cached below them goes too.
                 for gone in self.model.schema.prune_missing_below(&node) {
@@ -380,7 +394,12 @@ impl App {
                 }
                 self.model.schema.set_health(&connection, Health::Ok);
             }
-            Ok(_) => return false,
+            // Not the level this node lists any more: nothing to show, and it
+            // must not stay loading.
+            Ok(_) => {
+                self.model.schema.set(node.clone(), Children::NotLoaded);
+                self.ui.sidebar.expanded.remove(&node);
+            }
             // Abandoned on purpose: the node is simply not loaded again.
             Err(e) if e.kind == CoreErrorKind::Cancelled => {
                 let next = match self.model.schema.state(&node).listing() {
@@ -499,7 +518,7 @@ impl App {
 
     /// Whether the connection under the cursor is one the form can edit.
     pub(super) fn cursor_on_editable(&self) -> bool {
-        self.selected_connection().is_some_and(|c| c.kind == DbKind::Postgres)
+        self.selected_connection().is_some_and(|c| c.capabilities.edit_in_form)
     }
 
     /// A short note under the sidebar: used by edit for kinds the form does not handle.

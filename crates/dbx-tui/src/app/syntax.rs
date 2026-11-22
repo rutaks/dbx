@@ -8,12 +8,16 @@ use std::sync::Arc;
 
 use super::editor::Editor;
 use super::highlight::{Highlighted, Highlighter, TypeNames};
-use crate::core::{Cursor, DbKind, Syntax};
+use crate::core::{Capabilities, Cursor, DbKind, Dialect, Syntax};
 
 /// Answers nothing: what an `App` has until the shell gives it a Core.
 pub struct NoSyntax;
 
 impl Syntax for NoSyntax {
+    fn capabilities(&self, _kind: &DbKind) -> Capabilities {
+        Capabilities::default()
+    }
+
     fn type_names(&self, _kind: &DbKind) -> Vec<String> {
         Vec::new()
     }
@@ -67,6 +71,11 @@ impl SyntaxState {
 
     /// Where the statement `cursor` is in lies in `buffer`, asked of the Core
     /// now (not cached: the editing actions ask when a key is pressed).
+    /// What a kind of database can do (the Core's answer, no I/O).
+    pub fn capabilities(&self, kind: &DbKind) -> Capabilities {
+        self.handle.capabilities(kind)
+    }
+
     pub fn statement_at(&self, kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)> {
         self.handle.statement_range(kind, buffer, cursor)
     }
@@ -74,7 +83,7 @@ impl SyntaxState {
     /// Brings the colours up to date, and nothing else: what completion needs
     /// to know which characters are a string or a comment. The same cache as
     /// `prepare`, so the next frame tokenizes nothing more.
-    pub fn refresh(&mut self, editor: &Editor, kind: Option<&DbKind>) {
+    pub fn refresh(&mut self, editor: &Editor, kind: Option<&DbKind>, dialect: Option<Dialect>) {
         if let Some(kind) = kind {
             if !self.types.iter().any(|(k, _)| k == kind) {
                 self.types.push((kind.clone(), TypeNames::new(self.handle.type_names(kind))));
@@ -82,15 +91,15 @@ impl SyntaxState {
         }
         let none = TypeNames::default();
         let types = kind.and_then(|k| self.types.iter().find(|(t, _)| t == k)).map_or(&none, |(_, t)| t);
-        self.highlighter.colours(editor.revision(), editor.lines(), kind, types);
+        self.highlighter.colours(editor.revision(), editor.lines(), dialect, types);
     }
 
     /// Brings the colours up to date and returns the
     /// range of the statement a run would send, if one can be placed. With a
     /// selection the run sends the selection, which is outlined as a
     /// selection already: no statement range then.
-    pub fn prepare(&mut self, editor: &Editor, kind: Option<&DbKind>) -> Option<(Cursor, Cursor)> {
-        self.refresh(editor, kind);
+    pub fn prepare(&mut self, editor: &Editor, kind: Option<&DbKind>, dialect: Option<Dialect>) -> Option<(Cursor, Cursor)> {
+        self.refresh(editor, kind, dialect);
 
         let kind = kind?;
         if editor.selection().is_some() {

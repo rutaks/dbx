@@ -14,7 +14,7 @@ use super::overlay::{Candidate, Chooser, HelpOverlay, Overlay};
 use super::settings::RunAtCaret;
 use super::theme::Role;
 use super::{App, Effects, Mode, PaneId};
-use crate::core::{text_between, Cursor, DbKind};
+use crate::core::{text_between, Cursor};
 
 /// Whether an action changes the text (and so ends a live template, as an undo
 /// does).
@@ -51,7 +51,7 @@ impl App {
     /// statement finder, for the active connection's kind (Postgres when the
     /// tab has none yet: statements end at `;` in every dialect).
     pub(super) fn statement_range_at(&self, text: &str, at: Cursor) -> Option<(Cursor, Cursor)> {
-        let kind = self.active_kind().unwrap_or(DbKind::Postgres);
+        let kind = self.active_kind().unwrap_or_default();
         self.ui.syntax.statement_at(&kind, text, at)
     }
 
@@ -142,7 +142,7 @@ impl App {
 
     fn move_statement(&mut self, up: bool, fx: &mut Effects) {
         let text = self.ui.editor.text();
-        let kind = self.active_kind().unwrap_or(DbKind::Postgres);
+        let kind = self.active_kind().unwrap_or_default();
         let mut doc = self.ui.editor.doc();
         let syntax = &self.ui.syntax;
         let moved = edit_ops::move_statement(&mut doc, up, &|at| syntax.statement_at(&kind, &text, at));
@@ -196,7 +196,7 @@ impl App {
 
         let s = &self.model.settings;
         let opts = super::format::Options { case: s.format_keyword_case, indent: s.format_indent, comma: s.format_comma };
-        let kind = self.active_kind();
+        let dialect = self.active_dialect();
         let region: String = chars[a..b].iter().collect();
         let (caret, anchor) = (off(doc.caret), doc.anchor.map(off));
         let inside = |p: usize| p.clamp(a, b) - a;
@@ -204,11 +204,11 @@ impl App {
         // A selection must start and end between tokens of the whole text: one
         // that begins inside a string, comment or `$$` body is not SQL.
         if !whole && doc.sel().is_some() {
-            if let Err(why) = super::format::ends_between_tokens(&text, kind.as_ref(), &[a, b]) {
+            if let Err(why) = super::format::ends_between_tokens(&text, dialect, &[a, b]) {
                 return self.notify(format!("Not reformatted: {why}."), true, fx);
             }
         }
-        let done = match super::format::format_sql(&region, kind.as_ref(), &opts, base, 0, &asked) {
+        let done = match super::format::format_sql(&region, dialect, &opts, base, 0, &asked) {
             Ok(done) => done,
             Err(why) => return self.notify(format!("Not reformatted: {why}."), true, fx),
         };
@@ -243,8 +243,8 @@ impl App {
     }
 
     fn matching_brace(&mut self, fx: &mut Effects) {
-        let kind = self.active_kind();
-        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref());
+        let (kind, dialect) = (self.active_kind(), self.active_dialect());
+        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref(), dialect);
         let caret = self.ui.editor.cursor();
         let Some([here, partner]) = super::highlight::matching_bracket(self.ui.syntax.colours(), caret) else { return };
         // Beside the partner, on the outside of the pair.
@@ -277,8 +277,8 @@ impl App {
     /// tokens (the whole buffer is tokenized once per change: the frame's own
     /// pass is the same cache).
     pub(super) fn caret_in_literal_now(&mut self) -> bool {
-        let kind = self.active_kind();
-        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref());
+        let (kind, dialect) = (self.active_kind(), self.active_dialect());
+        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref(), dialect);
         let caret = self.ui.editor.cursor();
         let Some(before) = caret.col.checked_sub(1) else { return false };
         let Some(span) = self.ui.syntax.colours().line(caret.row).and_then(|spans| spans.iter().find(|s| s.start <= before && before < s.end)).copied() else {

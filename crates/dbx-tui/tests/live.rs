@@ -12,8 +12,8 @@ mod common;
 
 use common::*;
 use dbx_tui::core::{
-    Candidate, CandidateKind, Cell, CellKind, CompletionRequest, ConnectionDraft, ConnectionId, Core, CoreErrorKind, Cursor, DatabasePath, DbxCore, RunId, RunRequest,
-    SchemaPath, SearchKind, SessionId, TabId, TableKind, TablePath, DEFAULT_ROW_CAP,
+    Candidate, CandidateKind, Cell, CellKind, CompletionRequest, ConnectionDraft, ConnectionId, Core, CoreErrorKind, Cursor, DatabasePath, Dialect, DbxCore, RunId, RunRequest,
+    SchemaPath, SearchKind, SessionId, Syntax, TabId, TableKind, TablePath, DEFAULT_ROW_CAP,
 };
 
 const FIXTURE_PASSWORD: &str = "dbxtui";
@@ -1169,4 +1169,73 @@ async fn a_search_across_schemas_finds_a_name_that_two_schemas_have() {
     let id = saved_fixture(&core).await;
     let all = core.complete(&CompletionRequest { global: true, ..search(&id, "pagila", None, SearchKind::Relation, "film") }).await.expect("search");
     assert!(all.candidates.iter().any(|c| c.name == "film" && c.schema.as_deref() == Some("public")), "{all:?}");
+}
+
+// ---- capabilities (slice 14b) -----------------------------------------------------
+
+#[tokio::test]
+async fn a_postgres_connection_reports_what_dbxs_descriptor_says_for_postgres() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let saved = s.core().save_connection(&fixture("pagila", FIXTURE_PASSWORD)).await.expect("save");
+    // plugins/connection-types/postgres.yaml: schemaAware and treeSchema
+    // (databases, then schemas), queryExecution, metadataBrowse,
+    // tableDataEdit, sqlExplain, defaultPort 5432, dialect PostgreSQL,
+    // singleConnectionPool false.
+    let caps = &saved.capabilities;
+    assert!(caps.databases && caps.schemas, "{caps:?}");
+    assert!(caps.query && caps.browse && caps.edit_data && caps.explain, "{caps:?}");
+    assert_eq!(caps.default_port, Some(5432));
+    assert_eq!(caps.dialect, Dialect::PostgreSql);
+    assert!(!caps.single_connection);
+    // The same answer before any connection exists, for the form.
+    assert_eq!(&s.core().capabilities(&saved.kind), caps);
+    assert_eq!(s.core().connections().await.unwrap()[0].capabilities, *caps);
+}
+
+#[tokio::test]
+async fn a_scratch_sqlite_connection_has_no_database_or_schema_level_and_one_connection() {
+    let s = Scratch::new();
+    let core = s.core();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("scratch.db");
+    core.seed_config(serde_json::json!({
+        "id": "lite-1",
+        "name": "scratch sqlite",
+        "db_type": "sqlite",
+        "host": "",
+        "port": 0,
+        "username": "",
+        "password": "",
+        "database": file.to_string_lossy(),
+        "ssl": false,
+        "driver_profile": null,
+    }))
+    .await
+    .expect("seed");
+    let list = core.connections().await.expect("list");
+    let caps = &list.iter().find(|c| c.id.0 == "lite-1").expect("listed").capabilities;
+    // plugins/connection-types/sqlite.yaml: localFile, singleConnectionPool,
+    // no schemaAware or treeSchema, defaultPort absent, sqlExplain false.
+    assert!(!caps.databases && !caps.schemas, "{caps:?}");
+    assert!(caps.single_connection, "{caps:?}");
+    assert!(caps.query && caps.edit_data && !caps.explain, "{caps:?}");
+    assert_eq!(caps.default_port, None);
+    assert_eq!(caps.dialect, Dialect::Sqlite);
+    // dbx can browse it; this client does not yet, and says so.
+    assert!(!caps.browse && !caps.edit_in_form, "{caps:?}");
+}
+
+#[tokio::test]
+async fn an_empty_database_name_is_the_connections_own_database() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    // Saved with `pagila`: an empty name must not reach dbx as a database.
+    let request = RunRequest { database: Some(String::new()), ..run_request(&id, "", 1, "select current_database()") };
+    let result = core.run(RunId(rand_id()), request).await.expect("run");
+    assert_eq!(result.rows, vec![vec![Cell::Value("pagila".into())]]);
+    assert!(core.schemas(&database(&id, "")).await.expect("schemas").contains(&"public".to_string()));
+    assert_eq!(core.current_schema(&database(&id, "")).await.expect("current"), Some("public".into()));
 }

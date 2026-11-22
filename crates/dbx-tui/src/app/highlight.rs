@@ -5,11 +5,11 @@
 
 use std::collections::HashSet;
 
-use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{Dialect as SqlDialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 use super::theme::Role;
-use crate::core::{Cursor, DbKind};
+use crate::core::{Cursor, Dialect};
 
 /// One coloured stretch of a line: characters `start..end` (not display
 /// columns: the painter turns them into columns by the widths it draws).
@@ -101,19 +101,15 @@ pub(crate) fn is_keyword(lower: &str) -> bool {
 
 /// MySQL and the databases that speak its dialect: a double-quoted run is a
 /// string there, not a name.
-fn mysql_family(kind: Option<&DbKind>) -> bool {
-    match kind {
-        Some(DbKind::MySql) => true,
-        Some(DbKind::Other(name)) => ["mysql", "mariadb", "tidb", "doris", "starrocks", "oceanbase"].contains(&name.to_lowercase().as_str()),
-        _ => false,
-    }
+fn mysql_family(dialect: Option<Dialect>) -> bool {
+    dialect == Some(Dialect::MySql)
 }
 
-pub(super) fn dialect_of(kind: Option<&DbKind>) -> Box<dyn Dialect> {
-    match kind {
-        Some(DbKind::Postgres) => Box::new(PostgreSqlDialect {}),
-        Some(DbKind::Sqlite) => Box::new(SQLiteDialect {}),
-        _ if mysql_family(kind) => Box::new(MySqlDialect {}),
+pub(super) fn dialect_of(dialect: Option<Dialect>) -> Box<dyn SqlDialect> {
+    match dialect {
+        Some(Dialect::PostgreSql) => Box::new(PostgreSqlDialect {}),
+        Some(Dialect::Sqlite) => Box::new(SQLiteDialect {}),
+        Some(Dialect::MySql) => Box::new(MySqlDialect {}),
         _ => Box::new(GenericDialect {}),
     }
 }
@@ -184,11 +180,11 @@ fn add(out: &mut [Vec<Span>], lens: &[usize], from: (usize, usize), to: (usize, 
 /// those are the normal state of text being typed. It keeps what it had read
 /// before the failure, and the rest of the text is coloured as what opened:
 /// a comment, a string, or (for a quoted name) a bad token.
-pub fn highlight(lines: &[String], first_line: usize, kind: Option<&DbKind>, types: &TypeNames) -> Highlighted {
+pub fn highlight(lines: &[String], first_line: usize, dialect: Option<Dialect>, types: &TypeNames) -> Highlighted {
     let lens: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
     let mut out: Vec<Vec<Span>> = vec![Vec::new(); lines.len()];
     let mut brackets = Vec::new();
-    let dialect = dialect_of(kind);
+    let sql_dialect = dialect_of(dialect);
     // The tokenizer runs on the text from `base` (line, character) on; when it
     // refuses something that is not an unterminated run, that word is bad and
     // it starts again after it.
@@ -200,7 +196,7 @@ pub fn highlight(lines: &[String], first_line: usize, kind: Option<&DbKind>, typ
             text.push_str(l);
         }
         let mut tokens: Vec<TokenWithSpan> = Vec::new();
-        let result = Tokenizer::new(dialect.as_ref(), &text).tokenize_with_location_into_buf(&mut tokens);
+        let result = Tokenizer::new(sql_dialect.as_ref(), &text).tokenize_with_location_into_buf(&mut tokens);
 
         let pos = |l: sqlparser::tokenizer::Location| {
             let (line, col) = ((l.line as usize).saturating_sub(1), (l.column as usize).saturating_sub(1));
@@ -235,7 +231,7 @@ pub fn highlight(lines: &[String], first_line: usize, kind: Option<&DbKind>, typ
         let last = (lines.len() - 1, lens[lines.len() - 1]);
         if rest.starts_with("/*") {
             add(&mut out, &lens, from, last, Role::SynComment);
-        } else if rest.starts_with('"') && mysql_family(kind) {
+        } else if rest.starts_with('"') && mysql_family(dialect) {
             add(&mut out, &lens, from, last, Role::SynString);
         } else if rest.starts_with('"') || rest.starts_with('`') {
             add(&mut out, &lens, from, last, Role::SynBad);
@@ -294,7 +290,7 @@ pub struct Stats {
 #[derive(Debug)]
 struct Cached {
     revision: u64,
-    kind: Option<DbKind>,
+    dialect: Option<Dialect>,
     types: u64,
     result: Highlighted,
 }
@@ -317,13 +313,13 @@ impl Highlighter {
     /// never because of a repaint, a scroll or a caret move. The whole buffer
     /// is tokenized, so a comment or string opened anywhere above the screen
     /// is seen.
-    pub fn colours(&mut self, revision: u64, lines: &[String], kind: Option<&DbKind>, types: &TypeNames) -> &Highlighted {
-        let fresh = self.cached.as_ref().is_some_and(|c| c.revision == revision && c.kind.as_ref() == kind && c.types == types.generation());
+    pub fn colours(&mut self, revision: u64, lines: &[String], dialect: Option<Dialect>, types: &TypeNames) -> &Highlighted {
+        let fresh = self.cached.as_ref().is_some_and(|c| c.revision == revision && c.dialect == dialect && c.types == types.generation());
         if !fresh {
             self.stats.runs += 1;
             self.stats.lines_tokenized += lines.len();
-            let result = highlight(lines, 0, kind, types);
-            self.cached = Some(Cached { revision, kind: kind.cloned(), types: types.generation(), result });
+            let result = highlight(lines, 0, dialect, types);
+            self.cached = Some(Cached { revision, dialect, types: types.generation(), result });
         }
         &self.cached.as_ref().expect("set above").result
     }
@@ -342,9 +338,9 @@ mod tests {
     }
 
     /// The spans of line `row`, without punctuation, as (text, role).
-    fn parts(text: &str, kind: DbKind, row: usize) -> Vec<(String, Role)> {
+    fn parts(text: &str, kind: Dialect, row: usize) -> Vec<(String, Role)> {
         let ls = lines(text);
-        let h = highlight(&ls, 0, Some(&kind), &pg_types());
+        let h = highlight(&ls, 0, Some(kind), &pg_types());
         let chars: Vec<char> = ls[row].chars().collect();
         h.line(row)
             .expect("the line is covered")
@@ -355,7 +351,7 @@ mod tests {
     }
 
     fn pg(text: &str) -> Vec<(String, Role)> {
-        parts(text, DbKind::Postgres, 0)
+        parts(text, Dialect::PostgreSql, 0)
     }
 
     fn p(text: &str, role: Role) -> (String, Role) {
@@ -365,7 +361,7 @@ mod tests {
     #[test]
     fn a_select_gets_keyword_string_number_keyword_identifier_and_comment_spans_at_their_columns() {
         let ls = lines("select 'a', 12 from t -- note");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(
             h.line(0).unwrap(),
             &[
@@ -388,7 +384,7 @@ mod tests {
         );
         // Across lines: the rest of the buffer is the string.
         let ls = lines("select 1;\nselect 'abc\nfrom t where");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(h.line(0).unwrap()[0], Span { start: 0, end: 6, role: Role::SynKeyword });
         assert_eq!(h.line(1).unwrap().last(), Some(&Span { start: 7, end: 11, role: Role::SynString }));
         assert_eq!(h.line(2).unwrap(), &[Span { start: 0, end: 12, role: Role::SynString }]);
@@ -398,7 +394,7 @@ mod tests {
     fn an_unterminated_block_comment_colours_the_rest_as_comment() {
         assert_eq!(pg("select 1 /* later"), [p("select", Role::SynKeyword), p("1", Role::SynNumber), p("/* later", Role::SynComment)]);
         let ls = lines("select 1 /* a\nb\nc");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(h.line(0).unwrap().last(), Some(&Span { start: 9, end: 13, role: Role::SynComment }));
         assert_eq!(h.line(1).unwrap(), &[Span { start: 0, end: 1, role: Role::SynComment }]);
         assert_eq!(h.line(2).unwrap(), &[Span { start: 0, end: 1, role: Role::SynComment }]);
@@ -407,7 +403,7 @@ mod tests {
     #[test]
     fn a_terminated_block_comment_ends_where_it_ends_and_covers_each_of_its_lines() {
         let ls = lines("/* a\nb */ select 1");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(h.line(0).unwrap(), &[Span { start: 0, end: 4, role: Role::SynComment }]);
         assert_eq!(h.line(1).unwrap()[0], Span { start: 0, end: 4, role: Role::SynComment });
         assert_eq!(h.line(1).unwrap()[1], Span { start: 5, end: 11, role: Role::SynKeyword });
@@ -451,7 +447,7 @@ mod tests {
     fn the_words_of_a_multi_word_type_are_all_types() {
         let types = TypeNames::new(["double precision", "character varying", "integer[]", "with time zone"].map(String::from));
         let ls = lines("select a::double precision, b::character varying, with");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &types);
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &types);
         let chars: Vec<char> = ls[0].chars().collect();
         let got: Vec<(String, Role)> = h.line(0).unwrap().iter().filter(|s| s.role == Role::SynType || chars[s.start..s.end].iter().collect::<String>() == "with").map(|s| (chars[s.start..s.end].iter().collect(), s.role)).collect();
         assert_eq!(
@@ -469,7 +465,7 @@ mod tests {
             [p("select", Role::SynKeyword), p("'日本語'", Role::SynString), p("from", Role::SynKeyword), p("t", Role::SynIdentifier)]
         );
         let ls = lines("select '日本語' from t");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert!(h.line(0).unwrap().contains(&Span { start: 13, end: 17, role: Role::SynKeyword }));
     }
 
@@ -488,11 +484,11 @@ mod tests {
         );
         // The semicolon inside the dollar quotes is not punctuation.
         let ls = lines("select $$a;b$$");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert!(h.line(0).unwrap().iter().all(|s| s.role != Role::SynPunct));
         // Unterminated: the rest of the buffer is the string.
         let ls = lines("select 1, $$abc\ndef; select 2");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(h.line(1).unwrap(), &[Span { start: 0, end: 13, role: Role::SynString }]);
     }
 
@@ -504,25 +500,25 @@ mod tests {
     #[test]
     fn commas_and_semicolons_are_punctuation_and_operators_are_plain() {
         let ls = lines("select 1, 2;");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         let roles: Vec<(usize, Role)> = h.line(0).unwrap().iter().map(|s| (s.start, s.role)).collect();
         assert_eq!(roles, [(0, Role::SynKeyword), (7, Role::SynNumber), (8, Role::SynPunct), (10, Role::SynNumber), (11, Role::SynPunct)]);
         let ls = lines("select a+1");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert!(!h.line(0).unwrap().iter().any(|s| s.start == 8), "the + has no span: {:?}", h.line(0));
     }
 
     #[test]
     fn mysql_strings_may_be_double_quoted_and_postgres_double_quotes_are_names() {
-        assert_eq!(parts("select \"a\"", DbKind::MySql, 0)[1], p("\"a\"", Role::SynString));
-        assert_eq!(parts("select \"a\"", DbKind::Postgres, 0)[1], p("\"a\"", Role::SynIdentifier));
-        assert_eq!(parts("select `a`", DbKind::MySql, 0)[1], p("`a`", Role::SynIdentifier));
+        assert_eq!(parts("select \"a\"", Dialect::MySql, 0)[1], p("\"a\"", Role::SynString));
+        assert_eq!(parts("select \"a\"", Dialect::PostgreSql, 0)[1], p("\"a\"", Role::SynIdentifier));
+        assert_eq!(parts("select `a`", Dialect::MySql, 0)[1], p("`a`", Role::SynIdentifier));
     }
 
     #[test]
     fn the_bracket_beside_the_caret_is_matched_with_its_partner() {
         let ls = lines("select (a + (b)) from t");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         let at = |col| Cursor { row: 0, col };
         assert_eq!(matching_bracket(&h, at(8)), Some([(0, 7), (0, 15)]), "after the first (");
         assert_eq!(matching_bracket(&h, at(7)), Some([(0, 7), (0, 15)]), "before the first (");
@@ -534,7 +530,7 @@ mod tests {
     #[test]
     fn brackets_inside_strings_and_comments_are_not_brackets() {
         let ls = lines("select ')', (1) -- (\n, '(')");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         // After the real `(` (character 12): the partner is the real `)` at 14.
         assert_eq!(matching_bracket(&h, Cursor { row: 0, col: 13 }), Some([(0, 12), (0, 14)]));
         // Beside the `)` inside the string: nothing.
@@ -548,7 +544,7 @@ mod tests {
     #[test]
     fn a_bracket_pairs_across_lines_and_square_and_curly_ones_pair_with_their_own_kind() {
         let ls = lines("select (a,\n [b]) ");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(matching_bracket(&h, Cursor { row: 0, col: 8 }), Some([(0, 7), (1, 4)]));
         assert_eq!(matching_bracket(&h, Cursor { row: 1, col: 2 }), Some([(1, 1), (1, 3)]));
     }
@@ -576,16 +572,16 @@ mod tests {
 
     #[test]
     fn an_unterminated_double_quote_is_a_string_on_mysql_and_its_family_and_a_bad_name_elsewhere() {
-        assert_eq!(parts("select \"abc", DbKind::MySql, 0)[1], p("\"abc", Role::SynString));
-        assert_eq!(parts("select \"abc", DbKind::Other("mariadb".into()), 0)[1], p("\"abc", Role::SynString));
-        assert_eq!(parts("select \"abc", DbKind::Postgres, 0)[1], p("\"abc", Role::SynBad));
+        assert_eq!(parts("select \"abc", Dialect::MySql, 0)[1], p("\"abc", Role::SynString));
+        assert_eq!(parts("select \"abc", Dialect::MySql, 0)[1], p("\"abc", Role::SynString));
+        assert_eq!(parts("select \"abc", Dialect::PostgreSql, 0)[1], p("\"abc", Role::SynBad));
     }
 
     #[test]
     fn one_stray_character_the_tokenizer_refuses_does_not_turn_the_rest_of_the_buffer_plain() {
         // A bad escape in a unicode string is an error that is not "unterminated".
         let ls = lines("select U&'x\\zz' from t;\nselect 'x' from t;\nselect 2");
-        let h = highlight(&ls, 0, Some(&DbKind::Postgres), &pg_types());
+        let h = highlight(&ls, 0, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(h.line(0).unwrap()[1], Span { start: 7, end: 15, role: Role::SynBad });
         assert!(h.line(0).unwrap().contains(&Span { start: 16, end: 20, role: Role::SynKeyword }), "{:?}", h.line(0));
         assert!(h.line(1).unwrap().contains(&Span { start: 7, end: 10, role: Role::SynString }), "{:?}", h.line(1));
@@ -604,7 +600,7 @@ mod tests {
         ls[100] = "/* it's".to_string();
         ls[700] = "*/".to_string();
         let mut hl = Highlighter::default();
-        let h = hl.colours(1, &ls, Some(&DbKind::Postgres), &pg_types());
+        let h = hl.colours(1, &ls, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(h.line(610).unwrap(), &[Span { start: 0, end: ls[610].chars().count(), role: Role::SynComment }]);
         // After the comment ends the code is code again.
         assert_eq!(h.line(701).unwrap()[0], Span { start: 0, end: 6, role: Role::SynKeyword });
@@ -612,7 +608,7 @@ mod tests {
         // A string opened above the view: the lines in it are the string.
         ls[100] = "select 'open".to_string();
         ls[700] = "close' from t".to_string();
-        let h = hl.colours(2, &ls, Some(&DbKind::Postgres), &pg_types());
+        let h = hl.colours(2, &ls, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(h.line(610).unwrap(), &[Span { start: 0, end: ls[610].chars().count(), role: Role::SynString }]);
     }
 
@@ -621,17 +617,17 @@ mod tests {
         let ls = big();
         let mut hl = Highlighter::default();
         let types = pg_types();
-        hl.colours(1, &ls, Some(&DbKind::Postgres), &types);
+        hl.colours(1, &ls, Some(Dialect::PostgreSql), &types);
         assert_eq!(hl.stats, Stats { runs: 1, lines_tokenized: 5000 });
         let after_first = hl.stats;
         // The same text, drawn again, and scrolled far away.
-        hl.colours(1, &ls, Some(&DbKind::Postgres), &types);
-        hl.colours(1, &ls, Some(&DbKind::Postgres), &types);
-        hl.colours(1, &ls, Some(&DbKind::Postgres), &types);
+        hl.colours(1, &ls, Some(Dialect::PostgreSql), &types);
+        hl.colours(1, &ls, Some(Dialect::PostgreSql), &types);
+        hl.colours(1, &ls, Some(Dialect::PostgreSql), &types);
         assert_eq!(hl.stats, after_first, "nothing changed, nothing was tokenized");
         assert!(hl.current().line(4010).is_some() && hl.current().line(10).is_some());
         // A keystroke: a new revision.
-        hl.colours(2, &ls, Some(&DbKind::Postgres), &types);
+        hl.colours(2, &ls, Some(Dialect::PostgreSql), &types);
         assert_eq!(hl.stats.runs, 2);
     }
 
@@ -640,7 +636,7 @@ mod tests {
         let mut ls: Vec<String> = (0..100).map(|i| format!("select {i};")).collect();
         ls[0] = "/* open".to_string();
         let mut hl = Highlighter::default();
-        let h = hl.colours(1, &ls, Some(&DbKind::Postgres), &pg_types());
+        let h = hl.colours(1, &ls, Some(Dialect::PostgreSql), &pg_types());
         assert_eq!(h.line(70).unwrap(), &[Span { start: 0, end: 10, role: Role::SynComment }]);
     }
 
@@ -649,12 +645,12 @@ mod tests {
         let ls = lines("select cast(x as varchar)");
         let mut hl = Highlighter::default();
         let none = TypeNames::default();
-        let h = hl.colours(1, &ls, Some(&DbKind::Postgres), &none);
+        let h = hl.colours(1, &ls, Some(Dialect::PostgreSql), &none);
         assert!(!h.line(0).unwrap().iter().any(|s| s.role == Role::SynType));
-        let h = hl.colours(1, &ls, Some(&DbKind::Postgres), &pg_types());
+        let h = hl.colours(1, &ls, Some(Dialect::PostgreSql), &pg_types());
         assert!(h.line(0).unwrap().iter().any(|s| s.role == Role::SynType), "the types arrived");
         let runs = hl.stats.lines_tokenized;
-        hl.colours(1, &ls, Some(&DbKind::MySql), &pg_types());
+        hl.colours(1, &ls, Some(Dialect::MySql), &pg_types());
         assert!(hl.stats.lines_tokenized > runs, "another kind, another dialect");
     }
 }

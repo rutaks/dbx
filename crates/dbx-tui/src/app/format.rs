@@ -21,11 +21,11 @@
 //! A comment stays on the line it was on, after the same token, or on a line
 //! of its own, before the same token.
 
-use sqlparser::dialect::Dialect;
+use sqlparser::dialect::Dialect as SqlDialect;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use super::highlight::{dialect_of, is_keyword, KEYWORD_FUNCTIONS};
-use crate::core::DbKind;
+use crate::core::Dialect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeywordCase {
@@ -170,7 +170,7 @@ fn classify(token: &Token, raw: &str) -> K {
 
 /// The tokens and comments of `chars`, with where each is, or why the text
 /// does not tokenize.
-fn lex(chars: &[char], dialect: &dyn Dialect) -> Result<Vec<Item>, String> {
+fn lex(chars: &[char], dialect: &dyn SqlDialect) -> Result<Vec<Item>, String> {
     let text: String = chars.iter().collect();
     let tokens = Tokenizer::new(dialect, &text).tokenize_with_location().map_err(|e| format!("{} (line {}, column {})", e.message.to_lowercase(), e.location.line, e.location.column))?;
     let mut line_starts = vec![0usize];
@@ -254,9 +254,9 @@ fn same_items(a: &[Item], b: &[Item], fold: bool) -> bool {
 /// Whether `before` and `after` (texts) have the same tokens, comments and
 /// whitespace that carries meaning.
 #[cfg(test)]
-pub(super) fn same_tokens(before: &str, after: &str, kind: Option<&DbKind>, fold: bool) -> bool {
-    let dialect = dialect_of(kind);
-    let lexed = |t: &str| lex(&t.chars().collect::<Vec<_>>(), dialect.as_ref());
+pub(super) fn same_tokens(before: &str, after: &str, dialect: Option<Dialect>, fold: bool) -> bool {
+    let sql_dialect = dialect_of(dialect);
+    let lexed = |t: &str| lex(&t.chars().collect::<Vec<_>>(), sql_dialect.as_ref());
     match (lexed(before), lexed(after)) {
         (Ok(a), Ok(b)) => same_items(&a, &b, fold),
         _ => false,
@@ -813,10 +813,10 @@ fn client_command_line(chars: &[char], items: &[Item]) -> Option<usize> {
 
 /// Whether each of `ends` (character offsets into `text`) is outside every
 /// string, comment, quoted name and word of the whole `text`.
-pub fn ends_between_tokens(text: &str, kind: Option<&DbKind>, ends: &[usize]) -> Result<(), String> {
+pub fn ends_between_tokens(text: &str, dialect: Option<Dialect>, ends: &[usize]) -> Result<(), String> {
     let chars: Vec<char> = text.chars().collect();
-    let dialect = dialect_of(kind);
-    let items = lex(&chars, dialect.as_ref()).map_err(|why| format!("the editor's text does not tokenize ({why}), so a selection cannot be checked; fix that, or put the caret in the statement instead"))?;
+    let sql_dialect = dialect_of(dialect);
+    let items = lex(&chars, sql_dialect.as_ref()).map_err(|why| format!("the editor's text does not tokenize ({why}), so a selection cannot be checked; fix that, or put the caret in the statement instead"))?;
     for &pos in ends {
         let k = items.partition_point(|i| i.span().0 < pos);
         // The last item that starts before the position.
@@ -835,10 +835,10 @@ pub fn ends_between_tokens(text: &str, kind: Option<&DbKind>, ends: &[usize]) ->
 /// text sits at in the editor); `lead` the spaces the first line gets (the text
 /// began at the start of its line); `carets` are character offsets into `src`
 /// that come back as where they are in the result.
-pub fn format_sql(src: &str, kind: Option<&DbKind>, opts: &Options, base: usize, lead: usize, carets: &[usize]) -> Result<Formatted, String> {
+pub fn format_sql(src: &str, dialect: Option<Dialect>, opts: &Options, base: usize, lead: usize, carets: &[usize]) -> Result<Formatted, String> {
     let chars: Vec<char> = src.chars().collect();
-    let dialect = dialect_of(kind);
-    let items = lex(&chars, dialect.as_ref())?;
+    let sql_dialect = dialect_of(dialect);
+    let items = lex(&chars, sql_dialect.as_ref())?;
     let Some(last) = items.last() else {
         return Ok(Formatted { text: src.to_string(), carets: carets.to_vec(), tokens: 0 });
     };
@@ -851,7 +851,7 @@ pub fn format_sql(src: &str, kind: Option<&DbKind>, opts: &Options, base: usize,
     }
 
     let mut fmt = Fmt::new(opts, base, items.len());
-    fmt.mysql_names = !matches!(kind, Some(DbKind::Postgres | DbKind::Sqlite));
+    fmt.mysql_names = !matches!(dialect, Some(Dialect::PostgreSql | Dialect::Sqlite));
     fmt.run(&items);
     let suffix: String = chars[last_e..].iter().collect();
     let keep = if suffix.contains('\n') { suffix } else { String::new() };
@@ -860,7 +860,7 @@ pub fn format_sql(src: &str, kind: Option<&DbKind>, opts: &Options, base: usize,
     text.push_str(&keep);
 
     // Nothing but whitespace and keyword case may differ.
-    let again = lex(&text.chars().collect::<Vec<_>>(), dialect.as_ref()).map_err(|why| format!("the result would not tokenize ({why}), so the text is unchanged; select a smaller part and try again"))?;
+    let again = lex(&text.chars().collect::<Vec<_>>(), sql_dialect.as_ref()).map_err(|why| format!("the result would not tokenize ({why}), so the text is unchanged; select a smaller part and try again"))?;
     let fold = opts.case != KeywordCase::Leave;
     if !same_items(&items, &again, fold) {
         return Err("the result would change more than whitespace and keyword case, so the text is unchanged; select a smaller part and try again".to_string());
