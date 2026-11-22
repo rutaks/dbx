@@ -15,6 +15,7 @@ pub mod complete_scope;
 pub mod edit_ops;
 pub mod editor;
 pub mod form;
+pub mod format;
 pub mod grid;
 pub mod highlight;
 pub mod keys;
@@ -42,6 +43,8 @@ mod cancel_tests;
 mod finish_tests;
 #[cfg(test)]
 mod editor_keys_tests;
+#[cfg(test)]
+mod format_tests;
 #[cfg(test)]
 mod marks_tests;
 #[cfg(test)]

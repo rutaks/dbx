@@ -92,7 +92,7 @@ pub(crate) const KEYWORDS: &[&str] = &[
 ];
 
 /// Keywords that are calls when a parenthesis follows directly.
-const KEYWORD_FUNCTIONS: &[&str] = &["left", "right", "replace", "if", "truncate", "rollup", "cube", "filter"];
+pub(crate) const KEYWORD_FUNCTIONS: &[&str] = &["left", "right", "replace", "if", "truncate", "rollup", "cube", "filter"];
 
 pub(crate) fn is_keyword(lower: &str) -> bool {
     static SET: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();

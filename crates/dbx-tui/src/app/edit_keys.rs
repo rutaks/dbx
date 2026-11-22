@@ -134,6 +134,8 @@ impl App {
             Action::TextEnd => self.edit_doc(fx, |d| edit_ops::text_edge(d, true, false)),
             Action::TextEndSelect => self.edit_doc(fx, |d| edit_ops::text_edge(d, true, true)),
             Action::MatchingBrace => self.matching_brace(fx),
+            Action::Reformat => self.reformat(false, fx),
+            Action::ReformatAll => self.reformat(true, fx),
             _ => {}
         }
     }
@@ -151,6 +153,92 @@ impl App {
             },
             Ok(false) => {}
             Err(why) => self.notify(why.to_string(), true, fx),
+        }
+    }
+
+    /// Reformat code: the selection, else the statement under the caret, or
+    /// with `whole` the whole editor. The result is one undo step; text that
+    /// does not tokenize is left alone with a notice.
+    fn reformat(&mut self, whole: bool, fx: &mut Effects) {
+        let text = self.ui.editor.text();
+        let chars: Vec<char> = text.chars().collect();
+        let doc = self.ui.editor.doc();
+        let mut starts = vec![0usize];
+        starts.extend(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1));
+        let off = |c: Cursor| starts[c.row.min(starts.len() - 1)] + c.col;
+        let range = if whole {
+            Some((Cursor::default(), Cursor { row: starts.len() - 1, col: chars.len() - starts[starts.len() - 1] }))
+        } else if let Some(sel) = doc.sel() {
+            Some(sel)
+        } else {
+            self.statement_range_at(&text, doc.caret)
+        };
+        let Some((from, to)) = range else {
+            return self.notify("Nothing to reformat: the caret is not in a statement.".to_string(), false, fx);
+        };
+        // Only the text between the first and the last character that is not
+        // blank is replaced: the blanks around it stay as they are.
+        let (mut a, mut b) = (off(from).min(chars.len()), off(to).min(chars.len()));
+        while a < b && chars[a].is_whitespace() {
+            a += 1;
+        }
+        while b > a && chars[b - 1].is_whitespace() {
+            b -= 1;
+        }
+        if a == b {
+            return self.notify("Nothing to reformat here.".to_string(), false, fx);
+        }
+        // Where the lines after the first sit: under the first, when it starts
+        // its line, else at the line's own indentation.
+        let row_start = chars[..a].iter().rposition(|c| *c == '\n').map_or(0, |i| i + 1);
+        let before = &chars[row_start..a];
+        let base = if before.iter().all(|c| c.is_whitespace()) { before.len() } else { chars[row_start..].iter().take_while(|c| **c == ' ' || **c == '\t').count() };
+
+        let s = &self.model.settings;
+        let opts = super::format::Options { case: s.format_keyword_case, indent: s.format_indent, comma: s.format_comma };
+        let kind = self.active_kind();
+        let region: String = chars[a..b].iter().collect();
+        let (caret, anchor) = (off(doc.caret), doc.anchor.map(off));
+        let inside = |p: usize| p.clamp(a, b) - a;
+        let asked = [inside(caret), anchor.map_or(0, inside)];
+        // A selection must start and end between tokens of the whole text: one
+        // that begins inside a string, comment or `$$` body is not SQL.
+        if !whole && doc.sel().is_some() {
+            if let Err(why) = super::format::ends_between_tokens(&text, kind.as_ref(), &[a, b]) {
+                return self.notify(format!("Not reformatted: {why}."), true, fx);
+            }
+        }
+        let done = match super::format::format_sql(&region, kind.as_ref(), &opts, base, 0, &asked) {
+            Ok(done) => done,
+            Err(why) => return self.notify(format!("Not reformatted: {why}."), true, fx),
+        };
+        if done.text == region {
+            return;
+        }
+        let new_len = done.text.chars().count();
+        let place = |p: usize, mapped: usize| if p < a { p } else if p > b { p - (b - a) + new_len } else { a + mapped };
+        let (new_caret, new_anchor) = (place(caret, done.carets[0]), anchor.map(|p| place(p, done.carets[1])));
+        let mut new_text: String = chars[..a].iter().collect();
+        new_text.push_str(&done.text);
+        new_text.extend(&chars[b..]);
+
+        let lines: Vec<String> = new_text.split('\n').map(str::to_string).collect();
+        let at = |p: usize| {
+            let (mut row, mut left) = (0, p);
+            for l in &lines {
+                let n = l.chars().count();
+                if left <= n {
+                    break;
+                }
+                left -= n + 1;
+                row += 1;
+            }
+            Cursor { row: row.min(lines.len() - 1), col: left }
+        };
+        let doc = Doc::from_lines(&lines, new_anchor.map(at), at(new_caret));
+        match self.ui.editor.apply(&doc) {
+            Ok(changed) => fx.repaint |= changed,
+            Err(why) => self.notify(format!("Not done: {why}."), true, fx),
         }
     }
 

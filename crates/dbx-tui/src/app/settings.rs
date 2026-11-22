@@ -1,6 +1,8 @@
 //! What the user can switch. Defaults now; the config file that sets them comes
 //! with a later slice.
 
+use super::format::{CommaPosition, KeywordCase};
+
 /// What running does when the caret is inside a subquery (IntelliJ's "when
 /// caret inside statement, execute").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,12 @@ pub struct Settings {
     pub hard_tabs: bool,
     /// The width of an indent step, in columns.
     pub tab_width: usize,
+    /// Reformat code: the case of keywords (default: leave as typed).
+    pub format_keyword_case: KeywordCase,
+    /// Reformat code: the width of an indent step, in spaces.
+    pub format_indent: usize,
+    /// Reformat code: where the comma of a broken list goes.
+    pub format_comma: CommaPosition,
 }
 
 impl Default for Settings {
@@ -47,6 +55,9 @@ impl Default for Settings {
             run_at_caret: RunAtCaret::Ask,
             hard_tabs: false,
             tab_width: 4,
+            format_keyword_case: KeywordCase::Leave,
+            format_indent: 4,
+            format_comma: CommaPosition::Trailing,
         }
     }
 }

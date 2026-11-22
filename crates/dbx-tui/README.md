@@ -145,7 +145,7 @@ with all its keys, from the live bindings, and marks in `[brackets]` the keys
 this terminal cannot deliver (no keyboard protocol). A few actions also have a
 prefix key (`ctrl+g d` duplicate, `x` delete line, `/` line comment, `*` block
 comment, `f` find, `g` go to line, `a` select all, `u`/`U` undo/redo, `w`/`W`
-extend/shrink, `J` join, `~` toggle case, `%` matching brace); they work in the
+extend/shrink, `J` join, `~` toggle case, `=` reformat, `+` reformat all, `%` matching brace); they work in the
 editor only and are in the help, not in the mode bar.
 
 | Action | Keys |
@@ -166,6 +166,8 @@ editor only and are in the help, not in the mode bar.
 | new line after / before | `shift+enter` / `cmd+alt+enter` `ctrl+alt+enter` |
 | join lines | `ctrl+shift+j` |
 | toggle case | `cmd+shift+u` `ctrl+shift+u` |
+| reformat the selection, else the statement | `cmd+alt+l` `ctrl+alt+l`, `ctrl+g =` |
+| reformat the whole editor | `ctrl+g +` |
 | indent / unindent | `tab` / `shift+tab` |
 | word left/right, delete word | `alt`/`ctrl` + `left` `right`, `backspace` `delete` (shift selects) |
 | line start/end (`home` toggles first non-blank / column 0) | `home` `end` `cmd+left` `cmd+right` |
@@ -182,6 +184,32 @@ keys (each a setting, on): `(` `[` `'` `"` insert the pair, the closer typed
 next is typed over, `tab` moves past a closer, `backspace` between an empty
 pair takes both, an opener over a selection surrounds it, `enter` keeps the
 indent and opens a block between brackets, `home` toggles.
+
+Reformat (`src/app/format.rs`) lays the SQL out on the tokenizer's tokens and
+changes only whitespace and, by setting, keyword case: every token is copied
+from the text by its span (strings, `$$` bodies, `E''`, quoted names, comments),
+and the result is tokenized again and refused if its tokens are not the
+source's. Layout: each clause (`select`, `from`, `where`, `group by`, `having`,
+`order by`, `limit`, `offset`, joins, `union`...) on its own line; the items of
+`select`, `set` and `values` and the columns of a `create table` one per line,
+indented; the `and`/`or` of `where`, `having` and `on` one per line, indented
+(not a `between`'s `and`, nor one inside `case`); a subquery or CTE indented one
+level with its `)` on its own line; calls and other parentheses stay on one
+line; one blank line between statements. A comment stays after the token it
+followed or on its own line before the token it preceded. The caret stays on the
+same token, the result is one undo step, and text that does not tokenize (an
+unterminated string or comment) is left alone with a notice giving the reason.
+A line break between two string literals is kept (Postgres joins them by it),
+and two operators in a row keep their space (`- -1`). A region with a client
+command line (`DELIMITER`, a lone `GO`, a `\` psql command) is refused with a
+notice, and so is a selection that starts or ends inside a string, comment,
+quoted name, `$$` body or word. On MySQL-family and unknown databases only
+words MySQL reserves are re-cased, so a table named `language` keeps its case.
+Settings (`Settings`): `format_keyword_case` (`Leave` default, `Upper`,
+`Lower`; applies to the keyword list the highlighter uses, never to quoted
+names, strings, comments or a word after a `.`), `format_indent` (4) and
+`format_comma` (`Trailing` default, or `Leading`). Not done: tabs (indents are
+spaces), per-dialect style, reformat on paste.
 
 When the caret is inside a subquery (`( select ... )` or a CTE body), run opens
 a chooser (the subquery, the statement) and runs exactly the listed text, as a

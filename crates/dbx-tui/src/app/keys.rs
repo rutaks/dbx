@@ -306,6 +306,8 @@ pub enum Action {
     NewLineBefore,
     JoinLines,
     ToggleCase,
+    Reformat,
+    ReformatAll,
     Indent,
     Unindent,
     WordLeft,
@@ -401,6 +403,8 @@ impl Action {
             Action::NewLineBefore => "new line before",
             Action::JoinLines => "join lines",
             Action::ToggleCase => "toggle case",
+            Action::Reformat => "reformat",
+            Action::ReformatAll => "reformat all",
             Action::Indent => "indent",
             Action::Unindent => "unindent",
             Action::WordLeft => "word left",
@@ -492,6 +496,8 @@ impl Action {
             | Action::NewLineBefore
             | Action::JoinLines
             | Action::ToggleCase
+            | Action::Reformat
+            | Action::ReformatAll
             | Action::Indent
             | Action::Unindent
             | Action::WordLeft
@@ -683,6 +689,7 @@ impl Default for Keybinds {
                     (Action::NewLineBefore, &["cmd+alt+enter", "ctrl+alt+enter"]),
                     (Action::JoinLines, &["ctrl+shift+j"]),
                     (Action::ToggleCase, &["cmd+shift+u", "ctrl+shift+u"]),
+                    (Action::Reformat, &["cmd+alt+l", "ctrl+alt+l"]),
                     (Action::Indent, &["tab"]),
                     (Action::Unindent, &["shift+tab"]),
                     (Action::WordLeft, &["alt+left", "ctrl+left"]),
@@ -717,6 +724,8 @@ impl Default for Keybinds {
                 ('g', Action::GotoLine),
                 ('J', Action::JoinLines),
                 ('~', Action::ToggleCase),
+                ('=', Action::Reformat),
+                ('+', Action::ReformatAll),
                 ('%', Action::MatchingBrace),
                 ('o', Action::NewLineAfter),
                 ('O', Action::NewLineBefore),
@@ -953,7 +962,7 @@ pub struct HelpSection {
 }
 
 /// The editor's actions in the order the help lists them.
-pub const EDIT_ACTIONS: [Action; 41] = [
+pub const EDIT_ACTIONS: [Action; 43] = [
     Action::Duplicate,
     Action::DeleteLine,
     Action::MoveLineUp,
@@ -978,6 +987,8 @@ pub const EDIT_ACTIONS: [Action; 41] = [
     Action::NewLineBefore,
     Action::JoinLines,
     Action::ToggleCase,
+    Action::Reformat,
+    Action::ReformatAll,
     Action::Indent,
     Action::Unindent,
     Action::WordLeft,
