@@ -237,12 +237,12 @@ fn the_sidebar_is_a_filled_column_with_one_separator_and_one_shared_divider() {
 fn mode_bar_hints_come_from_the_live_keybindings() {
     let mut app = ready_app();
     press(&mut app, "ctrl+g");
-    let bar = frame_rows(&mut app, 100, 30)[29].clone();
+    let bar = frame_rows(&mut app, 120, 30)[29].clone();
     for want in ["PREFIX", "h/j/k/l", "focus", "z", "zoom", "q", "quit", "esc", "back"] {
         assert!(bar.contains(want), "{want:?} missing from {bar:?}");
     }
     app.ui.keys.rebind(Action::Quit, "x");
-    let bar = frame_rows(&mut app, 100, 30)[29].clone();
+    let bar = frame_rows(&mut app, 120, 30)[29].clone();
     assert!(bar.contains("x quit") && !bar.contains("q quit"), "{bar:?}");
 }
 

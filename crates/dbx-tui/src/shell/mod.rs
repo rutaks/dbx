@@ -3,6 +3,7 @@
 //! `select!` over the terminal's events, the reply channel and the app's
 //! next deadline; it draws only when an update asks for a repaint.
 
+pub mod kitty;
 pub mod prefs;
 mod terminal;
 
@@ -183,6 +184,7 @@ pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>) -> io::
     let (tx, mut rx) = mpsc::unbounded_channel::<(RequestId, CoreReply)>();
     let mut events = EventStream::new();
     let mut app = App::new();
+    app.ui.caps.keyboard_protocol = guard.keyboard_protocol;
     let syntax: Arc<dyn crate::core::Syntax> = core.clone();
     app.ui.syntax.set_handle(syntax);
     app.ui.theme = crate::app::theme::Palette::from_setting(std::env::var("DBX_TUI_THEME").ok().as_deref());

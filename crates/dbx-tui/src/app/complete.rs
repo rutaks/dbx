@@ -388,14 +388,21 @@ impl App {
         if combo.code == KeyCode::Esc && self.ui.complete.is_open() {
             self.close_completion(fx);
         }
-        // An undo or a redo ends template mode first: the template would
-        // otherwise follow what it undid as a new edit, and mirror it back.
-        if matches!(key.code, KeyCode::Char('u' | 'r')) && key.modifiers == KeyModifiers::CONTROL {
-            self.leave_template(fx);
+        // While the find or go-to-line bar is open the keys that are text are its.
+        if self.bar_open() {
+            return self.bar_key(&key, &combo, fx);
+        }
+        // The editor's own actions: IntelliJ's keys, and the fallbacks.
+        if let Some(action) = self.ui.keys.lookup_editor(&combo) {
+            let now = self.ui.now.unwrap_or_else(std::time::Instant::now);
+            return self.perform_edit(action, now, fx);
         }
         let before = self.ui.editor.revision();
         let template_before = self.template_before();
-        fx.repaint |= self.ui.editor.key(key);
+        // Typed text goes through the smart keys first (pairs, indentation).
+        if !self.smart_key(&key, fx) {
+            fx.repaint |= self.ui.editor.key(key);
+        }
         self.track_template(template_before, fx);
         let edited = self.ui.editor.revision() != before;
         let typed = match key.code {

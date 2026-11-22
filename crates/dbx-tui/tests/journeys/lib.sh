@@ -54,6 +54,17 @@ wait_for() {
   fail "timed out waiting for /$re/ ($name)"
 }
 
+# wait_for_soft NAME REGEX [SECONDS]: like wait_for, but returns 1 on timeout.
+wait_for_soft() {
+  local name="$1" re="$2" tries=$(( ${3:-10} * 10 ))
+  while [ "$tries" -gt 0 ]; do
+    capture "$name"
+    grep -Eq -- "$re" "$LAST_CAPTURE" && return 0
+    sleep 0.1; tries=$((tries - 1))
+  done
+  return 1
+}
+
 expect() { grep -Eq -- "$2" "$LAST_CAPTURE" || fail "$1: expected /$2/"; }
 expect_not() { grep -Eq -- "$2" "$LAST_CAPTURE" && fail "$1: did not expect /$2/"; true; }
 

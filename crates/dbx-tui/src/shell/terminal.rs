@@ -4,13 +4,46 @@
 use std::io;
 
 use crossterm::cursor::Show;
-use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use ratatui::DefaultTerminal;
 
 /// Owns the terminal while the client runs. Dropping it restores the shell.
 pub struct TerminalGuard {
     pub terminal: DefaultTerminal,
+    /// The terminal speaks the kitty keyboard protocol (asked once, here, before
+    /// the event stream starts) and the guard turned it on.
+    pub keyboard_protocol: bool,
+}
+
+/// Set once the protocol is on, so the panic hook and signal paths pop it too.
+static PROTOCOL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once xterm's modifyOtherKeys was asked for (terminals without the kitty
+/// protocol, tmux among them: it passes Ctrl+Enter on only to a program that asks).
+static MODIFY_OTHER_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once the kitty user variable was written.
+static USER_VAR_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The user variable kitty's `map --when-focus-on var:dbx_tui` looks at.
+pub const USER_VAR: &str = "dbx_tui";
+
+/// `OSC 1337 ; SetUserVar=NAME=BASE64 ST`: sets a kitty user variable.
+pub fn set_user_var(name: &str, value: &str) -> String {
+    format!("\u{1b}]1337;SetUserVar={name}={}\u{1b}\\", base64(value.as_bytes()))
+}
+
+/// The same with no value: kitty's own examples clear a variable this way
+/// (`SetUserVar=in_editor`).
+pub fn clear_user_var(name: &str) -> String {
+    format!("\u{1b}]1337;SetUserVar={name}\u{1b}\\")
+}
+
+/// Only kitty reads the variable; other terminals are not sent it.
+fn in_kitty() -> bool {
+    std::env::var_os("KITTY_WINDOW_ID").is_some() || std::env::var("TERM").is_ok_and(|t| t.contains("kitty"))
 }
 
 impl TerminalGuard {
@@ -28,8 +61,49 @@ impl TerminalGuard {
             std::process::exit(101);
         }));
         execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
-        Ok(Self { terminal })
+        // Asked once, now: it reads the terminal's answer, which must not race
+        // the event stream. Disambiguated keys give Cmd (as SUPER), Ctrl+Enter
+        // and the rest; a terminal that cannot says so and nothing is pushed.
+        let keyboard_protocol = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        if keyboard_protocol && execute!(io::stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)).is_ok() {
+            PROTOCOL_ON.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if !keyboard_protocol && modify_other_keys_is_safe() {
+            use std::io::Write;
+            let mut out = io::stdout();
+            // xterm's modifyOtherKeys, level 2: Ctrl+Enter, Ctrl+/ and the like
+            // arrive with their modifiers where the terminal (or tmux, with
+            // `extended-keys on`) can send them. A terminal that does not know
+            // it ignores it.
+            if out.write_all(b"\x1b[>4;2m").and_then(|_| out.flush()).is_ok() {
+                MODIFY_OTHER_ON.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        if in_kitty() {
+            use std::io::Write;
+            let mut out = io::stdout();
+            if out.write_all(set_user_var(USER_VAR, "1").as_bytes()).and_then(|_| out.flush()).is_ok() {
+                USER_VAR_ON.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Ok(Self { terminal, keyboard_protocol })
     }
+}
+
+/// crossterm 0.29 cannot parse xterm's `CSI 27;mods;code ~` form (it rejects
+/// the key code 27), so modifyOtherKeys is only asked for where the terminal
+/// answers in the `CSI code;mods u` form it does parse: inside tmux set to
+/// `extended-keys-format csi-u`. Anywhere else, ctrl and alt chords would be lost.
+fn modify_other_keys_is_safe() -> bool {
+    if std::env::var_os("TMUX").is_none() {
+        return false;
+    }
+    std::process::Command::new("tmux")
+        .args(["show-options", "-sv", "extended-keys-format"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "csi-u")
+        .unwrap_or(false)
 }
 
 impl Drop for TerminalGuard {
@@ -80,12 +154,35 @@ pub fn copy_to_terminal(text: &str) {
 }
 
 fn restore_extras() {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    // Every exit path comes through here: quit and signals (the guard's drop)
+    // and panics (the hook).
+    if PROTOCOL_ON.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    if MODIFY_OTHER_ON.swap(false, Ordering::SeqCst) {
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\x1b[>4;0m");
+        let _ = out.flush();
+    }
+    if USER_VAR_ON.swap(false, Ordering::SeqCst) {
+        let mut out = io::stdout();
+        let _ = out.write_all(clear_user_var(USER_VAR).as_bytes());
+        let _ = out.flush();
+    }
     let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, Show);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kitty_user_variable_is_set_with_base64_one_and_cleared_without_a_value() {
+        assert_eq!(set_user_var("dbx_tui", "1"), "\u{1b}]1337;SetUserVar=dbx_tui=MQ==\u{1b}\\");
+        assert_eq!(clear_user_var("dbx_tui"), "\u{1b}]1337;SetUserVar=dbx_tui\u{1b}\\");
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {

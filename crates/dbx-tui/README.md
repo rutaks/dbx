@@ -81,11 +81,11 @@ connection cancels a run on it first, and the removal waits for that run.
 
 | Key | Does |
 |---|---|
-| `f5`, `ctrl+g r` | run the selection, or else the statement under the cursor (dbx splits statements at `;`, and also before a line starting with a keyword such as `CREATE`, `INSERT`, `UPDATE`, `DELETE` or `SET`, but not `SELECT` or `WITH`, after two or more blank lines; a cursor on a blank line after a statement runs that statement) |
-| `ctrl+c` (editor or results focused), `ctrl+g c` (anywhere) | cancel the run; pressed again while the cancel has not landed, ask whether to stop waiting (below). With nothing running, `ctrl+c` does nothing at all |
+| `f5`, `cmd+enter`, `ctrl+enter`, `ctrl+g r` | run the selection, or else the statement under the cursor (dbx splits statements at `;`, and also before a line starting with a keyword such as `CREATE`, `INSERT`, `UPDATE`, `DELETE` or `SET`, but not `SELECT` or `WITH`, after two or more blank lines; a cursor on a blank line after a statement runs that statement) |
+| `ctrl+c`, `ctrl+f2`, `cmd+f2` (editor or results focused), `ctrl+g c` (anywhere) | cancel the run; pressed again while the cancel has not landed, ask whether to stop waiting (below). With nothing running, `ctrl+c` does nothing, except in the editor with a selection, where it copies |
 | `ctrl+space` (editor focused) | open the completion popup (below) |
 | `alt+enter` (editor focused) | the intention actions, as in IntelliJ: on a select list's `*` it expands it; anywhere else it does nothing and shows no hint. It is not a run key |
-| anything else, editor focused | the editor's own (`ratatui-textarea` defaults: shift+arrows select, `ctrl+u`/`ctrl+r` undo/redo) |
+| anything else, editor focused | text, the arrows (shift selects), page keys and the editing keys below. The widget's Emacs keys (`ctrl+k`, `ctrl+u`, `ctrl+r`...) are not bound; `ctrl+u` and `ctrl+r` are no longer undo and redo (`ctrl+z` and `ctrl+shift+z` are) |
 
 A run has no time limit unless the connection sets its own query timeout in
 the dbx desktop app (dbx's default of 60 counts as unset); a pasted text over
@@ -134,6 +134,85 @@ the statement ends. Giving the tab another target, or removing its connection,
 while a run is in flight leaves the same marker. Quitting while a statement may
 still be running prints, once the terminal is restored,
 `dbx-tui: A statement may still be running on <connection / database>.`
+
+## Editor keys (slice 13)
+
+Every editing action is a named action in the live bindings (`Keybinds`), with
+IntelliJ's macOS key (`cmd+...`), its Windows/Linux key (Ctrl) and, where one
+exists, a key every terminal delivers; both the Cmd and the Ctrl forms are
+bound on every platform. `ctrl+g ?` (the prefix, then `?`) lists every action
+with all its keys, from the live bindings, and marks in `[brackets]` the keys
+this terminal cannot deliver (no keyboard protocol). A few actions also have a
+prefix key (`ctrl+g d` duplicate, `x` delete line, `/` line comment, `*` block
+comment, `f` find, `g` go to line, `a` select all, `u`/`U` undo/redo, `w`/`W`
+extend/shrink, `J` join, `~` toggle case, `%` matching brace); they work in the
+editor only and are in the help, not in the mode bar.
+
+| Action | Keys |
+|---|---|
+| duplicate line or selection | `cmd+d` `ctrl+d` |
+| delete line | `cmd+backspace` `ctrl+y` |
+| move line up / down | `alt+shift+up` / `down` |
+| move statement up / down | `cmd+shift+up/down` `ctrl+shift+up/down` |
+| line comment (`-- `) | `cmd+/` `ctrl+/` |
+| block comment | `cmd+alt+/` `ctrl+shift+/` |
+| extend / shrink selection (word, statement, all) | `ctrl+w` `alt+up` / `ctrl+shift+w` `alt+down` |
+| select all | `cmd+a` `ctrl+a` |
+| undo / redo | `cmd+z` `ctrl+z` / `cmd+shift+z` `ctrl+shift+z` |
+| cut / copy | `cmd+x` `ctrl+x` / `cmd+c` (and `ctrl+c` with a selection, nothing running) |
+| paste | the terminal's paste (arrives as a bracketed paste); `cmd+v`/`ctrl+v` only say so |
+| find, next, previous | `cmd+f` `ctrl+f`; `enter` `f3` `cmd+g`; `shift+f3` `cmd+shift+g`; `esc` closes |
+| go to line | `cmd+l`, `ctrl+g g` |
+| new line after / before | `shift+enter` / `cmd+alt+enter` `ctrl+alt+enter` |
+| join lines | `ctrl+shift+j` |
+| toggle case | `cmd+shift+u` `ctrl+shift+u` |
+| indent / unindent | `tab` / `shift+tab` |
+| word left/right, delete word | `alt`/`ctrl` + `left` `right`, `backspace` `delete` (shift selects) |
+| line start/end (`home` toggles first non-blank / column 0) | `home` `end` `cmd+left` `cmd+right` |
+| text start/end | `cmd+up` `cmd+home` `ctrl+home` / `cmd+down` `cmd+end` `ctrl+end` |
+| matching brace | `ctrl+m` `ctrl+shift+m` |
+
+Every edit, however many changes it makes, is one undo step (the widget's own
+history is off; `Editor` keeps snapshots). `tab` belongs to the completion popup
+first, then to a live template being filled in, then to a selection over several
+lines (indent), and last inserts indentation to the next stop (spaces, or a tab
+with `Settings::hard_tabs`). Find is plain text, case-insensitive unless the
+query has a capital, with the matches in the `find_match` palette role. Smart
+keys (each a setting, on): `(` `[` `'` `"` insert the pair, the closer typed
+next is typed over, `tab` moves past a closer, `backspace` between an empty
+pair takes both, an opener over a selection surrounds it, `enter` keeps the
+indent and opens a block between brackets, `home` toggles.
+
+When the caret is inside a subquery (`( select ... )` or a CTE body), run opens
+a chooser (the subquery, the statement) and runs exactly the listed text, as a
+range sent with the run; `Settings::run_at_caret` is `Ask` (default),
+`Smallest` or `Statement`. Running all statements is not offered: the adapter
+runs one.
+
+## Terminal setup
+
+At start the client asks the terminal once whether it speaks the kitty keyboard
+protocol; if so it turns on disambiguated keys (Cmd arrives as `cmd+`, and
+Ctrl+Enter is told from Enter) and turns it off again on quit, panic and signals.
+Without the protocol it asks for xterm's `modifyOtherKeys` (level 2), which tmux
+(and xterm) honour.
+
+- **No setup needed:** `f5` runs, `ctrl+g` is the prefix, and in a terminal with
+  the protocol every Ctrl binding works.
+- **kitty:** kitty keeps `cmd+enter`, `cmd+f`, `cmd+l`, `cmd+c` and others for
+  itself. `dbx-tui kitty-setup` prints the path of `extras/kitty/dbx-tui.conf`
+  and the one line to add to `kitty.conf` (`include <path>`; `--write` copies the
+  file into kitty's configuration directory first). The file uses `map
+  --when-focus-on var:dbx_tui <key>` for each key, and the client sets the user
+  variable `dbx_tui` on start and clears it on exit (`OSC 1337 ; SetUserVar`), so
+  the keys are released only while the client is focused. `cmd+v` is not released:
+  kitty's paste is how text reaches the client.
+- **tmux:** `set -s extended-keys on` for `ctrl+enter` and `ctrl+/`. Cmd never
+  passes through tmux; use the Ctrl keys, `f5` or the prefix.
+- **macOS Terminal.app:** no keyboard protocol: `f5` and the prefix (and the
+  legacy Ctrl keys such as `ctrl+d`, `ctrl+z`).
+- With kitty's `macos_option_as_alt no`, Option+letter types a character; the
+  Option-arrow combinations are listed in the slice report.
 
 ## The editor's look (syntax colouring)
 

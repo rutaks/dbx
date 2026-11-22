@@ -65,6 +65,12 @@ impl SyntaxState {
         self.highlighter.current()
     }
 
+    /// Where the statement `cursor` is in lies in `buffer`, asked of the Core
+    /// now (not cached: the editing actions ask when a key is pressed).
+    pub fn statement_at(&self, kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)> {
+        self.handle.statement_range(kind, buffer, cursor)
+    }
+
     /// Brings the colours up to date, and nothing else: what completion needs
     /// to know which characters are a string or a comment. The same cache as
     /// `prepare`, so the next frame tokenizes nothing more.

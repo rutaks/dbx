@@ -4,6 +4,19 @@ use dbx_tui::core::DbxCore;
 use dbx_tui::shell;
 
 fn main() {
+    // `dbx-tui kitty-setup [--write]` prints where kitty's include file is.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("kitty-setup") {
+        let write = args.next().as_deref() == Some("--write");
+        match shell::kitty::setup(write, &|k| std::env::var(k).ok()) {
+            Ok(text) => print!("{text}"),
+            Err(e) => {
+                eprintln!("dbx-tui: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     shell::install_crypto_provider();
     let runtime = match shell::runtime() {
         Ok(rt) => rt,

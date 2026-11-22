@@ -329,7 +329,6 @@ async fn quit_while_cancelling_or_with_the_question_open_cancels_again_closes_th
 async fn ctrl_c_with_nothing_running_does_nothing_at_all_in_any_pane_and_in_the_sidebar_never_cancels() {
     let mut h = on_pagila().await;
     h.type_text("select 1");
-    h.press("shift+left");
     let selection = h.app.ui.editor.selection();
     for (pane, keys) in [("editor", ""), ("results", "ctrl+g j"), ("sidebar", "ctrl+g h")] {
         if !keys.is_empty() {

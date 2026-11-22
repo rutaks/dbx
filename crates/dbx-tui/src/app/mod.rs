@@ -1,7 +1,9 @@
 //! The pure part of the client: state, `update(event) -> effects`, and
 //! `view(frame)`. No tokio, no terminal I/O, no dbx types.
 
+mod bar;
 mod connection_ui;
+mod edit_keys;
 pub mod finish;
 mod resize;
 pub mod complete;
@@ -10,6 +12,7 @@ pub mod complete_insert;
 pub mod complete_match;
 pub mod complete_popup;
 pub mod complete_scope;
+pub mod edit_ops;
 pub mod editor;
 pub mod form;
 pub mod grid;
@@ -37,6 +40,8 @@ pub(crate) mod view;
 mod cancel_tests;
 #[cfg(test)]
 mod finish_tests;
+#[cfg(test)]
+mod editor_keys_tests;
 #[cfg(test)]
 mod marks_tests;
 #[cfg(test)]
@@ -154,9 +159,23 @@ pub struct SidebarNote {
     pub failure: bool,
 }
 
+/// What the terminal can do, asked once at startup by the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    /// The terminal speaks the kitty keyboard protocol, so Cmd, Ctrl+Enter and
+    /// the other keys a legacy terminal cannot tell apart arrive as they are.
+    /// Where it is false the help overlay marks those keys as unavailable.
+    pub keyboard_protocol: bool,
+}
+
 /// Presentation only.
 #[derive(Debug)]
 pub struct Ui {
+    pub caps: Capabilities,
+    /// The find or go-to-line bar on the editor's last row, while open.
+    pub bar: Option<bar::Bar>,
+    /// What was last searched for: where the find bar starts with no selection.
+    pub last_find: String,
     pub focus: PaneId,
     pub zoomed: bool,
     pub mode: Mode,
@@ -327,6 +346,9 @@ impl App {
                 row_cap: DEFAULT_ROW_CAP,
             },
             ui: Ui {
+                caps: Capabilities::default(),
+                bar: None,
+                last_find: String::new(),
                 focus: PaneId::Sidebar,
                 zoomed: false,
                 mode: Mode::Normal,
@@ -489,6 +511,9 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str, fx: &mut Effects) {
+        if self.bar_open() {
+            return self.bar_paste(text, fx);
+        }
         if self.ui.focus == PaneId::Editor {
             self.close_completion(fx);
             match self.ui.editor.paste(text) {
@@ -523,7 +548,15 @@ impl App {
                 None
             }
             (Action::Run | Action::RunDirect, _) => {
-                self.run_statement(now, fx);
+                self.run_requested(now, fx);
+                None
+            }
+            (Action::Help, _) => {
+                self.open_help(fx);
+                None
+            }
+            (a, _) if a.scope() == keys::Scope::Editor => {
+                self.perform_edit(a, now, fx);
                 None
             }
             (Action::Cancel, _) => {
@@ -545,6 +578,11 @@ impl App {
             }
             (Action::PrevUnresolved, Editor) => {
                 self.goto_unresolved(false, fx);
+                None
+            }
+            // With nothing running, `ctrl+c` in the editor copies a selection.
+            (Action::CancelDirect, Editor) if self.tab().run.in_flight().is_none() && self.ui.editor.selection().is_some() => {
+                self.copy_selection(false, fx);
                 None
             }
             (Action::CancelDirect, Editor | Results) => {
@@ -714,6 +752,9 @@ impl App {
         if matches!(self.ui.overlay, Some(Overlay::CellViewer(_))) {
             return self.on_viewer_key(combo, fx);
         }
+        if self.on_chooser_or_help_key(&combo, fx) {
+            return;
+        }
         let Some(overlay) = &self.ui.overlay else { return };
         let action = overlay.buttons().iter().find(|b| KeyCombo::parse(b.key) == Some(combo)).map(|b| b.action);
         if let Some(action) = action {
@@ -727,11 +768,67 @@ impl App {
         }
     }
 
+    /// The keys of the chooser and the help that are not buttons: moving.
+    /// Returns whether it took the key.
+    fn on_chooser_or_help_key(&mut self, combo: &KeyCombo, fx: &mut Effects) -> bool {
+        let name = combo.to_string();
+        let key = |names: &[&str]| names.contains(&name.as_str());
+        match &mut self.ui.overlay {
+            Some(Overlay::Chooser(c)) => {
+                let last = c.items.len().saturating_sub(1);
+                if key(&["down", "j", "ctrl+n"]) {
+                    c.selected = (c.selected + 1).min(last);
+                } else if key(&["up", "k", "ctrl+p"]) {
+                    c.selected = c.selected.saturating_sub(1);
+                } else {
+                    return false;
+                }
+                fx.repaint = true;
+                true
+            }
+            Some(Overlay::Help(h)) => {
+                if key(&["down", "j"]) {
+                    h.scroll += 1;
+                } else if key(&["up", "k"]) {
+                    h.scroll = h.scroll.saturating_sub(1);
+                } else if key(&["pagedown", "space"]) {
+                    h.scroll += 10;
+                } else if key(&["pageup"]) {
+                    h.scroll = h.scroll.saturating_sub(10);
+                } else if key(&["g", "home"]) {
+                    h.scroll = 0;
+                } else if key(&["G", "end"]) {
+                    h.scroll = usize::MAX / 2;
+                } else {
+                    return false;
+                }
+                fx.repaint = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn on_overlay_mouse(&mut self, mouse: MouseEvent, fx: &mut Effects) {
         // A drag that began before the overlay opened ends here.
         // A divider drag that ends here is saved all the same.
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
             self.on_release(fx);
+        }
+        if let Some(Overlay::Help(h)) = &mut self.ui.overlay {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    h.scroll += WHEEL_ROWS as usize;
+                    fx.repaint = true;
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    h.scroll = h.scroll.saturating_sub(WHEEL_ROWS as usize);
+                    fx.repaint = true;
+                    return;
+                }
+                _ => {}
+            }
         }
         match mouse.kind {
             MouseEventKind::ScrollDown => return self.scroll_viewer(WHEEL_ROWS, fx),
@@ -791,6 +888,14 @@ impl App {
             OverlayAction::ViewerPageUp => self.scroll_viewer_by(Scroll::Page(-1), fx),
             OverlayAction::ViewerTop => self.scroll_viewer_by(Scroll::Top, fx),
             OverlayAction::ViewerBottom => self.scroll_viewer_by(Scroll::Bottom, fx),
+            OverlayAction::ChooserRun => {
+                let now = self.ui.now.unwrap_or_else(Instant::now);
+                self.chooser_run(None, now, fx)
+            }
+            OverlayAction::ChooserPick(i) => {
+                let now = self.ui.now.unwrap_or_else(Instant::now);
+                self.chooser_run(Some(i), now, fx)
+            }
             OverlayAction::Dismiss => {
                 self.ui.overlay = None;
                 fx.repaint = true;

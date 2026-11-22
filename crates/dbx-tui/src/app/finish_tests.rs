@@ -65,7 +65,7 @@ async fn the_keys_complete_the_statement_in_one_undo_step() {
         h.press(keys);
         assert_eq!(text(&h), "select count(*);", "{keys}");
         assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 16 }, "{keys}");
-        h.press("ctrl+u");
+        h.press("ctrl+z");
         assert_eq!(text(&h), "select count(*", "{keys}: one undo");
     }
 }
