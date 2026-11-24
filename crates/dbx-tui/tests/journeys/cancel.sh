@@ -171,7 +171,7 @@ key Enter
 wait_for 30-proxied-databases 'proxied pg' 4
 goto 'pagila'
 key u
-wait_for 31-proxied-target 'editor · proxied pg / pagila'
+wait_for 31-proxied-target '1 proxied pg / pagila'
 key C-g l
 semicolon
 key Enter

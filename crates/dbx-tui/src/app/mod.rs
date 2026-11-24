@@ -69,6 +69,8 @@ mod syntax_tests;
 #[cfg(test)]
 mod tabs_tests;
 #[cfg(test)]
+mod tab_bar_tests;
+#[cfg(test)]
 mod capabilities_tests;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -227,6 +229,8 @@ pub struct Ui {
     /// The mode bar's hints as last drawn, each with what a click on it does.
     /// Filled by `view`.
     pub mode_hints: Vec<HintHit>,
+    /// The tab bar's tabs as last drawn. Filled by `view`.
+    pub tab_hits: Vec<layout::TabHit>,
     /// The open overlay's buttons as last drawn. Filled by `view`.
     pub overlay_buttons: Vec<OverlayButton>,
     /// The open form's rows as last drawn, for clicks. Filled by `view`.
@@ -406,6 +410,7 @@ impl App {
                 overlay: None,
                 hits: HitMap::default(),
                 mode_hints: Vec::new(),
+                tab_hits: Vec::new(),
                 overlay_buttons: Vec::new(),
                 overlay_fields: Vec::new(),
                 next_form_serial: 1,
@@ -597,6 +602,26 @@ impl App {
                 self.open_help(fx);
                 None
             }
+            (Action::NewTab, _) => {
+                self.new_tab(fx);
+                None
+            }
+            (Action::CloseTab | Action::CloseTabDirect, _) => {
+                self.request_close_tab(self.ui.tab.id, fx);
+                None
+            }
+            (Action::NextTab | Action::NextTabDirect, _) => {
+                self.cycle_tab(1, fx);
+                None
+            }
+            (Action::PrevTab | Action::PrevTabDirect, _) => {
+                self.cycle_tab(-1, fx);
+                None
+            }
+            (Action::GoToTab(n), _) => {
+                self.go_to_tab(n, fx);
+                None
+            }
             (a, _) if a.scope() == keys::Scope::Editor => {
                 self.perform_edit(a, now, fx);
                 None
@@ -697,6 +722,18 @@ impl App {
         if let Some(hit) = self.ui.mode_hints.iter().find(|h| h.rect.contains(at)).copied() {
             self.ui.clicks.forget();
             return self.click_hint(hit.action, now, fx);
+        }
+        // A tab in the bar: its label makes it active, the `×` closes it.
+        if let Some(hit) = self.ui.tab_hits.iter().find(|h| h.rect.contains(at)).copied() {
+            self.ui.clicks.forget();
+            self.close_completion(fx);
+            if hit.close {
+                return self.request_close_tab(hit.tab, fx);
+            }
+            self.switch_to(hit.tab, fx);
+            self.ui.focus = PaneId::Editor;
+            fx.repaint = true;
+            return;
         }
         // The completion popup is drawn over the panes: a press on it is its
         // own, and a press anywhere else closes it and goes on.
@@ -922,6 +959,7 @@ impl App {
             OverlayAction::RemoveYes => self.confirm_remove(fx),
             OverlayAction::DropSessionYes => self.drop_session(fx),
             OverlayAction::RerunYes => self.confirm_rerun(fx),
+            OverlayAction::CloseTabYes => self.confirm_close_tab(fx),
             OverlayAction::ViewerCopy => self.copy_viewer(fx),
             OverlayAction::ViewerToggleRaw => self.toggle_viewer_raw(fx),
             OverlayAction::ViewerLineDown => self.scroll_viewer_by(Scroll::Line(1), fx),
@@ -952,7 +990,12 @@ impl App {
             Settled::Current(target) => target,
             Settled::Stale(Target::Run(tab)) => {
                 if let CoreReply::Ran(result) = reply {
+                    let glyph = self.model.tab(tab).map(query::glyph);
                     self.on_ran_after_cancel(tab, id, result, fx);
+                    // A tab in the bar whose glyph changed is redrawn.
+                    if glyph.is_some() && self.model.tab(tab).map(query::glyph) != glyph {
+                        fx.repaint = true;
+                    }
                 }
                 return;
             }
@@ -964,9 +1007,11 @@ impl App {
             (Target::SaveConnection(serial), CoreReply::Saved(result)) => self.on_saved(serial, result, fx),
             (Target::RemoveConnection(id), CoreReply::Removed(result)) => self.on_removed(id, result, fx),
             (Target::Run(tab), CoreReply::Ran(result)) => {
+                let glyph = self.model.tab(tab).map(query::glyph);
                 self.on_ran_in(tab, result, fx);
-                // A tab that is not on screen changed out of sight.
-                if !self.is_active(tab) {
+                // A tab that is not on screen changed out of sight, but for
+                // its glyph in the bar.
+                if !self.is_active(tab) && self.model.tab(tab).map(query::glyph) == glyph {
                     return;
                 }
             }

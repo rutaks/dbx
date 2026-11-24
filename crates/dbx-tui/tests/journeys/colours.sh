@@ -71,7 +71,7 @@ while [ "$n" -lt 40 ]; do
   key j; sleep 0.12; n=$((n + 1))
 done
 key u
-wait_for 02-used 'editor · local pg / pagila'
+wait_for 02-used '1 local pg / pagila'
 key C-g l
 wait_for 03-focused 'EDITOR'
 

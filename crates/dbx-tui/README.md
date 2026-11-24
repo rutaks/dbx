@@ -101,8 +101,8 @@ gives it the database the connection was saved with.
 
 ## Running a statement (editor and results)
 
-The query tab owns its target (`editor · <connection> / <database>` in the
-editor's title) and a database session: dbx's `client_session_id` is the tab
+The query tab owns its target (`<n> <connection> / <database>` in the tab
+bar, the editor's title) and a database session: dbx's `client_session_id` is the tab
 and a serial (`dbx-tui-tab-1-2`), so `SET`, temporary tables and transactions
 last from run to run. The tab starts a new session, with the next serial,
 whenever it is given another database or connection, so a late close of the
@@ -169,6 +169,40 @@ the statement ends. Giving the tab another target, or removing its connection,
 while a run is in flight leaves the same marker. Quitting while a statement may
 still be running prints, once the terminal is restored,
 `dbx-tui: A statement may still be running on <connection / database>.`
+
+## Query tabs (slice 15b)
+
+Each query tab has its own target, session, editor, run and result. The tab
+bar sits on the editor's top edge: each tab's number, its target
+(`local pg / pagila`, or `no target`) and a state glyph, yellow `●` while
+its statement runs or is being cancelled, red `●` after a failure or a
+timeout, none when idle or done. The active tab is `accent` (bold while the
+editor has focus) and carries a `×`; the others are `overlay0`. When the tabs
+do not fit, the active one stays and `…` marks the ones left out; the bar is
+always one row. A target longer than 24 cells ends in `…`.
+
+| Key | Does |
+|---|---|
+| `ctrl+g t` | new tab: on the active tab's target, in a session of its own (`dbx-tui-tab-<id>-1`), with an empty editor; it becomes active and the editor takes focus |
+| `ctrl+g T`, `ctrl+f4`, `cmd+w` | close the active tab: at once when it is empty and idle; with text, a confirmation names the tab and says its text will be lost; with a statement running, it says the statement will be cancelled. The run is cancelled and its session closed once it ends (or after 2 s), as on a retarget; a statement that may still be running is named at quit. The tab to its left becomes active (to its right, for the first). Closing the last tab leaves one new, empty tab on the same target |
+| `ctrl+g ]`, `cmd+shift+]`, `ctrl+tab` | next tab, wrapping |
+| `ctrl+g [`, `cmd+shift+[`, `ctrl+shift+tab` | previous tab, wrapping |
+| `ctrl+g 1` ... `ctrl+g 9` | go to that tab, if there is one |
+| click a tab | make it active (and focus the editor) |
+| click the `×` | close the active tab, with the same confirmations |
+| `u` in the sidebar | give the active tab a target |
+
+The `cmd` keys, `ctrl+tab` and `ctrl+shift+tab` need the kitty keyboard
+protocol, and kitty keeps all of them (and `cmd+w`) for its own tabs unless
+`kitty.conf` releases them (`map cmd+w`, `map ctrl+tab` with no action); not
+yet tried by hand. `ctrl+f4` and the prefix keys work everywhere.
+`alt+left`/`alt+right` are word movement in the editor, not tab keys.
+
+A tab not on screen keeps running. The mode bar shows the active tab's run
+state, and only its elapsed time wakes the client; a background tab's reply
+lands in that tab, without a notice (a failure is said when the tab is shown
+again), and repaints only because its glyph in the bar changed. A closed
+tab's late reply changes nothing and repaints nothing.
 
 ## Editor keys (slice 13)
 
@@ -595,7 +629,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `cancel`, `complete`, `first-query`, `mouse`, `quit-mid-run` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `cancel`, `complete`, `first-query`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live

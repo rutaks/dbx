@@ -182,15 +182,17 @@ async fn a_slow_and_a_fast_run_in_two_tabs_each_land_in_their_own_tab_whichever_
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_reply_for_the_tab_that_is_not_active_updates_it_without_a_repaint() {
+async fn a_reply_for_the_tab_that_is_not_active_updates_only_it_and_repaints_for_its_glyph_in_the_bar() {
     // Tab 2's clock is shown: let it reach its next second first, so only
     // tab 1's reply arrives in the step that is counted.
-    let (mut h, one, _two) = two_runs(1_500, 60_000).await;
+    let (mut h, one, two) = two_runs(1_500, 60_000).await;
     advance(&mut h, 1_000).await;
-    let repaints = h.repaints;
+    let (repaints, tab_two) = (h.repaints, model_tab(&h, two).clone());
     advance(&mut h, 500).await;
-    assert_eq!(h.repaints, repaints, "tab 1's rows landed while tab 2 was shown");
     assert!(rows_shown(&h, one).is_some());
+    // Slice 15b: the bar shows tab 1's run glyph, which the reply changed.
+    assert_eq!(h.repaints, repaints + 1, "tab 1's glyph changed in the bar");
+    assert_eq!((model_tab(&h, two).run.clone(), model_tab(&h, two).outcome.clone()), (tab_two.run, tab_two.outcome), "tab 2 untouched");
 }
 
 #[tokio::test(start_paused = true)]

@@ -117,7 +117,7 @@ click "$((c + 3))" "$r"
 capture 23-table-selected
 expect table-selected 'u use'
 key u
-wait_for 24-used 'editor · local pg / pagila'
+wait_for 24-used '1 local pg / pagila'
 
 # ---- the editor ----
 # A click puts the caret in the editor and focuses it.

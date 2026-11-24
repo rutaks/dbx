@@ -52,7 +52,7 @@ key Enter
 wait_for 02-databases '▸ pagila'
 goto 'pagila'
 key u
-wait_for 03-used 'editor · local pg / pagila'
+wait_for 03-used '1 local pg / pagila'
 
 # Focus the editor, type, run with F5: three rows.
 key C-g l

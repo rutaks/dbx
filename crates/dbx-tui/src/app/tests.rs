@@ -13,7 +13,8 @@ const SIDEBAR: &str = "connections";
 
 fn titles_visible(rows: &[String]) -> bool {
     let all = rows.join("\n");
-    all.contains(SIDEBAR) && all.contains("editor") && all.contains("results")
+    // The editor's title is its tab bar: tab 1, with no target yet.
+    all.contains(SIDEBAR) && all.contains("1 no target") && all.contains("results")
 }
 
 #[test]
@@ -71,15 +72,18 @@ fn a_failed_connection_list_is_shown_in_the_sidebar() {
 fn prefix_then_l_moves_focus_from_sidebar_to_editor() {
     let mut app = ready_app();
     assert_eq!(app.ui.focus, PaneId::Sidebar);
-    let (x, y) = find_text(&mut app, 100, 30, "editor").unwrap();
-    assert_eq!(role_at(&mut app, x, y).fg, Some(Role::Overlay0));
+    let (x, y) = find_text(&mut app, 100, 30, "1 no target").unwrap();
+    // The active tab is accent; bold only while the editor has focus.
+    assert_eq!(role_at(&mut app, x, y).fg, Some(Role::Accent));
+    assert!(!style_at(&mut app, x, y).2.contains(ratatui::style::Modifier::BOLD));
 
     let fx = press(&mut app, "ctrl+g l");
     assert!(fx.repaint);
     assert_eq!(app.ui.focus, PaneId::Editor);
     assert_eq!(app.ui.mode, Mode::Normal);
-    // The focused pane is marked by its title role, since panes have no border.
+    // The focused pane is marked by its title, since panes have no border.
     assert_eq!(role_at(&mut app, x, y).fg, Some(Role::Accent));
+    assert!(style_at(&mut app, x, y).2.contains(ratatui::style::Modifier::BOLD));
     let rows = frame_rows(&mut app, 100, 30);
     assert!(rows[29].contains("EDITOR") && !rows[29].contains("SIDEBAR"), "{:?}", rows[29]);
 }
@@ -188,7 +192,7 @@ fn an_event_that_changes_nothing_does_not_repaint() {
 #[test]
 fn the_focused_title_is_accent_the_others_overlay0_and_a_theme_changes_only_colours() {
     let positions = |app: &mut App| {
-        ["connections", "editor", "results"].map(|t| find_text(app, 100, 30, t).expect(t))
+        ["connections", "1 no target", "results"].map(|t| find_text(app, 100, 30, t).expect(t))
     };
     for (focus_keys, focused) in [("", 0), ("ctrl+g l", 1), ("ctrl+g l ctrl+g j", 2)] {
         let mut app = ready_app();
@@ -196,8 +200,12 @@ fn the_focused_title_is_accent_the_others_overlay0_and_a_theme_changes_only_colo
         let at = positions(&mut app);
         let roles: Vec<_> = at.iter().map(|&(x, y)| role_at(&mut app, x, y).fg).collect();
         for (i, role) in roles.iter().enumerate() {
-            let want = if i == focused { Role::Accent } else { Role::Overlay0 };
+            // The editor's title is its tab bar, whose active tab is always
+            // accent: focus makes it bold.
+            let want = if i == focused || i == 1 { Role::Accent } else { Role::Overlay0 };
             assert_eq!(*role, Some(want), "title {i}, focus {focused}");
+            let bold = style_at(&mut app, at[i].0, at[i].1).2.contains(ratatui::style::Modifier::BOLD);
+            assert_eq!(bold, i == focused || i != 1, "title {i}, focus {focused}");
         }
 
         // Switch theme: the colours drawn change, the role assignment does not.

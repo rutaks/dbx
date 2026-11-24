@@ -172,6 +172,22 @@ pub enum Outcome {
     TimedOut { error: CoreError, elapsed: Duration },
 }
 
+/// The state glyph a tab shows in the bar: yellow while its run is in
+/// flight (running or being cancelled), red after a failure or a timeout,
+/// none when idle or done.
+pub fn glyph(tab: &QueryTab) -> Option<super::theme::Role> {
+    use super::theme::Role;
+    if tab.run.in_flight().is_some() {
+        return Some(Role::Yellow);
+    }
+    match (&tab.run, &tab.outcome) {
+        (RunState::Cancelled { how: CancelEnd::Failed(_), .. }, _) => Some(Role::Red),
+        (RunState::Cancelled { .. }, _) => None,
+        (_, Some(Outcome::Failed { .. } | Outcome::TimedOut { .. })) => Some(Role::Red),
+        _ => None,
+    }
+}
+
 /// A short message in a corner that expires on its own and takes no input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
@@ -690,7 +706,7 @@ impl App {
     }
 
     /// `name / database` for tab `id`.
-    fn target_label_of(&self, id: TabId) -> Option<String> {
+    pub(super) fn target_label_of(&self, id: TabId) -> Option<String> {
         let at = self.model.tab(id)?.target.as_ref()?;
         let name = match &self.model.connections {
             Loadable::Ready(list) => list.iter().find(|c| c.id == at.connection).map(|c| c.name.clone()),

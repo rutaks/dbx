@@ -55,7 +55,7 @@ start_shell
 tm send-keys -t "$SESSION" "$CLIENT; echo EXIT=\$?" Enter
 wait_for 00-listed 'local pg'
 key u
-wait_for 01-used 'editor · local pg / edge'
+wait_for 01-used '1 local pg / edge'
 
 # ---- 1. the 120-column table ----------------------------------------------------
 key C-g l

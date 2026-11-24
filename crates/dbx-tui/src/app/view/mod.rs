@@ -7,6 +7,7 @@ mod overlays;
 mod panel;
 mod popup;
 mod results;
+mod tab_bar;
 mod viewer;
 
 pub(crate) use results::cell_text;
@@ -62,7 +63,12 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     let drawn = match &mut app.ui.overlay {
         Some(overlay) => {
             panel::dim(buf, buf.area);
-            draw_overlay(overlay, &app.ui.keys, app.ui.caps, app.ui.notice.as_ref(), &p, buf)
+            // The close-tab question says what is true now, not when it opened.
+            let running = match overlay {
+                Overlay::ConfirmCloseTab(ask) => app.model.tab(ask.tab).is_some_and(|t| t.run.in_flight().is_some()),
+                _ => false,
+            };
+            draw_overlay(overlay, running, &app.ui.keys, app.ui.caps, app.ui.notice.as_ref(), &p, buf)
         }
         None => Drawn::default(),
     };
@@ -77,7 +83,7 @@ pub(super) struct Drawn {
     pub fields: Vec<FieldHit>,
 }
 
-fn draw_overlay(overlay: &mut Overlay, keys: &super::keys::Keybinds, caps: super::Capabilities, notice: Option<&super::query::Notice>, p: &Painter, buf: &mut Buffer) -> Drawn {
+fn draw_overlay(overlay: &mut Overlay, closing_tab_running: bool, keys: &super::keys::Keybinds, caps: super::Capabilities, notice: Option<&super::query::Notice>, p: &Painter, buf: &mut Buffer) -> Drawn {
     let buttons = overlay.buttons();
     match overlay {
         Overlay::Error(e) => {
@@ -116,6 +122,19 @@ fn draw_overlay(overlay: &mut Overlay, keys: &super::keys::Keybinds, caps: super
                 ask.statement
             );
             let buttons = message_box(p, buf, "Run the statement again?", &message, buttons, Role::Red, Role::Red);
+            Drawn { buttons, fields: Vec::new() }
+        }
+        Overlay::ConfirmCloseTab(ask) => {
+            let mut message = format!("Close {}?", ask.name);
+            if closing_tab_running {
+                message.push_str(" The statement running in it will be cancelled, and its session closed.");
+            } else if ask.running {
+                message.push_str(" The statement that was running in it has ended.");
+            }
+            if ask.text {
+                message.push_str(" Its text will be lost.");
+            }
+            let buttons = message_box(p, buf, "Close tab", &message, buttons, Role::Red, Role::Red);
             Drawn { buttons, fields: Vec::new() }
         }
         Overlay::Form(form) => form::draw(form, buttons, p, buf),
@@ -475,16 +494,16 @@ pub const NULLABLE_MARK: &str = "?";
 
 fn draw_editor(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     let r = hits.editor;
+    // No tab is clickable where the bar is not drawn (another pane zoomed).
+    app.ui.tab_hits.clear();
     if r.is_empty() {
         return;
     }
     let focused = app.ui.focus == PaneId::Editor;
-    // The title names where a statement runs: the tab's own target.
-    let title = match app.target_label() {
-        Some(label) => format!("editor · {label}"),
-        None => "editor".to_string(),
-    };
-    p.within(r).title(buf, r.x + 1, r.y, &title, focused);
+    // The tab bar is the editor's title: each tab names where its statements
+    // run, the active one first among them.
+    let bar = Rect::new(r.x + 1, r.y, r.width.saturating_sub(2), 1).intersection(p.bounds);
+    app.ui.tab_hits = tab_bar::draw(app, p, buf, bar, focused);
     let area = Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(1), r.height.saturating_sub(1)).intersection(p.bounds);
     if area.is_empty() {
         return;
@@ -707,6 +726,12 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
             if app.tab().run.in_flight().is_none() {
                 h.retain(|hint| hint.keys.iter().all(|(_, a)| *a != Action::Cancel));
             }
+            // Going to a numbered tab is in the help, not the bar; moving
+            // along the bar only with another tab to move to.
+            let one_tab = app.model.tabs.len() < 2;
+            h.retain(|hint| {
+                hint.keys.iter().all(|(_, a)| !matches!(a, Action::GoToTab(_)) && !(one_tab && matches!(a, Action::NextTab | Action::PrevTab)))
+            });
             // First, so it is the one a narrow bar keeps: backing out always works.
             h.insert(0, Hint { keys: vec![("esc".to_string(), Action::OpenPrefix)], desc: "back" });
             h

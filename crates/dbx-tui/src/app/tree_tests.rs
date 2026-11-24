@@ -1133,8 +1133,9 @@ fn no_connections_means_no_active_context_and_the_tree_keys_do_nothing() {
         let fx = press(&mut app, keys);
         assert!(fx.commands.is_empty(), "{keys}");
     }
-    let title = frame_rows(&mut app, 114, 30).iter().find(|r| r.contains("editor")).cloned().unwrap();
-    assert!(title.contains("editor") && !title.contains('·'), "{title:?}");
+    let rows = frame_rows(&mut app, 114, 30);
+    let title = rows[app.ui.hits.editor.y as usize].clone();
+    assert!(title.contains("1 no target") && !title.contains(" / "), "{title:?}");
 }
 
 #[test]

@@ -81,14 +81,99 @@ impl App {
         }
     }
 
-    /// Opens another query tab, with no target and an empty editor, and
-    /// leaves the active one active. (No key yet: slice 15b adds the tab bar.)
+    /// Opens another query tab, on the active tab's target, in a session of
+    /// its own (serial 1), with an empty editor, and leaves the active one
+    /// active.
     pub fn open_tab(&mut self) -> TabId {
         let id = TabId(self.model.next_tab);
         self.model.next_tab += 1;
-        self.model.tabs.push(QueryTab::new(id));
+        let mut tab = QueryTab::new(id);
+        tab.target = self.model.tab(self.ui.tab.id).and_then(|t| t.target.clone());
+        self.model.tabs.push(tab);
         self.ui.parked.push(TabUi::new(id));
         id
+    }
+
+    /// A new tab, made active, with the editor focused to type in.
+    pub(super) fn new_tab(&mut self, fx: &mut Effects) {
+        let id = self.open_tab();
+        let switched = self.activate_tab(id);
+        fx.commands.extend(switched.commands);
+        self.ui.focus = super::PaneId::Editor;
+        fx.repaint = true;
+    }
+
+    /// Where tab `id` is in the bar, counted from 0.
+    pub(super) fn tab_index(&self, id: TabId) -> Option<usize> {
+        self.model.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// Makes the tab `step` places along the bar active, wrapping.
+    pub(super) fn cycle_tab(&mut self, step: isize, fx: &mut Effects) {
+        let n = self.model.tabs.len() as isize;
+        let Some(at) = self.tab_index(self.ui.tab.id) else { return };
+        let to = self.model.tabs[(at as isize + step).rem_euclid(n) as usize].id;
+        self.switch_to(to, fx);
+    }
+
+    /// Makes the `n`th tab of the bar (from 1) active, if there is one.
+    pub(super) fn go_to_tab(&mut self, n: u8, fx: &mut Effects) {
+        if let Some(to) = self.model.tabs.get(usize::from(n).wrapping_sub(1)).map(|t| t.id) {
+            self.switch_to(to, fx);
+        }
+    }
+
+    /// `activate_tab`, merged into `fx`; the active tab again changes nothing.
+    pub(super) fn switch_to(&mut self, id: TabId, fx: &mut Effects) {
+        let switched = self.activate_tab(id);
+        fx.repaint |= switched.repaint;
+        fx.commands.extend(switched.commands);
+    }
+
+    /// How the bar and a question name tab `id`: `tab 2 (local pg / pagila)`.
+    pub(super) fn tab_name(&self, id: TabId) -> String {
+        let n = self.tab_index(id).map_or(0, |i| i + 1);
+        match self.target_label_of(id) {
+            Some(label) => format!("tab {n} ({label})"),
+            None => format!("tab {n}"),
+        }
+    }
+
+    /// Closes tab `id`: at once if it is empty and idle, otherwise after a
+    /// question naming it and saying what goes with it.
+    pub(super) fn request_close_tab(&mut self, id: TabId, fx: &mut Effects) {
+        let Some(tab) = self.model.tab(id) else { return };
+        let running = tab.run.in_flight().is_some();
+        let text = self.tab_ui_mut(id).is_some_and(|ui| !ui.editor.text().is_empty());
+        if running || text {
+            let name = self.tab_name(id);
+            self.close_completion(fx);
+            self.ui.overlay = Some(super::overlay::Overlay::ConfirmCloseTab(super::overlay::ConfirmCloseTab { tab: id, name, text, running }));
+            self.ui.mode = super::Mode::Normal;
+            fx.repaint = true;
+            return;
+        }
+        self.close_tab(id, fx);
+    }
+
+    /// The close-tab question was answered yes.
+    pub(super) fn confirm_close_tab(&mut self, fx: &mut Effects) {
+        let asked = match self.ui.overlay.take() {
+            Some(super::overlay::Overlay::ConfirmCloseTab(ask)) => ask.tab,
+            other => {
+                self.ui.overlay = other;
+                return;
+            }
+        };
+        fx.repaint = true;
+        self.close_tab(asked, fx);
+    }
+
+    /// `remove_tab`, merged into `fx`.
+    pub(super) fn close_tab(&mut self, id: TabId, fx: &mut Effects) {
+        let closed = self.remove_tab(id);
+        fx.repaint = true;
+        fx.commands.extend(closed.commands);
     }
 
     /// Makes tab `id` the active one. The tab left closes its completion
@@ -114,12 +199,12 @@ impl App {
         fx
     }
 
-    /// Removes tab `id` (no key yet: a test helper until slice 15b). Its run
-    /// is cancelled and then its session closed, as when it is given another
-    /// target (design section 17); every reply still on its way for it is
-    /// forgotten, so it changes nothing and repaints nothing. Removing the
-    /// active tab makes another active, opening an empty one if it was the
-    /// last.
+    /// Removes tab `id`, without asking. Its run is cancelled and then its
+    /// session closed, as when it is given another target (design section
+    /// 17); every reply still on its way for it is forgotten, so it changes
+    /// nothing and repaints nothing. Removing the active tab makes the one to
+    /// its left active (to its right, for the first), opening an empty one on
+    /// the same target if it was the last.
     pub fn remove_tab(&mut self, id: TabId) -> Effects {
         let mut fx = Effects::default();
         if self.model.tab(id).is_none() {
@@ -130,9 +215,11 @@ impl App {
             if matches!(self.ui.overlay, Some(super::overlay::Overlay::ConfirmDropSession(_) | super::overlay::Overlay::ConfirmRerun(_))) {
                 self.ui.overlay = None;
             }
-            let next = match self.model.tabs.iter().map(|t| t.id).find(|t| *t != id) {
-                Some(next) => next,
-                None => self.open_tab(),
+            let at = self.tab_index(id).unwrap_or(0);
+            let next = match (at.checked_sub(1), self.model.tabs.get(at + 1)) {
+                (Some(left), _) => self.model.tabs[left].id,
+                (None, Some(right)) => right.id,
+                (None, None) => self.open_tab(),
             };
             let switched = self.activate_tab(next);
             fx.repaint |= switched.repaint;

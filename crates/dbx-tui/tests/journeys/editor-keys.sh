@@ -37,7 +37,7 @@ key Enter
 wait_for 02-open 'pagila'
 goto 'pagila'
 key u
-wait_for 03-used 'editor · local pg / pagila'
+wait_for 03-used '1 local pg / pagila'
 key C-g l
 wait_for 04-editor 'EDITOR'
 

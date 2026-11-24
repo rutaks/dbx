@@ -15,6 +15,15 @@ pub struct HintHit {
     pub action: Action,
 }
 
+/// A tab in the editor's tab bar as drawn: its label (a click makes it
+/// active), or the `×` on the active one (a click closes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabHit {
+    pub rect: Rect,
+    pub tab: crate::core::TabId,
+    pub close: bool,
+}
+
 /// Every clickable or measurable rectangle of the last frame. A rectangle that
 /// is not on screen (a hidden pane when another is zoomed) is empty.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

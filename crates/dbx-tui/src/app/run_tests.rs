@@ -74,9 +74,10 @@ pub(super) fn runs(commands: &[Command]) -> Vec<(RequestId, RunId, crate::core::
         .collect()
 }
 
-/// The editor's title row as drawn.
+/// The editor's title row (its tab bar) as drawn.
 pub(super) fn title(h: &mut Harness) -> String {
-    frame_rows(&mut h.app, 114, 30).into_iter().find(|r| r.contains("editor")).unwrap_or_default()
+    let rows = frame_rows(&mut h.app, 114, 30);
+    rows[h.app.ui.hits.editor.y as usize].clone()
 }
 
 pub(super) fn mode_bar(h: &mut Harness) -> String {

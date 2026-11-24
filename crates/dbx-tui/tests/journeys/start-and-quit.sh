@@ -11,7 +11,7 @@ start_shell
 tm send-keys -t "$SESSION" "$CLIENT; echo EXIT=\$?" Enter
 wait_for 01-initial 'No connections yet'
 expect initial 'connections'
-expect initial 'editor'
+expect initial '1 no target'
 expect initial 'results'
 expect initial 'SIDEBAR'
 expect initial 'ctrl\+g prefix'

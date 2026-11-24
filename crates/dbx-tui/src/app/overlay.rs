@@ -26,6 +26,9 @@ pub enum Overlay {
     /// "Load more" on a statement that is read-only but not proven safe to
     /// repeat: re-run it?
     ConfirmRerun(ConfirmRerun),
+    /// Closing a tab that has text, or a statement running: "close tab 2?",
+    /// saying what goes with it.
+    ConfirmCloseTab(ConfirmCloseTab),
     /// One cell's whole value, wrapped and scrollable.
     CellViewer(Box<super::viewer::CellViewer>),
     /// "What to run?" when the caret is inside a subquery.
@@ -74,6 +77,18 @@ pub struct ConfirmRerun {
     pub tab: TabId,
     /// The statement's first non-blank line.
     pub statement: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmCloseTab {
+    /// The tab to close: a yes closes it, whichever tab is active then.
+    pub tab: TabId,
+    /// How the bar names it: `tab 2 (local pg / pagila)`.
+    pub name: String,
+    /// It has text, which goes with it.
+    pub text: bool,
+    /// A statement is running in it, which is cancelled.
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +142,8 @@ pub enum OverlayAction {
     RerunYes,
     /// The second-cancel question: close the session.
     DropSessionYes,
+    /// The close-tab question: close it.
+    CloseTabYes,
     /// The statement chooser: run the highlighted entry, or one that was clicked.
     ChooserRun,
     ChooserPick(usize),
@@ -187,6 +204,8 @@ const REMOVE_BUTTONS: &[ButtonSpec] =
     &[button("↵", "enter", "remove", OverlayAction::RemoveYes), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
 const RERUN_BUTTONS: &[ButtonSpec] =
     &[button("↵", "enter", "re-run", OverlayAction::RerunYes), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
+const CLOSE_TAB_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "close tab", OverlayAction::CloseTabYes), button("esc", "esc", "keep it", OverlayAction::Dismiss)];
 const STOPPED_BUTTONS: &[ButtonSpec] =
     &[button("↵", "enter", "close", OverlayAction::Dismiss), button("esc", "esc", "close", OverlayAction::Dismiss)];
 const DROP_SESSION_BUTTONS: &[ButtonSpec] = &[
@@ -213,6 +232,7 @@ impl Overlay {
             Overlay::ConfirmRemove(_) => REMOVE_BUTTONS,
             Overlay::Failure(_) => FAILURE_BUTTONS,
             Overlay::ConfirmRerun(_) => RERUN_BUTTONS,
+            Overlay::ConfirmCloseTab(_) => CLOSE_TAB_BUTTONS,
             Overlay::ConfirmDropSession(ask) if ask.stopped => STOPPED_BUTTONS,
             Overlay::ConfirmDropSession(_) => DROP_SESSION_BUTTONS,
             // Drawn with the live keys, not from this table.

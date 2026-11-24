@@ -144,7 +144,7 @@ impl KeyCombo {
         let ctrl = m.contains(KeyModifiers::CONTROL);
         match self.code {
             KeyCode::Enter => ctrl || m.contains(KeyModifiers::SHIFT),
-            KeyCode::Backspace | KeyCode::Tab | KeyCode::Esc => ctrl,
+            KeyCode::Backspace | KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => ctrl,
             KeyCode::Char(' ') => false,
             KeyCode::Char(c) => ctrl && (c.is_ascii_uppercase() || !c.is_ascii_alphabetic() || matches!(c, 'm' | 'i' | 'h' | 'j')),
             _ => false,
@@ -325,6 +325,19 @@ pub enum Action {
     TextStartSelect,
     TextEndSelect,
     MatchingBrace,
+    // The query tabs (slice 15b): after the prefix, and the same from direct
+    // keys (IntelliJ's, where a terminal delivers them).
+    /// Open a tab on the active tab's target, and make it active.
+    NewTab,
+    /// Close the active tab, asking first if it has text or a run.
+    CloseTab,
+    NextTab,
+    PrevTab,
+    /// Make tab `n` (counted from 1, as the bar numbers them) active.
+    GoToTab(u8),
+    CloseTabDirect,
+    NextTabDirect,
+    PrevTabDirect,
 }
 
 impl Action {
@@ -422,6 +435,11 @@ impl Action {
             Action::TextStartSelect => "select to text start",
             Action::TextEndSelect => "select to text end",
             Action::MatchingBrace => "matching brace",
+            Action::NewTab => "new tab",
+            Action::CloseTab | Action::CloseTabDirect => "close tab",
+            Action::NextTab | Action::NextTabDirect => "next tab",
+            Action::PrevTab | Action::PrevTabDirect => "previous tab",
+            Action::GoToTab(_) => "go to tab",
         }
     }
 
@@ -439,6 +457,11 @@ impl Action {
             | Action::ResizeMode
             | Action::FinishStatement
             | Action::Help
+            | Action::NewTab
+            | Action::CloseTab
+            | Action::NextTab
+            | Action::PrevTab
+            | Action::GoToTab(_)
             | Action::OpenPrefix => Scope::Prefix,
             Action::ResizeLeft | Action::ResizeRight | Action::ResizeUp | Action::ResizeDown | Action::ResizeDone => Scope::Resize,
             Action::RunDirect
@@ -447,7 +470,10 @@ impl Action {
             | Action::ExpandStar
             | Action::NextUnresolved
             | Action::PrevUnresolved
-            | Action::FinishStatementDirect => Scope::Direct,
+            | Action::FinishStatementDirect
+            | Action::CloseTabDirect
+            | Action::NextTabDirect
+            | Action::PrevTabDirect => Scope::Direct,
             Action::TemplateNext | Action::TemplatePrev | Action::TemplateDone => Scope::Template,
             Action::CompleteInsert
             | Action::CompleteReplace
@@ -557,6 +583,19 @@ impl Default for Keybinds {
                 (plain('R'), Action::ResizeMode),
                 (plain(';'), Action::FinishStatement),
                 (plain('?'), Action::Help),
+                (plain('t'), Action::NewTab),
+                (plain('T'), Action::CloseTab),
+                (plain(']'), Action::NextTab),
+                (plain('['), Action::PrevTab),
+                (plain('1'), Action::GoToTab(1)),
+                (plain('2'), Action::GoToTab(2)),
+                (plain('3'), Action::GoToTab(3)),
+                (plain('4'), Action::GoToTab(4)),
+                (plain('5'), Action::GoToTab(5)),
+                (plain('6'), Action::GoToTab(6)),
+                (plain('7'), Action::GoToTab(7)),
+                (plain('8'), Action::GoToTab(8)),
+                (plain('9'), Action::GoToTab(9)),
             ],
             direct: vec![
                 // `f5` first: it reaches the program in every terminal, so it is
@@ -578,6 +617,16 @@ impl Default for Keybinds {
                 // Terminals differ in which of the two they can send.
                 (key("cmd+shift+enter"), Action::FinishStatementDirect),
                 (key("ctrl+shift+enter"), Action::FinishStatementDirect),
+                // IntelliJ's tab keys. kitty keeps `cmd+w`, `cmd+shift+]`,
+                // `cmd+shift+[`, `ctrl+tab` and `ctrl+shift+tab` for its own
+                // tabs unless its config releases them; the prefix keys
+                // always work. Not `alt+left`/`alt+right`: word movement.
+                (key("ctrl+f4"), Action::CloseTabDirect),
+                (key("cmd+w"), Action::CloseTabDirect),
+                (key("cmd+shift+]"), Action::NextTabDirect),
+                (key("ctrl+tab"), Action::NextTabDirect),
+                (key("cmd+shift+["), Action::PrevTabDirect),
+                (key("ctrl+shift+tab"), Action::PrevTabDirect),
             ],
             sidebar: vec![
                 (key("j"), Action::MoveDown),
@@ -853,10 +902,18 @@ impl Keybinds {
             row("quit", &[Action::Quit]),
             row("help", &[Action::Help]),
         ];
+        let tabs = vec![
+            row("new tab", &[Action::NewTab]),
+            row("close tab", &[Action::CloseTabDirect, Action::CloseTab]),
+            row("next tab", &[Action::NextTabDirect, Action::NextTab]),
+            row("previous tab", &[Action::PrevTabDirect, Action::PrevTab]),
+            row("go to tab 1-9", &(1..=9).map(Action::GoToTab).collect::<Vec<_>>()),
+        ];
         vec![
             HelpSection { title: "Run", rows: run },
             HelpSection { title: "Edit", rows: edit },
             HelpSection { title: "Panes", rows: panes },
+            HelpSection { title: "Tabs", rows: tabs },
         ]
     }
 
@@ -881,8 +938,13 @@ impl Keybinds {
             Scope::Template => &mut self.template,
             Scope::Editor => &mut self.editor,
         };
+        // In the place of its first key, so its hint keeps its place in the bar.
+        let first = table.iter().position(|(_, a)| *a == action);
+        // The keys taken away before that place shift it left.
+        let before = first.map_or(0, |at| table[..at].iter().filter(|(k, _)| *k == combo).count());
         table.retain(|(k, a)| *a != action && *k != combo);
-        table.push((combo, action));
+        let at = first.map_or(table.len(), |at| (at - before).min(table.len()));
+        table.insert(at, (combo, action));
         true
     }
 
@@ -1029,6 +1091,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rebinding_onto_a_key_that_sat_earlier_keeps_the_hint_in_its_place() {
+        let mut k = Keybinds::default();
+        let order = |k: &Keybinds| k.bindings.iter().map(|(_, a)| *a).collect::<Vec<_>>();
+        let mut want = order(&k);
+        want.retain(|a| *a != Action::Run);
+        assert!(k.rebind(Action::Quit, "r"));
+        assert_eq!(order(&k), want, "Run lost its key to Quit; nothing else moved");
+        assert_eq!(k.key_for(Action::Quit).as_deref(), Some("r"));
+    }
+
+    #[test]
     fn shift_on_a_letter_means_the_capital_and_not_the_lowercase_letter() {
         assert_eq!(KeyCombo::parse("shift+q"), KeyCombo::parse("Q"));
         assert_ne!(KeyCombo::parse("shift+q"), KeyCombo::parse("q"));
@@ -1046,6 +1119,69 @@ mod tests {
         for bad in ["ctrl+", "a+", "alt+ctrl+", "++", "+x", "ctrl+ab"] {
             assert_eq!(KeyCombo::parse(bad), None, "{bad:?}");
         }
+    }
+
+    /// Every set of tables read for the same key press (design section 4's
+    /// routing): the prefix key and the direct keys with each pane's own, the
+    /// direct keys with the completion popup's (with and without a template
+    /// highlighted) and with a template's, everything after the prefix, and
+    /// the resize mode. A key bound to two actions in one set fails.
+    #[test]
+    fn no_key_does_two_things_in_any_set_of_scopes_read_together() {
+        let k = Keybinds::default();
+        let prefix = vec![(k.prefix, Action::OpenPrefix)];
+        let popup = |template: bool| -> Vec<(KeyCombo, Action)> {
+            let mut out: Vec<(KeyCombo, Action)> = Vec::new();
+            for (key, _) in &k.complete {
+                if !out.iter().any(|(o, _)| o == key) {
+                    out.push((*key, k.lookup_complete(key, template).expect("bound")));
+                }
+            }
+            out
+        };
+        let with_direct = |own: &[(KeyCombo, Action)]| [prefix.as_slice(), &k.direct, own].concat();
+        let sets: Vec<(&str, Vec<(KeyCombo, Action)>)> = vec![
+            ("sidebar", with_direct(&k.sidebar)),
+            ("results", with_direct(&k.results)),
+            ("editor", with_direct(&k.editor)),
+            ("popup", with_direct(&popup(false))),
+            ("popup on a template", with_direct(&popup(true))),
+            ("template", with_direct(&k.template)),
+            ("after the prefix", [k.bindings.as_slice(), &k.editor_prefix].concat()),
+            ("resize", k.resize.clone()),
+        ];
+        for (name, set) in sets {
+            for (i, (key, action)) in set.iter().enumerate() {
+                for (other, also) in &set[i + 1..] {
+                    assert!(!(key == other && action != also), "{name}: {key} is bound to both {action:?} and {also:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tab_keys_are_bound_where_the_slice_says() {
+        let k = Keybinds::default();
+        let prefix = |s: &str| k.lookup(&KeyCombo::parse(s).unwrap());
+        assert_eq!(prefix("t"), Some(Action::NewTab));
+        assert_eq!(prefix("T"), Some(Action::CloseTab));
+        assert_eq!(prefix("]"), Some(Action::NextTab));
+        assert_eq!(prefix("["), Some(Action::PrevTab));
+        for n in 1..=9u8 {
+            assert_eq!(prefix(&n.to_string()), Some(Action::GoToTab(n)));
+        }
+        let direct = |s: &str| k.lookup_direct(&KeyCombo::parse(s).unwrap());
+        for close in ["ctrl+f4", "cmd+w"] {
+            assert_eq!(direct(close), Some(Action::CloseTabDirect), "{close}");
+        }
+        for next in ["cmd+shift+]", "ctrl+tab"] {
+            assert_eq!(direct(next), Some(Action::NextTabDirect), "{next}");
+        }
+        for prev in ["cmd+shift+[", "ctrl+shift+tab"] {
+            assert_eq!(direct(prev), Some(Action::PrevTabDirect), "{prev}");
+        }
+        assert!(KeyCombo::parse("ctrl+shift+tab").unwrap().needs_protocol() && KeyCombo::parse("ctrl+tab").unwrap().needs_protocol());
+        assert_eq!(direct("alt+left"), None, "word movement in the editor");
     }
 
     #[test]
