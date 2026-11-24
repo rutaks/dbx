@@ -48,17 +48,17 @@ fn load(h: &mut Harness, marked: &str) {
             }
         }
     }
-    h.app.ui.editor.set_text(&text);
+    h.app.ui.tab.editor.set_text(&text);
     match (anchor, caret) {
-        (Some(a), Some(c)) => h.app.ui.editor.select_range(a, c),
-        (_, Some(c)) => h.app.ui.editor.move_to(c),
-        _ => h.app.ui.editor.move_to(Cursor::default()),
+        (Some(a), Some(c)) => h.app.ui.tab.editor.select_range(a, c),
+        (_, Some(c)) => h.app.ui.tab.editor.move_to(c),
+        _ => h.app.ui.tab.editor.move_to(Cursor::default()),
     }
 }
 
 /// The editor's text with its caret and selection marked.
 fn dump(h: &Harness) -> String {
-    let e = &h.app.ui.editor;
+    let e = &h.app.ui.tab.editor;
     let mut lines: Vec<Vec<char>> = e.lines().iter().map(|l| l.chars().collect()).collect();
     let mut marks: Vec<(Cursor, char)> = match e.selection() {
         Some((a, b)) => vec![(a, '‹'), (b, '›')],
@@ -86,7 +86,7 @@ fn act(h: &mut Harness, before: &str, keys: &str, after: &str) {
 fn act_undo(h: &mut Harness, before: &str, keys: &str, after: &str) {
     act(h, before, keys, after);
     h.press("ctrl+z");
-    assert_eq!(h.app.ui.editor.text(), plain(before), "one ctrl+z undoes {keys:?} on {before:?}");
+    assert_eq!(h.app.ui.tab.editor.text(), plain(before), "one ctrl+z undoes {keys:?} on {before:?}");
 }
 
 /// The clipboard texts among `commands`.
@@ -115,7 +115,7 @@ async fn cmd_enter_ctrl_enter_f5_and_prefix_r_each_emit_one_run_command_and_alt_
         h.type_text("select 1");
         let sent = runs(&h.press_fx(keys));
         assert_eq!(sent.len(), 1, "{keys}");
-        assert_eq!(h.app.ui.editor.text(), "select 1", "{keys} typed nothing");
+        assert_eq!(h.app.ui.tab.editor.text(), "select 1", "{keys} typed nothing");
     }
     let mut h = editing().await;
     h.type_text("select 1");
@@ -149,15 +149,15 @@ async fn an_unbound_cmd_or_ctrl_key_types_nothing_and_ctrl_u_and_ctrl_r_are_no_l
         act(&mut h, "abc‸", keys, "abc‸");
     }
     h.type_text("d");
-    assert_eq!(h.app.ui.editor.text(), "abcd");
+    assert_eq!(h.app.ui.tab.editor.text(), "abcd");
     h.press("ctrl+u");
-    assert_eq!(h.app.ui.editor.text(), "abcd", "ctrl+u is not undo");
+    assert_eq!(h.app.ui.tab.editor.text(), "abcd", "ctrl+u is not undo");
     h.press("ctrl+z ctrl+r");
-    assert_eq!(h.app.ui.editor.text(), "abc", "ctrl+r is not redo");
+    assert_eq!(h.app.ui.tab.editor.text(), "abc", "ctrl+r is not redo");
     // A terminal that reports shift on a letter and a punctuation key.
     let fx = h.app.update(Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)), base());
     h.run(fx);
-    assert_eq!(h.app.ui.editor.text(), "abcd", "ctrl+shift+z as the protocol reports it redoes");
+    assert_eq!(h.app.ui.tab.editor.text(), "abcd", "ctrl+shift+z as the protocol reports it redoes");
 }
 
 #[tokio::test]
@@ -166,13 +166,13 @@ async fn a_key_release_is_ignored_and_a_repeat_acts_as_a_press() {
     load(&mut h, "select a\n‸from t");
     let fx = h.app.update(key_event(KeyCode::Char('d'), KeyModifiers::SUPER, KeyEventKind::Release), base());
     h.run(fx);
-    assert_eq!(h.app.ui.editor.lines().len(), 2, "a release does nothing");
+    assert_eq!(h.app.ui.tab.editor.lines().len(), 2, "a release does nothing");
     let fx = h.app.update(key_event(KeyCode::Char('d'), KeyModifiers::SUPER, KeyEventKind::Repeat), base());
     h.run(fx);
-    assert_eq!(h.app.ui.editor.lines().len(), 3, "a repeat is another press");
+    assert_eq!(h.app.ui.tab.editor.lines().len(), 3, "a repeat is another press");
     let fx = h.app.update(key_event(KeyCode::Char('d'), KeyModifiers::SUPER, KeyEventKind::Press), base());
     h.run(fx);
-    assert_eq!(h.app.ui.editor.lines().len(), 4);
+    assert_eq!(h.app.ui.tab.editor.lines().len(), 4);
 }
 
 // ---- one test per editing action, on each of its bindings ------------------------------
@@ -292,15 +292,15 @@ async fn undo_and_redo_on_every_binding() {
         let mut h = editing().await;
         h.type_text("ab");
         h.press(undo);
-        assert_eq!(h.app.ui.editor.text(), "a", "{undo}");
+        assert_eq!(h.app.ui.tab.editor.text(), "a", "{undo}");
         h.press(redo);
-        assert_eq!(h.app.ui.editor.text(), "ab", "{redo}");
+        assert_eq!(h.app.ui.tab.editor.text(), "ab", "{redo}");
         h.press(undo);
         h.press(undo);
-        assert_eq!(h.app.ui.editor.text(), "", "{undo} twice");
+        assert_eq!(h.app.ui.tab.editor.text(), "", "{undo} twice");
         h.press(redo);
         h.press(redo);
-        assert_eq!(h.app.ui.editor.text(), "ab", "{redo} twice");
+        assert_eq!(h.app.ui.tab.editor.text(), "ab", "{redo} twice");
     }
 }
 
@@ -310,14 +310,14 @@ async fn an_undo_is_one_step_for_a_compound_edit_and_a_new_edit_ends_the_redo() 
     load(&mut h, "select a\nfr‸om t");
     h.press("cmd+d");
     h.press("cmd+/");
-    assert_eq!(h.app.ui.editor.text(), "select a\nfrom t\n-- from t");
+    assert_eq!(h.app.ui.tab.editor.text(), "select a\nfrom t\n-- from t");
     h.press("cmd+z");
-    assert_eq!(h.app.ui.editor.text(), "select a\nfrom t\nfrom t");
+    assert_eq!(h.app.ui.tab.editor.text(), "select a\nfrom t\nfrom t");
     h.press("cmd+z");
-    assert_eq!(h.app.ui.editor.text(), "select a\nfrom t");
+    assert_eq!(h.app.ui.tab.editor.text(), "select a\nfrom t");
     h.type_text("x");
     h.press("cmd+shift+z");
-    assert_eq!(h.app.ui.editor.text(), "select a\nfrxom t", "typing ended the redo history");
+    assert_eq!(h.app.ui.tab.editor.text(), "select a\nfrxom t", "typing ended the redo history");
 }
 
 #[tokio::test]
@@ -340,14 +340,14 @@ async fn copy_cut_and_paste_through_the_system_clipboard() {
         assert_eq!(copied(&sent), ["from t"], "{keys}");
         assert_eq!(dump(&h), "select a\n‸\nwhere x = 1", "{keys}");
         h.press("ctrl+z");
-        assert_eq!(h.app.ui.editor.text(), T3, "one undo puts the cut text back");
+        assert_eq!(h.app.ui.tab.editor.text(), T3, "one undo puts the cut text back");
         load(&mut h, "select a\nfr‸om t\nwhere x = 1");
         let sent = h.press_fx(keys);
         assert_eq!(copied(&sent), ["from t\n"], "{keys}: no selection cuts the line");
         assert_eq!(dump(&h), "select a\nwh‸ere x = 1", "{keys}");
     }
     // Over the terminal clipboard's size nothing is sent, and it says so.
-    h.app.ui.editor.set_text(&"x".repeat(80_000));
+    h.app.ui.tab.editor.set_text(&"x".repeat(80_000));
     h.press("ctrl+a");
     assert!(copied(&h.press_fx("cmd+c")).is_empty());
     assert!(h.app.ui.notice.as_ref().is_some_and(|n| n.failure && n.text.contains("too large")), "{:?}", h.app.ui.notice);
@@ -369,9 +369,9 @@ async fn paste_arrives_as_the_terminals_paste_and_the_paste_keys_type_nothing() 
     load(&mut h, "select a\nfr‸om t");
     let fx = h.app.update(Event::Paste("1,\r\n2,\n3".into()), base());
     h.run(fx);
-    assert_eq!(h.app.ui.editor.text(), "select a\nfr1,\n2,\n3om t", "multi-line text keeps its line breaks");
+    assert_eq!(h.app.ui.tab.editor.text(), "select a\nfr1,\n2,\n3om t", "multi-line text keeps its line breaks");
     h.press("ctrl+z");
-    assert_eq!(h.app.ui.editor.text(), "select a\nfrom t", "a paste is one undo step");
+    assert_eq!(h.app.ui.tab.editor.text(), "select a\nfrom t", "a paste is one undo step");
     for keys in ["cmd+v", "ctrl+v"] {
         act(&mut h, "select a\nfr‸om t", keys, "select a\nfr‸om t");
         assert!(h.app.ui.notice.as_ref().is_some_and(|n| n.text.contains("paste")), "{keys} says what to do: {:?}", h.app.ui.notice);
@@ -383,17 +383,17 @@ async fn find_and_find_next_and_previous() {
     for open in ["cmd+f", "ctrl+f", "ctrl+g f"] {
         let mut h = editing().await;
         load(&mut h, T3);
-        h.app.ui.editor.move_to(Cursor::default());
+        h.app.ui.tab.editor.move_to(Cursor::default());
         h.press(open);
         assert!(screen(&mut h).contains("find"), "{open} opens the find bar");
         h.type_text("t");
         assert_eq!(dump(&h), "selec‹t› a\nfrom t\nwhere x = 1", "typing finds the first match after the caret");
-        assert_eq!(h.app.ui.editor.text(), T3, "typing went to the bar");
+        assert_eq!(h.app.ui.tab.editor.text(), T3, "typing went to the bar");
         for (next, previous) in [("enter", "shift+f3"), ("f3", "cmd+shift+g"), ("cmd+g", "shift+f3")] {
             load(&mut h, T3);
-            h.app.ui.editor.move_to(Cursor::default());
+            h.app.ui.tab.editor.move_to(Cursor::default());
             h.press("esc");
-            h.app.ui.last_find.clear();
+            h.app.ui.tab.last_find.clear();
             h.press(open);
             h.type_text("t");
             h.press(next);
@@ -408,10 +408,10 @@ async fn find_and_find_next_and_previous() {
         // esc closes the bar and keeps the text; the next esc is the editor's.
         h.press("esc");
         assert!(!screen(&mut h).contains("find"), "esc closes it");
-        assert_eq!(h.app.ui.editor.text(), T3);
+        assert_eq!(h.app.ui.tab.editor.text(), T3);
         // The bar is gone: typing is the editor's again.
         h.type_text("z");
-        assert!(h.app.ui.editor.text().contains('z'));
+        assert!(h.app.ui.tab.editor.text().contains('z'));
     }
 }
 
@@ -425,19 +425,19 @@ async fn find_is_plain_text_and_case_insensitive_unless_the_query_has_a_capital(
     h.press("enter");
     assert_eq!(dump(&h), "Select a\nfrom (t) ‹FROM› t");
     h.press("esc");
-    h.app.ui.last_find.clear();
+    h.app.ui.tab.last_find.clear();
     h.press("cmd+f");
     h.type_text("FROM");
     assert!(dump(&h).contains("‹FROM›") && !dump(&h).contains("‹from›"), "a capital makes it exact: {}", dump(&h));
     // Characters that mean something to a regular expression are only themselves.
     load(&mut h, "‸a(b)c a.c");
     h.press("esc");
-    h.app.ui.last_find.clear();
+    h.app.ui.tab.last_find.clear();
     h.press("cmd+f");
     h.type_text("a.c");
     assert_eq!(dump(&h), "a(b)c ‹a.c›");
     h.press("esc");
-    h.app.ui.last_find.clear();
+    h.app.ui.tab.last_find.clear();
     h.press("cmd+f");
     h.type_text("zzz");
     assert!(screen(&mut h).contains("no match"), "{}", screen(&mut h));
@@ -467,7 +467,7 @@ async fn go_to_line() {
     for keys in ["cmd+l", "ctrl+g g"] {
         let mut h = editing().await;
         load(&mut h, T3);
-        h.app.ui.editor.move_to(Cursor::default());
+        h.app.ui.tab.editor.move_to(Cursor::default());
         h.press(keys);
         assert!(screen(&mut h).contains("line"), "{keys} opens the prompt");
         h.type_text("3");
@@ -476,17 +476,17 @@ async fn go_to_line() {
         h.press(keys);
         h.type_text("99");
         h.press("enter");
-        assert_eq!(h.app.ui.editor.cursor().row, 2, "past the end goes to the last line");
+        assert_eq!(h.app.ui.tab.editor.cursor().row, 2, "past the end goes to the last line");
         h.press(keys);
         h.type_text("1");
         h.press("esc");
-        assert_eq!(h.app.ui.editor.cursor().row, 2, "esc cancels");
-        assert_eq!(h.app.ui.editor.text(), T3);
+        assert_eq!(h.app.ui.tab.editor.cursor().row, 2, "esc cancels");
+        assert_eq!(h.app.ui.tab.editor.text(), T3);
         // Letters are not a line number.
         h.press(keys);
         h.type_text("ab");
         h.press("enter");
-        assert_eq!(h.app.ui.editor.cursor().row, 2);
+        assert_eq!(h.app.ui.tab.editor.cursor().row, 2);
     }
 }
 
@@ -533,7 +533,7 @@ async fn indent_and_unindent() {
     act_undo(&mut h, "‸select a", "tab", "    ‸select a");
     act_undo(&mut h, "se‸lect a", "tab", "se  ‸lect a");
     act(&mut h, "   ‸x", "tab", "    ‸x");
-    assert!(!h.app.ui.editor.text().contains('\t'));
+    assert!(!h.app.ui.tab.editor.text().contains('\t'));
     // A selection inside one line is replaced by the indentation.
     act(&mut h, "se‹lec›t a", "tab", "se  ‸t a");
     // shift+tab with no selection unindents the caret's line.
@@ -554,7 +554,7 @@ async fn tab_belongs_first_to_the_popup_then_to_a_template_then_to_a_multi_line_
     type_and_settle(&mut h, "select * from fil").await;
     assert!(super::complete_tests::visible(&h));
     h.press("tab");
-    assert!(h.app.ui.editor.text().starts_with("select * from film") && !h.app.ui.editor.text().contains("  "), "the popup took tab: {:?}", h.app.ui.editor.text());
+    assert!(h.app.ui.tab.editor.text().starts_with("select * from film") && !h.app.ui.tab.editor.text().contains("  "), "the popup took tab: {:?}", h.app.ui.tab.editor.text());
     // With a selection over several lines that is not in the way: indentation.
     let mut h = editing().await;
     act(&mut h, "‹select a\nfrom› t", "tab", "    ‹select a\n    from› t");
@@ -563,10 +563,10 @@ async fn tab_belongs_first_to_the_popup_then_to_a_template_then_to_a_multi_line_
     type_and_settle(&mut h, "sel").await;
     h.press("tab");
     h.settle().await;
-    assert!(h.app.ui.template.active());
-    let before = h.app.ui.editor.text();
+    assert!(h.app.ui.tab.template.active());
+    let before = h.app.ui.tab.editor.text();
     h.press("tab");
-    assert!(!h.app.ui.editor.text().starts_with(' ') && h.app.ui.editor.text().len() == before.len(), "{:?}", h.app.ui.editor.text());
+    assert!(!h.app.ui.tab.editor.text().starts_with(' ') && h.app.ui.tab.editor.text().len() == before.len(), "{:?}", h.app.ui.tab.editor.text());
     // Nothing else owns it: indentation.
     let mut h = editing().await;
     act(&mut h, "‸", "tab", "    ‸");
@@ -684,10 +684,10 @@ async fn typing_the_closer_that_is_next_moves_over_it_and_tab_also_moves_past_it
     // Typed in sequence: `(` `a` `)` leaves one pair.
     load(&mut h, "‸");
     h.type_text("count(*)");
-    assert_eq!(h.app.ui.editor.text(), "count(*)");
+    assert_eq!(h.app.ui.tab.editor.text(), "count(*)");
     load(&mut h, "‸");
     h.type_text("f('a', [1])");
-    assert_eq!(h.app.ui.editor.text(), "f('a', [1])");
+    assert_eq!(h.app.ui.tab.editor.text(), "f('a', [1])");
 }
 
 #[tokio::test]
@@ -765,11 +765,11 @@ async fn the_prefix_has_keys_for_a_new_line_after_and_before_and_the_mode_bar_sh
 async fn find_starts_with_the_last_search_when_nothing_is_selected() {
     let mut h = editing().await;
     load(&mut h, T3);
-    h.app.ui.editor.move_to(Cursor::default());
+    h.app.ui.tab.editor.move_to(Cursor::default());
     h.press("ctrl+f");
     h.type_text("from");
     h.press("esc");
-    h.app.ui.editor.move_to(Cursor::default());
+    h.app.ui.tab.editor.move_to(Cursor::default());
     h.press("ctrl+f");
     assert!(screen(&mut h).contains("from"), "the bar starts with the last search");
     h.press("enter");
@@ -816,7 +816,7 @@ async fn the_chooser_moves_runs_the_statement_and_esc_cancels_without_losing_tex
     h.press("cmd+enter");
     assert!(runs(&h.press_fx("esc")).is_empty());
     assert!(h.app.ui.overlay.is_none());
-    assert_eq!(h.app.ui.editor.text(), plain(SUB));
+    assert_eq!(h.app.ui.tab.editor.text(), plain(SUB));
     // Not inside a subquery: no chooser, as before.
     let mut h = editing().await;
     load(&mut h, "select * from t‸ where a = 1");

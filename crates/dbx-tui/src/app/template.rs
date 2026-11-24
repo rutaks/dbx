@@ -284,7 +284,7 @@ fn region(old: &str, new: &str) -> (usize, usize, usize) {
 
 impl App {
     fn row_chars(&self, row: usize) -> Vec<char> {
-        self.ui.editor.lines().get(row).map(|l| l.chars().collect()).unwrap_or_default()
+        self.ui.tab.editor.lines().get(row).map(|l| l.chars().collect()).unwrap_or_default()
     }
 
     // ---- tab: where a template may expand --------------------------------------------
@@ -292,13 +292,13 @@ impl App {
     /// `tab` where a postfix template or an abbreviation is. Returns whether
     /// it expanded (or is waiting to).
     pub(super) fn tab_expands(&mut self, fx: &mut Effects) -> bool {
-        if self.ui.template.active() || self.ui.editor.selection().is_some() {
+        if self.ui.tab.template.active() || self.ui.tab.editor.selection().is_some() {
             return false;
         }
-        let caret = self.ui.editor.cursor();
-        let moved = self.completion_visible() && self.ui.complete.popup.touched();
+        let caret = self.ui.tab.editor.cursor();
+        let moved = self.completion_visible() && self.ui.tab.complete.popup.touched();
         if !moved {
-            if let Some(line) = self.ui.editor.lines().get(caret.row) {
+            if let Some(line) = self.ui.tab.editor.lines().get(caret.row) {
                 if let Some(site) = postfix_at(line, caret.col) {
                     self.expand_postfix(site, caret.row, fx);
                     return true;
@@ -309,8 +309,8 @@ impl App {
     }
 
     fn expand_live(&mut self, moved: bool, fx: &mut Effects) -> bool {
-        let caret = self.ui.editor.cursor();
-        let ctx = analyse(self.ui.editor.lines(), caret);
+        let caret = self.ui.tab.editor.cursor();
+        let ctx = analyse(self.ui.tab.editor.lines(), caret);
         if ctx.literal || ctx.quoted || ctx.word.is_empty() || ctx.wants.qualified.is_some() || !ctx.statement_start {
             return false;
         }
@@ -319,7 +319,7 @@ impl App {
         // user moved the selection to it).
         let chosen = self
             .completion_visible()
-            .then(|| self.ui.complete.popup.selected_item().filter(|i| i.kind == ItemKind::Template).and_then(|i| Template::named(&i.name)))
+            .then(|| self.ui.tab.complete.popup.selected_item().filter(|i| i.kind == ItemKind::Template).and_then(|i| Template::named(&i.name)))
             .flatten();
         let exact = (!moved && ctx.word_end == caret).then(|| Template::named(&ctx.word)).flatten();
         let Some(template) = chosen.or(exact) else { return false };
@@ -329,7 +329,7 @@ impl App {
 
     pub(super) fn expand_template(&mut self, t: &'static Template, from: Cursor, to: Cursor, fx: &mut Effects) {
         let exp = expand(t);
-        if let Err(why) = self.ui.editor.replace(from, to, &exp.text) {
+        if let Err(why) = self.ui.tab.editor.replace(from, to, &exp.text) {
             return self.notify(format!("Could not expand {}: {why}.", t.abbr), true, fx);
         }
         self.close_completion(fx);
@@ -339,15 +339,15 @@ impl App {
             .into_iter()
             .map(|v| Var { spans: v.spans.into_iter().map(|(a, b)| (at(a), at(b))).collect(), ..v })
             .collect();
-        self.ui.template.expanded += 1;
-        self.ui.template.session = Some(Session {
+        self.ui.tab.template.expanded += 1;
+        self.ui.tab.template.session = Some(Session {
             row: from.row,
             start: from.col,
             len: exp.text.chars().count(),
             vars,
             end: at(exp.end),
             current: 0,
-            revision: self.ui.editor.revision(),
+            revision: self.ui.tab.editor.revision(),
         });
         self.move_to_var(0, fx);
         fx.repaint = true;
@@ -369,7 +369,7 @@ impl App {
     }
 
     pub(super) fn perform_template(&mut self, action: Action, fx: &mut Effects) {
-        if !self.ui.template.active() {
+        if !self.ui.tab.template.active() {
             return;
         }
         match action {
@@ -384,54 +384,54 @@ impl App {
     }
 
     fn template_next(&mut self, fx: &mut Effects) {
-        let Some(current) = self.ui.template.session.as_ref().map(|s| s.current) else { return };
+        let Some(current) = self.ui.tab.template.session.as_ref().map(|s| s.current) else { return };
         self.fill_columns_on_leaving(current, fx);
-        let Some(s) = self.ui.template.session.as_ref() else { return };
+        let Some(s) = self.ui.tab.template.session.as_ref() else { return };
         if current + 1 < s.vars.len() {
             self.move_to_var(current + 1, fx);
         } else {
             let end = Cursor { row: s.row, col: s.end };
             self.close_completion(fx);
             self.leave_template(fx);
-            self.ui.editor.move_to(end);
+            self.ui.tab.editor.move_to(end);
             fx.repaint = true;
         }
     }
 
     fn template_prev(&mut self, fx: &mut Effects) {
-        let Some(current) = self.ui.template.session.as_ref().map(|s| s.current) else { return };
+        let Some(current) = self.ui.tab.template.session.as_ref().map(|s| s.current) else { return };
         self.move_to_var(current.saturating_sub(1), fx);
     }
 
     /// The caret on variable `index`: its text selected when it has any, so
     /// that typing replaces it.
     fn move_to_var(&mut self, index: usize, fx: &mut Effects) {
-        let Some(s) = self.ui.template.session.as_mut() else { return };
+        let Some(s) = self.ui.tab.template.session.as_mut() else { return };
         s.current = index;
         let row = s.row;
         let Some(&(a, b)) = s.vars.get(index).and_then(|v| v.spans.iter().min_by_key(|(a, _)| *a)) else { return };
         self.close_completion(fx);
         if b > a {
-            self.ui.editor.select_range(Cursor { row, col: a }, Cursor { row, col: b });
+            self.ui.tab.editor.select_range(Cursor { row, col: a }, Cursor { row, col: b });
         } else {
-            self.ui.editor.move_to(Cursor { row, col: a });
+            self.ui.tab.editor.move_to(Cursor { row, col: a });
         }
         fx.repaint = true;
     }
 
     pub(super) fn leave_template(&mut self, fx: &mut Effects) {
-        if self.ui.template.session.take().is_some() {
+        if self.ui.tab.template.session.take().is_some() {
             fx.repaint = true;
         }
-        self.ui.template.columns_for = None;
+        self.ui.tab.template.columns_for = None;
     }
 
     // ---- following the text --------------------------------------------------------------
 
     /// The row as it is before a key reaches the editor, while a template is on.
     pub(super) fn template_before(&self) -> Option<Before> {
-        let s = self.ui.template.session.as_ref()?;
-        Some((s.row, self.ui.editor.lines().get(s.row).cloned().unwrap_or_default(), self.ui.editor.lines().len(), self.ui.editor.revision()))
+        let s = self.ui.tab.template.session.as_ref()?;
+        Some((s.row, self.ui.tab.editor.lines().get(s.row).cloned().unwrap_or_default(), self.ui.tab.editor.lines().len(), self.ui.tab.editor.revision()))
     }
 
     /// Accounts for what a key did to the row: the places of the variables
@@ -440,14 +440,14 @@ impl App {
     /// template, ends template mode (the text stays).
     pub(super) fn track_template(&mut self, before: Option<Before>, fx: &mut Effects) {
         let Some((row, old, lines, revision)) = before else { return };
-        if self.ui.template.session.is_none() {
+        if self.ui.tab.template.session.is_none() {
             return;
         }
-        if self.ui.editor.lines().len() != lines {
+        if self.ui.tab.editor.lines().len() != lines {
             return self.leave_template(fx);
         }
-        if self.ui.editor.revision() != revision {
-            let new = self.ui.editor.lines().get(row).cloned().unwrap_or_default();
+        if self.ui.tab.editor.revision() != revision {
+            let new = self.ui.tab.editor.lines().get(row).cloned().unwrap_or_default();
             let (p, old_end, new_len) = region(&old, &new);
             if !self.apply_edit(p, old_end, new_len, fx) {
                 return self.leave_template(fx);
@@ -458,16 +458,16 @@ impl App {
 
     /// A replacement made by the client in the row (a table accepted).
     fn template_replaced(&mut self, from: usize, to: usize, new_len: usize, fx: &mut Effects) {
-        if self.ui.template.session.is_some() && !self.apply_edit(from, to, new_len, fx) {
+        if self.ui.tab.template.session.is_some() && !self.apply_edit(from, to, new_len, fx) {
             self.leave_template(fx);
         }
         self.settle_session(fx);
     }
 
     fn settle_session(&mut self, fx: &mut Effects) {
-        let caret = self.ui.editor.cursor();
-        let revision = self.ui.editor.revision();
-        let Some(s) = self.ui.template.session.as_mut() else { return };
+        let caret = self.ui.tab.editor.cursor();
+        let revision = self.ui.tab.editor.revision();
+        let Some(s) = self.ui.tab.template.session.as_mut() else { return };
         s.revision = revision;
         if caret.row != s.row || caret.col < s.start || caret.col > s.start + s.len {
             self.leave_template(fx);
@@ -478,7 +478,7 @@ impl App {
     /// characters. Returns false when the edit is not inside one place of a
     /// variable.
     fn apply_edit(&mut self, p: usize, old_end: usize, new_len: usize, fx: &mut Effects) -> bool {
-        let Some(s) = self.ui.template.session.as_mut() else { return false };
+        let Some(s) = self.ui.tab.template.session.as_mut() else { return false };
         let inside = |(a, b): (usize, usize)| a <= p && old_end <= b;
         let mut found: Option<(usize, usize)> = None;
         let order = std::iter::once(s.current).chain((0..s.vars.len()).filter(|i| *i != s.current));
@@ -507,7 +507,7 @@ impl App {
         s.current = vi;
         if s.vars[vi].spans.len() > 1 {
             let (a, b) = s.vars[vi].spans[oi];
-            let text: String = self.row_chars(self.ui.template.session.as_ref().map_or(0, |s| s.row))[a..b].iter().collect();
+            let text: String = self.row_chars(self.ui.tab.template.session.as_ref().map_or(0, |s| s.row))[a..b].iter().collect();
             self.write_var(vi, &text, Some(oi), fx);
         }
         true
@@ -516,20 +516,20 @@ impl App {
     /// Puts `text` into every place of variable `vi` but `skip`, and the
     /// caret back where it was (moved by what was changed before it).
     fn write_var(&mut self, vi: usize, text: &str, skip: Option<usize>, fx: &mut Effects) {
-        let Some(s) = self.ui.template.session.as_ref() else { return };
+        let Some(s) = self.ui.tab.template.session.as_ref() else { return };
         let row = s.row;
         let mut places: Vec<usize> = (0..s.vars[vi].spans.len()).filter(|j| Some(*j) != skip).collect();
         places.sort_by_key(|j| std::cmp::Reverse(s.vars[vi].spans[*j].0));
-        let mut caret = self.ui.editor.cursor();
+        let mut caret = self.ui.tab.editor.cursor();
         let new_len = text.chars().count();
         for j in places {
-            let Some(s) = self.ui.template.session.as_mut() else { return };
+            let Some(s) = self.ui.tab.template.session.as_mut() else { return };
             let (a, b) = s.vars[vi].spans[j];
             let now: String = self.row_chars(row)[a..b].iter().collect();
             if now == text {
                 continue;
             }
-            if self.ui.editor.replace(Cursor { row, col: a }, Cursor { row, col: b }, text).is_err() {
+            if self.ui.tab.editor.replace(Cursor { row, col: a }, Cursor { row, col: b }, text).is_err() {
                 return self.leave_template(fx);
             }
             let delta = new_len as isize - (b - a) as isize;
@@ -537,7 +537,7 @@ impl App {
             if caret.row == row && caret.col >= b {
                 caret.col = shift(caret.col);
             }
-            let Some(s) = self.ui.template.session.as_mut() else { return };
+            let Some(s) = self.ui.tab.template.session.as_mut() else { return };
             for (i, v) in s.vars.iter_mut().enumerate() {
                 for (k, sp) in v.spans.iter_mut().enumerate() {
                     if (i, k) == (vi, j) {
@@ -552,9 +552,9 @@ impl App {
             }
             s.len = shift(s.len);
         }
-        self.ui.editor.move_to(caret);
-        let revision = self.ui.editor.revision();
-        if let Some(s) = self.ui.template.session.as_mut() {
+        self.ui.tab.editor.move_to(caret);
+        let revision = self.ui.tab.editor.revision();
+        if let Some(s) = self.ui.tab.template.session.as_mut() {
             s.revision = revision;
         }
         fx.repaint = true;
@@ -563,9 +563,9 @@ impl App {
     /// Ends template mode when something other than the template's own
     /// keystrokes moved the text or the caret (a click, an undo, a paste).
     pub(super) fn template_housekeeping(&mut self, fx: &mut Effects) {
-        let Some(s) = self.ui.template.session.as_ref() else { return };
-        let caret = self.ui.editor.cursor();
-        if s.revision != self.ui.editor.revision()
+        let Some(s) = self.ui.tab.template.session.as_ref() else { return };
+        let caret = self.ui.tab.editor.cursor();
+        if s.revision != self.ui.tab.editor.revision()
             || self.ui.focus != PaneId::Editor
             || self.ui.overlay.is_some()
             || caret.row != s.row
@@ -580,7 +580,7 @@ impl App {
 
     /// Whether the variable the caret is in names a table.
     pub(super) fn in_table_variable(&self) -> bool {
-        self.ui.template.in_table_variable()
+        self.ui.tab.template.in_table_variable()
     }
 
     /// The popup replaced `from..to` of the row with `new_len` characters in a
@@ -599,17 +599,17 @@ impl App {
     }
 
     fn var_index(&self, name: &str) -> Option<usize> {
-        self.ui.template.session.as_ref()?.vars.iter().position(|v| v.name == name)
+        self.ui.tab.template.session.as_ref()?.vars.iter().position(|v| v.name == name)
     }
 
     /// What the variable that names a table says now.
     fn table_variable_text(&self) -> String {
-        let Some(vi) = self.ui.template.session.as_ref().and_then(|s| s.vars.iter().position(|v| v.table)) else { return String::new() };
+        let Some(vi) = self.ui.tab.template.session.as_ref().and_then(|s| s.vars.iter().position(|v| v.table)) else { return String::new() };
         self.var_text(vi).trim().to_string()
     }
 
     fn var_text(&self, vi: usize) -> String {
-        let Some(s) = self.ui.template.session.as_ref() else { return String::new() };
+        let Some(s) = self.ui.tab.template.session.as_ref() else { return String::new() };
         let Some(&(a, b)) = s.vars.get(vi).and_then(|v| v.spans.first()) else { return String::new() };
         self.row_chars(s.row).get(a..b).map(|c| c.iter().collect()).unwrap_or_default()
     }
@@ -624,7 +624,7 @@ impl App {
         let waiting_for = |app: &mut App, needs: Vec<(Need, String)>, fx: &mut Effects| {
             if app.request_completion(needs, fx) {
                 let asked_at = app.table_variable_text();
-                app.ui.template.columns_for = Some((schema.map(str::to_string), table.to_string(), asked_at));
+                app.ui.tab.template.columns_for = Some((schema.map(str::to_string), table.to_string(), asked_at));
             }
         };
         let Some(current) = self.model.completions.current_schema.get(&db).cloned() else {
@@ -636,7 +636,7 @@ impl App {
         if cols.is_empty() {
             return waiting_for(self, needs, fx);
         }
-        self.ui.template.columns_for = None;
+        self.ui.tab.template.columns_for = None;
         let dialect = self.active_dialect();
         let list = cols.iter().map(|c| quote_identifier(&c.name, dialect)).collect::<Vec<_>>().join(", ");
         self.write_var(vi, &list, None, fx);
@@ -644,7 +644,7 @@ impl App {
 
     /// The user moves on from a table typed by hand: its columns go in too.
     fn fill_columns_on_leaving(&mut self, vi: usize, fx: &mut Effects) {
-        let table_var = self.ui.template.session.as_ref().is_some_and(|s| s.vars.get(vi).is_some_and(|v| v.table));
+        let table_var = self.ui.tab.template.session.as_ref().is_some_and(|s| s.vars.get(vi).is_some_and(|v| v.table));
         let Some(cols) = self.var_index("columns").filter(|c| table_var && self.var_text(*c).is_empty()) else { return };
         if let Some((schema, table)) = table_of_expr(self.var_text(vi).trim()) {
             self.fill_columns(cols, schema.as_deref(), &table, fx);
@@ -654,8 +654,8 @@ impl App {
     /// A reply came: a column list the template was waiting for may be made
     /// now, and so may a postfix expansion.
     pub(super) fn continue_template(&mut self, fx: &mut Effects) {
-        if self.ui.template.session.is_some() {
-            if let (Some((schema, table, asked_at)), Some(vi)) = (self.ui.template.columns_for.take(), self.var_index("columns")) {
+        if self.ui.tab.template.session.is_some() {
+            if let (Some((schema, table, asked_at)), Some(vi)) = (self.ui.tab.template.columns_for.take(), self.var_index("columns")) {
                 if self.var_text(vi).is_empty() {
                     // The reply is for the table that was in the variable when
                     // it was asked for. Another one is there now: it is the one
@@ -675,18 +675,18 @@ impl App {
     // ---- postfix expansion ------------------------------------------------------------------
 
     fn continue_postfix(&mut self, fx: &mut Effects) {
-        let Some(w) = self.ui.template.waiting.take() else { return };
-        let caret = self.ui.editor.cursor();
-        if self.ui.editor.revision() != w.revision || caret != w.caret || self.ui.focus != PaneId::Editor {
+        let Some(w) = self.ui.tab.template.waiting.take() else { return };
+        let caret = self.ui.tab.editor.cursor();
+        if self.ui.tab.editor.revision() != w.revision || caret != w.caret || self.ui.focus != PaneId::Editor {
             return;
         }
-        if let Some(site) = self.ui.editor.lines().get(caret.row).and_then(|l| postfix_at(l, caret.col)) {
+        if let Some(site) = self.ui.tab.editor.lines().get(caret.row).and_then(|l| postfix_at(l, caret.col)) {
             self.expand_postfix(site, caret.row, fx);
         }
     }
 
     fn expand_postfix(&mut self, site: PostfixSite, row: usize, fx: &mut Effects) {
-        self.ui.template.waiting = None;
+        self.ui.tab.template.waiting = None;
         let name = match site.kind {
             Postfix::From => ".from",
             Postfix::CFrom => ".cfrom",
@@ -753,10 +753,10 @@ impl App {
             }
         };
         let (from, to) = (Cursor { row, col: site.start }, Cursor { row, col: site.end });
-        match self.ui.editor.replace(from, to, &text) {
+        match self.ui.tab.editor.replace(from, to, &text) {
             Ok(_) => {
-                self.ui.editor.move_to(Cursor { row, col: site.start + caret });
-                self.ui.template.expanded += 1;
+                self.ui.tab.editor.move_to(Cursor { row, col: site.start + caret });
+                self.ui.tab.template.expanded += 1;
             }
             Err(why) => self.notify(format!("Could not expand {name}: {why}."), true, fx),
         }
@@ -768,7 +768,7 @@ impl App {
     /// the text has not moved on. Otherwise they are not coming.
     fn wait_for_names(&mut self, waiting: bool, name: &str, fx: &mut Effects) {
         if waiting {
-            self.ui.template.waiting = Some(Waiting { revision: self.ui.editor.revision(), caret: self.ui.editor.cursor() });
+            self.ui.tab.template.waiting = Some(Waiting { revision: self.ui.tab.editor.revision(), caret: self.ui.tab.editor.cursor() });
         } else {
             self.notify(format!("Could not expand {name}: the names it needs are not known."), true, fx);
         }

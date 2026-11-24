@@ -11,6 +11,12 @@ mod viewer;
 
 pub(crate) use results::cell_text;
 
+/// Graphemes of cell values the grid has read on this thread (work, for tests).
+#[cfg(test)]
+pub(crate) fn cell_graphemes_read() -> usize {
+    results::CELL_GRAPHEMES.with(|n| n.get())
+}
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -487,7 +493,7 @@ fn draw_editor(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) {
     let (kind, dialect) = (app.active_kind(), app.active_dialect());
     // The find or go-to-line bar takes the editor's last row.
     app.refresh_bar();
-    let (area, bar_row) = match (&app.ui.bar, area.height >= 3) {
+    let (area, bar_row) = match (&app.ui.tab.bar, area.height >= 3) {
         (Some(_), true) => (Rect { height: area.height - 1, ..area }, Some(Rect { y: area.bottom() - 1, height: 1, ..area })),
         _ => (area, None),
     };
@@ -542,10 +548,10 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     let keys = &app.ui.keys;
     // While the completion popup is open the bar shows its keys.
     if app.completion_visible() {
-        return keys.complete_hints(app.ui.complete.popup.selected_item().is_some_and(|i| i.kind == super::complete_popup::ItemKind::Template));
+        return keys.complete_hints(app.ui.tab.complete.popup.selected_item().is_some_and(|i| i.kind == super::complete_popup::ItemKind::Template));
     }
     // Filling in a template: its keys.
-    if app.ui.template.active() && app.ui.focus == PaneId::Editor {
+    if app.ui.tab.template.active() && app.ui.focus == PaneId::Editor {
         return keys.template_hints();
     }
     let one = |action: Action, desc: &'static str| keys.key_for(action).map(|k| Hint { keys: vec![(k, action)], desc });
@@ -576,7 +582,7 @@ fn normal_hints(app: &App) -> Vec<Hint> {
         hints.extend(one(Action::CompleteOpen, "complete"));
         hints.push(prefix);
         // Only while there is a name to go to.
-        if app.ui.marks.unresolved_count() > 0 {
+        if app.ui.tab.marks.unresolved_count() > 0 {
             hints.extend(one(Action::NextUnresolved, "next error"));
             hints.extend(one(Action::PrevUnresolved, "prev error"));
         }
@@ -685,7 +691,7 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
         // An overlay takes all input and shows its own keys.
         _ if app.ui.overlay.is_some() => Vec::new(),
         Mode::Normal => {
-            if app.ui.template.active() && app.ui.focus == PaneId::Editor {
+            if app.ui.tab.template.active() && app.ui.focus == PaneId::Editor {
                 x = p.put(buf, x + 1, r.y, " TEMPLATE ", label(Role::Teal));
             }
             normal_hints(app)

@@ -41,7 +41,7 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect) {
     };
     let focused = app.ui.focus == crate::app::PaneId::Results;
     let App { model, ui } = app;
-    let tab = &model.tabs[0];
+    let tab = model.active(ui.tab.id);
     // The outcome is the latest run's only while nothing came after it, and
     // the rows being loaded more of are the same statement's.
     let earlier = tab.run != RunState::Idle && tab.loading_more.is_none();
@@ -54,7 +54,7 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect) {
             if set.columns.is_empty() {
                 draw_affected(&p, buf, below, set)
             } else {
-                draw_grid(&p, buf, below, set, &mut ui.grid, focused)
+                draw_grid(&p, buf, below, set, &mut ui.tab.grid, focused)
             }
         }
         Some(Outcome::Failed { error, .. } | Outcome::TimedOut { error, .. }) => {
@@ -221,7 +221,15 @@ pub(crate) fn cell_text(cell: Option<&Cell>) -> String {
         width += UnicodeWidthStr::width(g);
         chars += 1;
     }
+    #[cfg(test)]
+    CELL_GRAPHEMES.with(|n| n.set(n.get() + chars));
     out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Graphemes `cell_text` has read on this thread (work, for tests).
+    pub(crate) static CELL_GRAPHEMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn right_aligned(kind: CellKind) -> bool {
@@ -350,7 +358,7 @@ pub(super) fn position(app: &App) -> Option<String> {
     if set.rows.is_empty() {
         return None;
     }
-    let g = &app.ui.grid;
+    let g = &app.ui.tab.grid;
     let plus = if set.truncated { "+" } else { "" };
     Some(format!("r {}/{}{plus}  c {}/{}", thousands(g.row + 1), thousands(set.rows.len()), g.col + 1, set.columns.len()))
 }

@@ -93,12 +93,12 @@ impl super::App {
     /// there is nothing to add.
     pub(super) fn finish_statement(&mut self, fx: &mut super::Effects) {
         let dialect = self.active_dialect();
-        let edit = match complete_statement(self.ui.editor.lines(), self.ui.editor.cursor(), dialect) {
+        let edit = match complete_statement(self.ui.tab.editor.lines(), self.ui.tab.editor.cursor(), dialect) {
             Ok(Some(edit)) => edit,
             Ok(None) => return,
             Err(why) => return self.notify(format!("Nothing was added: {why}."), true, fx),
         };
-        match self.ui.editor.replace(edit.at, edit.at, &edit.text) {
+        match self.ui.tab.editor.replace(edit.at, edit.at, &edit.text) {
             Ok(_) => fx.repaint = true,
             Err(why) => self.notify(format!("Could not complete the statement: {why}."), true, fx),
         }

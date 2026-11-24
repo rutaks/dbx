@@ -58,31 +58,31 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, hits: &HitMap) 
     if !app.completion_visible() {
         return;
     }
-    let Some(anchor) = app.ui.complete.anchor() else { return };
+    let Some(anchor) = app.ui.tab.complete.anchor() else { return };
     // The frame's tokens are the whole buffer's: a string or comment the
     // cheap read of the statement round the caret missed shows up here.
     if app.caret_in_literal() {
-        app.ui.complete.reset();
+        app.ui.tab.complete.reset();
         return;
     }
     // The cell the word starts in; the caret's, when that has scrolled away.
-    let Some((word_x, row_y)) = cell_of(app, anchor).or_else(|| cell_of(app, app.ui.editor.cursor())) else { return };
+    let Some((word_x, row_y)) = cell_of(app, anchor).or_else(|| cell_of(app, app.ui.tab.editor.cursor())) else { return };
 
     let screen = buf.area;
     let floor = if hits.mode_bar.is_empty() { screen.bottom() } else { hits.mode_bar.y };
     let below = floor.saturating_sub(row_y + 1) as usize;
     let above = row_y.saturating_sub(screen.top()) as usize;
-    let wanted = app.ui.complete.popup.rows();
+    let wanted = app.ui.tab.complete.popup.rows();
     let (go_below, room) = if below >= wanted || below >= above { (true, below) } else { (false, above) };
     if room == 0 {
         return;
     }
-    app.ui.complete.popup.set_cap(room);
+    app.ui.tab.complete.popup.set_cap(room);
     // From here on the user sees this list and its highlighted item.
-    app.ui.complete.popup.mark_seen();
-    let rows = app.ui.complete.popup.rows() as u16;
+    app.ui.tab.complete.popup.mark_seen();
+    let rows = app.ui.tab.complete.popup.rows() as u16;
 
-    let popup = &app.ui.complete.popup;
+    let popup = &app.ui.tab.complete.popup;
     let name_w = popup
         .items()
         .iter()

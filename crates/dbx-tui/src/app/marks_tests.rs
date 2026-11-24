@@ -37,7 +37,7 @@ fn title_and_nope() -> (&'static str, References) {
 const PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 
 async fn shown(h: &mut Harness, sql: &str) {
-    h.app.ui.editor.set_text(sql);
+    h.app.ui.tab.editor.set_text(sql);
     // A key, so that the app looks at the text; the pause that lets it ask
     // about it; then the replies and what they make it ask for.
     h.press("end");
@@ -73,7 +73,7 @@ async fn a_column_takes_the_column_role_and_a_name_that_resolves_to_nothing_the_
     assert_eq!(role_of(&mut h, "title"), Some(Role::SynColumn));
     assert_eq!(role_of(&mut h, "nope"), Some(Role::SynUnresolved));
     assert_eq!(role_of(&mut h, "film"), Some(Role::SynIdentifier), "a table that exists keeps the identifier colour");
-    assert_eq!(h.app.ui.marks.unresolved_count(), 1);
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 1);
 }
 
 #[tokio::test]
@@ -84,7 +84,7 @@ async fn a_table_qualified_with_a_schema_whose_relations_are_loaded_and_not_in_i
     let refs = References { tables: vec![t], scopes: vec![(0, None)], ..References::default() };
     let mut h = with_analysis(sql, refs).await;
     assert_eq!(role_of(&mut h, "filmz"), Some(Role::SynUnresolved));
-    assert_eq!(h.app.ui.marks.unresolved_count(), 1);
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 1);
 }
 
 #[tokio::test]
@@ -95,7 +95,7 @@ async fn an_unqualified_table_is_never_unresolved_whatever_the_current_schema_la
         let sql = format!("select * from {name}");
         let refs = References { tables: vec![table(name, None, span(0, 14, 14 + name.len()))], scopes: vec![(0, None)], ..References::default() };
         let mut h = with_analysis(&sql, refs).await;
-        assert_eq!(h.app.ui.marks.unresolved_count(), 0, "{name}");
+        assert_eq!(h.app.ui.tab.marks.unresolved_count(), 0, "{name}");
         assert_ne!(role_of(&mut h, name), Some(Role::SynUnresolved), "{name}");
     }
 }
@@ -127,7 +127,7 @@ async fn a_partition_the_sidebars_listing_leaves_out_is_not_unresolved_when_qual
     h.press("u ctrl+g l");
     frame_rows(&mut h.app, 100, 30);
     shown(&mut h, sql).await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 0);
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 0);
     assert_ne!(role_of(&mut h, "payment_p2022_01"), Some(Role::SynUnresolved));
 }
 
@@ -146,7 +146,7 @@ fn at_in(sql: &str, within: &str, offset: usize, len: usize) -> Span {
 
 async fn nothing_unresolved(sql: &str, refs: References) {
     let h = with_analysis(sql, refs).await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 0, "{sql}");
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 0, "{sql}");
 }
 
 #[tokio::test]
@@ -282,7 +282,7 @@ async fn a_column_of_a_plain_table_whose_columns_are_loaded_is_still_unresolved_
     };
     let mut h = with_analysis(sql, refs).await;
     assert_eq!(role_of(&mut h, "nope"), Some(Role::SynUnresolved));
-    assert_eq!(h.app.ui.marks.unresolved_count(), 1, "only nope");
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 1, "only nope");
 }
 
 #[tokio::test]
@@ -295,7 +295,7 @@ async fn an_alias_that_names_nothing_is_unresolved() {
         unknown_qualifiers: vec![("z".into(), span(0, 7, 8))],
     };
     let mut h = with_analysis(sql, refs).await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 1);
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 1);
     let (x, y) = find_text(&mut h.app, 100, 30, "z.title").unwrap();
     assert_eq!(role_at(&mut h.app, x, y).fg, Some(Role::SynUnresolved));
 }
@@ -307,7 +307,7 @@ async fn a_statement_that_does_not_parse_shows_no_unresolved_marks_at_all() {
     let mut h = editing_on(fake).await;
     frame_rows(&mut h.app, 100, 30);
     shown(&mut h, "select title, nope from film where").await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 0);
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 0);
     assert_eq!(role_of(&mut h, "nope"), Some(Role::SynIdentifier));
     assert_eq!(role_of(&mut h, "title"), Some(Role::SynIdentifier));
 }
@@ -323,7 +323,7 @@ async fn nothing_is_unresolved_while_the_schema_for_it_is_not_loaded_or_failed_t
     let mut h = editing_on(fake).await;
     frame_rows(&mut h.app, 100, 30);
     shown(&mut h, sql).await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 0, "a failed load is not knowledge");
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 0, "a failed load is not knowledge");
     assert_eq!(role_of(&mut h, "nope"), Some(Role::SynIdentifier));
     // And before the reply has come, nothing is claimed either.
     let mut cat = pagila();
@@ -334,7 +334,7 @@ async fn nothing_is_unresolved_while_the_schema_for_it_is_not_loaded_or_failed_t
     let mut h = editing_on(fake).await;
     frame_rows(&mut h.app, 100, 30);
     shown(&mut h, sql).await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 0);
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 0);
 }
 
 #[tokio::test]
@@ -351,7 +351,7 @@ async fn ctes_subquery_aliases_and_select_list_aliases_are_not_reported() {
         ..References::default()
     };
     let h = with_analysis(sql, refs).await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 0);
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 0);
     let sql = "select title as t from film order by t";
     let refs = References {
         tables: vec![table("film", None, span(0, 22, 26))],
@@ -360,7 +360,7 @@ async fn ctes_subquery_aliases_and_select_list_aliases_are_not_reported() {
         ..References::default()
     };
     let h = with_analysis(sql, refs).await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 0, "an alias of the select list");
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 0, "an alias of the select list");
 }
 
 #[tokio::test]
@@ -373,24 +373,24 @@ async fn f2_and_shift_f2_move_between_unresolved_names_and_wrap() {
         ..References::default()
     };
     let mut h = with_analysis(sql, refs).await;
-    assert_eq!(h.app.ui.marks.unresolved_count(), 2);
-    h.app.ui.editor.move_to(Cursor { row: 0, col: 0 });
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 2);
+    h.app.ui.tab.editor.move_to(Cursor { row: 0, col: 0 });
     h.press("f2");
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 7 });
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 7 });
     h.press("f2");
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 20 });
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 20 });
     h.press("f2");
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 7 }, "wraps");
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 7 }, "wraps");
     h.press("shift+f2");
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 20 }, "backwards, wrapping");
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 20 }, "backwards, wrapping");
     h.press("shift+f2");
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 7 });
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 7 });
 }
 
 #[tokio::test]
 async fn f2_is_in_the_mode_bar_only_when_there_is_something_to_go_to_and_from_the_live_keys() {
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select 1");
+    h.app.ui.tab.editor.set_text("select 1");
     assert!(!mode_bar(&mut h).contains("next error"));
     let (sql, refs) = title_and_nope();
     let mut h = with_analysis(sql, refs).await;
@@ -404,16 +404,16 @@ async fn f2_is_in_the_mode_bar_only_when_there_is_something_to_go_to_and_from_th
 async fn the_marks_are_computed_when_something_changes_and_never_per_frame() {
     let (sql, refs) = title_and_nope();
     let mut h = with_analysis(sql, refs).await;
-    let computed = h.app.ui.marks.computed();
+    let computed = h.app.ui.tab.marks.computed();
     let asked = h.fake.calls().len();
     for _ in 0..20 {
         frame_rows(&mut h.app, 100, 30);
     }
     h.press("left right");
-    assert_eq!(h.app.ui.marks.computed(), computed, "frames and caret moves recompute nothing");
+    assert_eq!(h.app.ui.tab.marks.computed(), computed, "frames and caret moves recompute nothing");
     assert_eq!(h.fake.calls().len(), asked, "and ask nothing");
     h.type_text(" ");
-    assert!(h.app.ui.marks.computed() > computed, "a text change does");
+    assert!(h.app.ui.tab.marks.computed() > computed, "a text change does");
     assert!(h.fake.calls().iter().any(|c| matches!(c, Call::Analyze(_))));
 }
 
@@ -452,7 +452,7 @@ async fn an_open_popup_and_the_marks_share_one_analysis_of_the_same_statement_te
     super::complete_scope_tests::put(&mut h, "select t| from film f");
     h.press("ctrl+space");
     h.settle().await;
-    assert!(h.app.ui.complete.is_open());
+    assert!(h.app.ui.tab.complete.is_open());
     h.type_text("i");
     h.settle().await;
     h.advance(PAUSE);
@@ -466,20 +466,20 @@ async fn an_open_popup_and_the_marks_share_one_analysis_of_the_same_statement_te
 async fn working_out_a_statement_again_with_the_same_text_and_schema_is_a_lookup() {
     let (sql, refs) = title_and_nope();
     let mut h = with_analysis(sql, refs).await;
-    let marked = h.app.ui.marks.statements_marked();
+    let marked = h.app.ui.tab.marks.statements_marked();
     assert!(marked >= 1, "worked out once");
     let asked = analyses(&h).len();
-    let computed = h.app.ui.marks.computed();
+    let computed = h.app.ui.tab.marks.computed();
     // An edit and its undoing: the same text again.
     h.press("end");
     h.type_text(" ");
     h.press("backspace");
     h.advance(PAUSE);
     h.settle().await;
-    assert!(h.app.ui.marks.computed() > computed, "the text changed, so the marks were looked at again");
-    assert_eq!(h.app.ui.marks.statements_marked(), marked, "but nothing was worked out again");
+    assert!(h.app.ui.tab.marks.computed() > computed, "the text changed, so the marks were looked at again");
+    assert_eq!(h.app.ui.tab.marks.statements_marked(), marked, "but nothing was worked out again");
     assert_eq!(analyses(&h).len(), asked, "and nothing asked");
-    assert_eq!(h.app.ui.marks.unresolved_count(), 1);
+    assert_eq!(h.app.ui.tab.marks.unresolved_count(), 1);
 }
 
 #[tokio::test]

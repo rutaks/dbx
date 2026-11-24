@@ -32,6 +32,7 @@ use super::requests::{RequestId, Target};
 use super::theme::Role;
 use super::tree::{Listing, NodeId};
 use super::{App, Command, CoreCall, CoreReply, Effects, PaneId};
+use crate::core::TabId;
 use crate::core::{
     display_safe, Candidate, CandidateKind, ColumnInfo, CompletionRequest, CoreErrorKind, Cursor, DatabasePath, ForeignKey, References, SchemaPath,
     SearchKind, TableKind, TablePath,
@@ -137,8 +138,8 @@ pub struct CompletionCache {
     /// Asked, and the Core said no: not asked again until that part of the
     /// tree is refreshed.
     pub(super) failed: HashSet<Need>,
-    /// In flight, with the prefix asked.
-    pub(super) inflight: HashMap<Need, (RequestId, String)>,
+    /// In flight, by the tab that asked, with the prefix asked.
+    pub(super) inflight: HashMap<(TabId, Need), (RequestId, String)>,
 }
 
 impl CompletionCache {
@@ -195,7 +196,7 @@ impl CompletionCache {
             }
         }
         self.failed.retain(|n| !n.is_under(node));
-        let gone: Vec<Need> = self.inflight.keys().filter(|n| n.is_under(node)).cloned().collect();
+        let gone: Vec<(TabId, Need)> = self.inflight.keys().filter(|(_, n)| n.is_under(node)).cloned().collect();
         gone.iter().filter_map(|n| self.inflight.remove(n)).map(|(id, _)| id).collect()
     }
 }
@@ -237,6 +238,11 @@ impl CompleteUi {
     pub(super) fn reset(&mut self) {
         self.session = None;
         self.popup.set_items(Vec::new(), false);
+    }
+
+    /// Forgets a `*` expansion waiting for columns (its tab was left).
+    pub(super) fn forget_pending(&mut self) {
+        self.pending_star = None;
     }
 
     /// Whether a completion is open or on its way (it may have nothing to
@@ -348,20 +354,20 @@ fn accept_range(ctx: &Context, caret: Cursor, replace: bool) -> (Cursor, Cursor)
 impl App {
     /// Whether the popup is on screen.
     pub(super) fn completion_visible(&self) -> bool {
-        self.ui.complete.visible() && self.ui.focus == PaneId::Editor && self.ui.overlay.is_none()
+        self.ui.tab.complete.visible() && self.ui.focus == PaneId::Editor && self.ui.overlay.is_none()
     }
 
     /// Closes the popup, and forgets what it was waiting for.
     pub(super) fn close_completion(&mut self, fx: &mut Effects) {
-        let was = self.ui.complete.session.is_some() || !self.ui.complete.popup.is_empty();
-        self.ui.complete.reset();
+        let was = self.ui.tab.complete.session.is_some() || !self.ui.tab.complete.popup.is_empty();
+        self.ui.tab.complete.reset();
         fx.repaint |= was;
     }
 
     /// A key given to the focused editor: the popup's keys first, when it is
     /// open; then the editor's own, after which the list follows the text.
     pub(super) fn on_editor_key(&mut self, key: KeyEvent, combo: KeyCombo, fx: &mut Effects) {
-        if self.ui.template.active() && self.template_key(&combo, fx) {
+        if self.ui.tab.template.active() && self.template_key(&combo, fx) {
             return;
         }
         // The template expansion key (`tab`, by default; `enter` is only the
@@ -374,7 +380,7 @@ impl App {
             return;
         }
         if self.completion_visible() {
-            let template = self.ui.complete.popup.selected_item().is_some_and(|i| i.kind == ItemKind::Template);
+            let template = self.ui.tab.complete.popup.selected_item().is_some_and(|i| i.kind == ItemKind::Template);
             if let Some(action) = self.ui.keys.lookup_complete(&combo, template) {
                 // `enter` after a word that is already typed in full is the
                 // editor's: a line break, not text the user did not type.
@@ -385,7 +391,7 @@ impl App {
         }
         // `esc` with a completion on its way but nothing to show yet ends it,
         // and is still the editor's key: it is not swallowed.
-        if combo.code == KeyCode::Esc && self.ui.complete.is_open() {
+        if combo.code == KeyCode::Esc && self.ui.tab.complete.is_open() {
             self.close_completion(fx);
         }
         // While the find or go-to-line bar is open the keys that are text are its.
@@ -397,22 +403,22 @@ impl App {
             let now = self.ui.now.unwrap_or_else(std::time::Instant::now);
             return self.perform_edit(action, now, fx);
         }
-        let before = self.ui.editor.revision();
+        let before = self.ui.tab.editor.revision();
         let template_before = self.template_before();
         // Typed text goes through the smart keys first (pairs, indentation).
         if !self.smart_key(&key, fx) {
-            fx.repaint |= self.ui.editor.key(key);
+            fx.repaint |= self.ui.tab.editor.key(key);
         }
         self.track_template(template_before, fx);
-        let edited = self.ui.editor.revision() != before;
+        let edited = self.ui.tab.editor.revision() != before;
         let typed = match key.code {
             KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => Some(c),
             _ => None,
         };
-        if self.ui.complete.is_open() {
+        if self.ui.tab.complete.is_open() {
             self.refresh_completion(Open::Keep, fx);
         }
-        if !self.ui.complete.is_open() && edited && typed.is_some_and(|c| is_word_char(c) || c == '.') {
+        if !self.ui.tab.complete.is_open() && edited && typed.is_some_and(|c| is_word_char(c) || c == '.') {
             self.refresh_completion(Open::Typed, fx);
         }
     }
@@ -424,10 +430,10 @@ impl App {
             Action::CompleteInsert | Action::ExpandTemplate => self.accept_completion(false, fx),
             Action::CompleteReplace => self.accept_completion(true, fx),
             Action::CompleteClose => self.close_completion(fx),
-            Action::CompleteUp => fx.repaint |= self.ui.complete.popup.up(),
-            Action::CompleteDown => fx.repaint |= self.ui.complete.popup.down(),
-            Action::CompletePageUp => fx.repaint |= self.ui.complete.popup.page_up(),
-            Action::CompletePageDown => fx.repaint |= self.ui.complete.popup.page_down(),
+            Action::CompleteUp => fx.repaint |= self.ui.tab.complete.popup.up(),
+            Action::CompleteDown => fx.repaint |= self.ui.tab.complete.popup.down(),
+            Action::CompletePageUp => fx.repaint |= self.ui.tab.complete.popup.page_up(),
+            Action::CompletePageDown => fx.repaint |= self.ui.tab.complete.popup.page_down(),
             _ => {}
         }
     }
@@ -441,9 +447,9 @@ impl App {
             return false;
         }
         if rect.contains((x, y).into()) {
-            let index = self.ui.complete.popup.top() + (y - rect.y) as usize;
-            if index < self.ui.complete.popup.len() {
-                self.ui.complete.popup.select(index);
+            let index = self.ui.tab.complete.popup.top() + (y - rect.y) as usize;
+            if index < self.ui.tab.complete.popup.len() {
+                self.ui.tab.complete.popup.select(index);
                 self.accept_completion(false, fx);
             }
             return true;
@@ -457,14 +463,14 @@ impl App {
         if !self.completion_visible() || !self.ui.hits.popup.contains((x, y).into()) {
             return false;
         }
-        fx.repaint |= self.ui.complete.popup.scroll(rows);
+        fx.repaint |= self.ui.tab.complete.popup.scroll(rows);
         true
     }
 
     /// The completion has nothing to do with what is on screen any more: the
     /// editor lost focus, an overlay or the prefix mode took over.
     pub(super) fn completion_housekeeping(&mut self, fx: &mut Effects) {
-        if self.ui.complete.is_open() && (self.ui.focus != PaneId::Editor || self.ui.overlay.is_some() || self.ui.mode != super::Mode::Normal) {
+        if self.ui.tab.complete.is_open() && (self.ui.focus != PaneId::Editor || self.ui.overlay.is_some() || self.ui.mode != super::Mode::Normal) {
             self.close_completion(fx);
         }
     }
@@ -479,14 +485,15 @@ impl App {
     /// key puts text into the buffer. The cheap read of the statement round
     /// the caret (`analyse`) is what typing relies on.
     pub(super) fn caret_in_literal(&mut self) -> bool {
-        if self.ui.complete.session.as_ref().is_none_or(|s| s.word.is_empty()) {
+        if self.ui.tab.complete.session.as_ref().is_none_or(|s| s.word.is_empty()) {
             return false;
         }
         let (kind, dialect) = (self.active_kind(), self.active_dialect());
-        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref(), dialect);
-        let caret = self.ui.editor.cursor();
+        self.ui.tab.syntax.refresh(&mut self.ui.syntax, &self.ui.tab.editor, kind.as_ref(), dialect);
+        let caret = self.ui.tab.editor.cursor();
         let Some(before) = caret.col.checked_sub(1) else { return false };
         self.ui
+            .tab
             .syntax
             .colours()
             .line(caret.row)
@@ -500,10 +507,10 @@ impl App {
     /// caret turns out to be inside a string or a comment.
     fn enter_is_a_line_break(&mut self, fx: &mut Effects) -> bool {
         let in_literal = self.caret_in_literal();
-        let typed = !self.ui.complete.popup.touched()
-            && self.ui.complete.popup.selected_item().is_some_and(|item| {
-                let caret = self.ui.editor.cursor();
-                self.typed_in_full(item, &analyse(self.ui.editor.lines(), caret), caret)
+        let typed = !self.ui.tab.complete.popup.touched()
+            && self.ui.tab.complete.popup.selected_item().is_some_and(|item| {
+                let caret = self.ui.tab.editor.cursor();
+                self.typed_in_full(item, &analyse(self.ui.tab.editor.lines(), caret), caret)
             });
         if in_literal || typed {
             self.close_completion(fx);
@@ -522,7 +529,7 @@ impl App {
         if from.row != to.row || from.col > to.col {
             return false;
         }
-        let Some(line) = self.ui.editor.lines().get(from.row) else { return false };
+        let Some(line) = self.ui.tab.editor.lines().get(from.row) else { return false };
         let typed: String = line.chars().skip(from.col).take(to.col - from.col).collect();
         if item.kind == ItemKind::Keyword {
             typed.to_lowercase() == item.insert.to_lowercase()
@@ -533,7 +540,7 @@ impl App {
 
     /// Recomputes the list for the caret as it is now.
     fn refresh_completion(&mut self, open: Open, fx: &mut Effects) {
-        let session = self.ui.complete.session.clone();
+        let session = self.ui.tab.complete.session.clone();
         if session.is_none() && matches!(open, Open::Keep | Open::Fill) {
             return;
         }
@@ -543,8 +550,8 @@ impl App {
                 self.model.completions.failed.retain(|n| n.database() != &db);
             }
         }
-        let caret = self.ui.editor.cursor();
-        let mut ctx = analyse(self.ui.editor.lines(), caret);
+        let caret = self.ui.tab.editor.cursor();
+        let mut ctx = analyse(self.ui.tab.editor.lines(), caret);
         // No name is that long (Postgres stops at 63 bytes): what is being
         // typed is not one, and matching it against everything would be work
         // for nothing.
@@ -579,10 +586,10 @@ impl App {
             return self.close_completion(fx);
         }
         let keep = open == Open::Fill || session.as_ref().is_some_and(|s| s.word == ctx.word);
-        let before = (self.ui.complete.session.clone(), self.ui.complete.popup.clone());
-        self.ui.complete.session = Some(Session { anchor: ctx.word_start, word: ctx.word.clone(), manual });
-        self.ui.complete.popup.set_items(items, keep);
-        if before != (self.ui.complete.session.clone(), self.ui.complete.popup.clone()) {
+        let before = (self.ui.tab.complete.session.clone(), self.ui.tab.complete.popup.clone());
+        self.ui.tab.complete.session = Some(Session { anchor: ctx.word_start, word: ctx.word.clone(), manual });
+        self.ui.tab.complete.popup.set_items(items, keep);
+        if before != (self.ui.tab.complete.session.clone(), self.ui.tab.complete.popup.clone()) {
             fx.repaint = true;
         }
     }
@@ -591,14 +598,14 @@ impl App {
     /// `tab` over the rest of the word to its right; a closed quoted name is
     /// replaced through its closing quote either way.
     fn accept_completion(&mut self, replace: bool, fx: &mut Effects) {
-        let Some(item) = self.ui.complete.popup.selected_item().cloned() else { return };
+        let Some(item) = self.ui.tab.complete.popup.selected_item().cloned() else { return };
         // Not into a string or a comment, which a keystroke may have made of
         // the caret's place before a frame could close the popup.
         if self.caret_in_literal() {
             return self.close_completion(fx);
         }
-        let caret = self.ui.editor.cursor();
-        let ctx = analyse(self.ui.editor.lines(), caret);
+        let caret = self.ui.tab.editor.cursor();
+        let ctx = analyse(self.ui.tab.editor.lines(), caret);
         // A template is expanded: what is highlighted is what you get.
         if item.kind == ItemKind::Template {
             if let (Some(template), true) = (super::template::Template::named(&item.name), ctx.statement_start) {
@@ -611,9 +618,9 @@ impl App {
             // An alias goes after a name that ends here, not into the middle of a word.
             let in_template = self.in_table_variable();
             let text = if to == ctx.word_end && !in_template { item.text() } else { item.insert.clone() };
-            if let Err(why) = self.ui.editor.replace(from, to, &text) {
+            if let Err(why) = self.ui.tab.editor.replace(from, to, &text) {
                 self.notify(format!("Could not insert {}: {why}.", display_safe(&text)), true, fx);
-            } else if self.ui.template.active() {
+            } else if self.ui.tab.template.active() {
                 let is_table = matches!(item.kind, ItemKind::Table | ItemKind::View | ItemKind::MatView | ItemKind::Foreign);
                 let table = is_table.then(|| (item.name.clone(), item.owner.clone()));
                 self.template_accepted(from.col, to.col, text.chars().count(), table, fx);
@@ -1145,7 +1152,7 @@ impl App {
             return;
         }
         let Some(db) = self.tab().target.clone() else { return };
-        let Some(sql) = ctx.scope.statement_text(self.ui.editor.lines()) else { return };
+        let Some(sql) = ctx.scope.statement_text(self.ui.tab.editor.lines()) else { return };
         if let (Some(Some(refs)), Some((origin, _))) = (self.model.completions.parsed.get(&(db, sql)), ctx.scope.text) {
             ctx.scope.apply_analysis(refs, origin, ctx.word_start);
         }
@@ -1153,13 +1160,13 @@ impl App {
 
     /// The `*` of a select list the caret is on or beside, if any.
     pub(crate) fn star_site(&self) -> Option<Star> {
-        let caret = self.ui.editor.cursor();
-        let line = self.ui.editor.lines().get(caret.row)?;
+        let caret = self.ui.tab.editor.cursor();
+        let line = self.ui.tab.editor.lines().get(caret.row)?;
         let near = |col: usize| line.chars().nth(col) == Some('*');
         if !(near(caret.col) || caret.col.checked_sub(1).is_some_and(near)) {
             return None;
         }
-        analyse(self.ui.editor.lines(), caret).scope.star
+        analyse(self.ui.tab.editor.lines(), caret).scope.star
     }
 
     /// Replaces the `*` under the caret with the columns it stands for: those
@@ -1168,17 +1175,17 @@ impl App {
     /// are not known yet they are asked for, and the expansion is made when
     /// they have come, if the text has not changed meanwhile.
     pub(super) fn expand_star(&mut self, fx: &mut Effects) {
-        self.ui.complete.pending_star = None;
+        self.ui.tab.complete.pending_star = None;
         let Some(star) = self.star_site() else { return };
-        let caret = self.ui.editor.cursor();
-        let ctx = analyse(self.ui.editor.lines(), caret);
+        let caret = self.ui.tab.editor.cursor();
+        let ctx = analyse(self.ui.tab.editor.lines(), caret);
         let Some(db) = self.tab().target.clone() else { return };
         if !self.core_names() {
             return self.notify("Expanding * needs a PostgreSQL connection for now.".to_string(), true, fx);
         }
         let Some(current) = self.model.completions.current_schema.get(&db).cloned() else {
             let waiting = self.request_completion(vec![(Need::CurrentSchema(db), String::new())], fx);
-            self.ui.complete.pending_star = waiting.then(|| (self.ui.editor.revision(), caret));
+            self.ui.tab.complete.pending_star = waiting.then(|| (self.ui.tab.editor.revision(), caret));
             return;
         };
         let sources: Vec<&Source> = match &star.qualifier {
@@ -1222,7 +1229,7 @@ impl App {
             }
         }
         if !needs.is_empty() && self.request_completion(needs, fx) {
-            self.ui.complete.pending_star = Some((self.ui.editor.revision(), caret));
+            self.ui.tab.complete.pending_star = Some((self.ui.tab.editor.revision(), caret));
             return;
         }
         if sources.is_empty() || !empty.is_empty() {
@@ -1230,7 +1237,7 @@ impl App {
             return self.notify(format!("Could not expand *: {what}."), true, fx);
         }
         let text = parts.join(", ");
-        match self.ui.editor.replace(star.start, star.end, &text) {
+        match self.ui.tab.editor.replace(star.start, star.end, &text) {
             Ok(_) => fx.repaint = true,
             Err(why) => self.notify(format!("Could not expand *: {why}."), true, fx),
         }
@@ -1239,9 +1246,9 @@ impl App {
 
     /// An expansion that was waiting for names has them now (or the text moved on).
     fn continue_pending_star(&mut self, fx: &mut Effects) {
-        let Some((revision, caret)) = self.ui.complete.pending_star else { return };
-        if self.ui.editor.revision() != revision || self.ui.editor.cursor() != caret || self.ui.focus != PaneId::Editor {
-            self.ui.complete.pending_star = None;
+        let Some((revision, caret)) = self.ui.tab.complete.pending_star else { return };
+        if self.ui.tab.editor.revision() != revision || self.ui.tab.editor.cursor() != caret || self.ui.focus != PaneId::Editor {
+            self.ui.tab.complete.pending_star = None;
             return;
         }
         self.expand_star(fx);
@@ -1253,21 +1260,22 @@ impl App {
     /// still outstanding (asked now, or earlier and not answered).
     pub(super) fn request_completion(&mut self, needs: Vec<(Need, String)>, fx: &mut Effects) -> bool {
         let mut outstanding = false;
+        let tab = self.ui.tab.id;
         for (need, mask) in needs {
             let cache = &mut self.model.completions;
             if cache.failed.contains(&need) {
                 continue;
             }
             outstanding = true;
-            match cache.inflight.get(&need) {
+            match cache.inflight.get(&(tab, need.clone())) {
                 // Already asked this.
                 Some((_, asked)) if *asked == mask => continue,
                 // Asked for another prefix: that answer is no longer wanted.
                 Some((old, _)) => fx.commands.push(Command::Abandon(*old)),
                 None => {}
             }
-            let id = self.model.requests.begin(Target::Complete(need.clone()));
-            self.model.completions.inflight.insert(need.clone(), (id, mask.clone()));
+            let id = self.model.requests.begin(Target::Complete(tab, need.clone()));
+            self.model.completions.inflight.insert((tab, need.clone()), (id, mask.clone()));
             let call = match &need {
                 Need::CurrentSchema(db) => CoreCall::CurrentSchema(db.clone()),
                 Need::Schemas(db) => CoreCall::Complete(CompletionRequest {
@@ -1312,11 +1320,13 @@ impl App {
         outstanding
     }
 
-    /// The reply to a completion call that is still current. Whatever it says
-    /// is kept; the popup changes only when it is open on the same word.
-    /// Returns whether anything on screen changed.
-    pub(super) fn on_complete_reply(&mut self, need: Need, reply: CoreReply, fx: &mut Effects) -> bool {
-        let prefix = self.model.completions.inflight.remove(&need).map(|(_, p)| p).unwrap_or_default();
+    /// The reply to a completion call of tab `tab` that is still current.
+    /// Whatever it says is kept, for every tab (it is what the Core said of
+    /// the database); the popup changes only when it is open on the same
+    /// word, in that tab, on screen. Returns whether anything on screen
+    /// changed.
+    pub(super) fn on_complete_reply(&mut self, tab: TabId, need: Need, reply: CoreReply, fx: &mut Effects) -> bool {
+        let prefix = self.model.completions.inflight.remove(&(tab, need.clone())).map(|(_, p)| p).unwrap_or_default();
         let cache = &mut self.model.completions;
         cache.version += 1;
         if matches!(need, Need::CurrentSchema(_) | Need::Relations(_) | Need::Columns(_)) {
@@ -1371,19 +1381,25 @@ impl App {
         // A failed background analysis is not worth a notice: nothing is marked.
         if let (Some(reason), false) = (failure, matches!(need, Need::Parse(..))) {
             // Once for each thing that failed: it is not asked again until
-            // the key or a refresh in the sidebar asks.
+            // the key or a refresh in the sidebar asks. A tab not on screen
+            // keeps it to say when it is shown again.
             let reason = reason.trim().trim_end_matches('.');
-            self.notify(format!("Completion for {} failed: {reason}. Refresh it in the sidebar to retry.", need.describe()), true, fx);
+            self.notify_tab(tab, format!("Completion for {} failed: {reason}. Refresh it in the sidebar to retry.", need.describe()), fx);
         }
-        let had_star = self.ui.complete.pending_star.is_some();
+        // A tab not on screen has no popup open, no `*` or template waiting
+        // (leaving a tab closes them).
+        if !self.is_active(tab) {
+            return false;
+        }
+        let had_star = self.ui.tab.complete.pending_star.is_some();
         self.continue_pending_star(fx);
         self.continue_template(fx);
-        if !self.ui.complete.is_open() {
+        if !self.ui.tab.complete.is_open() {
             return had_star;
         }
-        let before = (self.ui.complete.session.clone(), self.ui.complete.popup.clone());
+        let before = (self.ui.tab.complete.session.clone(), self.ui.tab.complete.popup.clone());
         self.refresh_completion(Open::Fill, fx);
-        before != (self.ui.complete.session.clone(), self.ui.complete.popup.clone())
+        before != (self.ui.tab.complete.session.clone(), self.ui.tab.complete.popup.clone())
     }
 
     /// A run in the tab ended whose text had `search_path` in it (it may have
@@ -1395,27 +1411,31 @@ impl App {
     /// the session is not what is learned, only what a fresh connection
     /// resolves names in (an `ALTER ROLE ... SET search_path`, say). Matching
     /// the text is conservative: any run that mentions it counts.
-    pub(super) fn after_run_forget_current_schema(&mut self, fx: &mut Effects) {
-        if !std::mem::take(&mut self.model.tabs[0].run_mentions_search_path) {
+    pub(super) fn after_run_forget_current_schema(&mut self, tab: TabId, fx: &mut Effects) {
+        let Some(t) = self.model.tab_mut(tab) else { return };
+        if !std::mem::take(&mut t.run_mentions_search_path) {
             return;
         }
-        let Some(db) = self.tab().target.clone() else { return };
+        let Some(db) = t.target.clone() else { return };
         let need = Need::CurrentSchema(db.clone());
         let cache = &mut self.model.completions;
         cache.current_schema.remove(&db);
         cache.schema_version += 1;
         cache.failed.remove(&need);
-        if let Some((id, _)) = cache.inflight.remove(&need) {
-            fx.commands.push(Command::Abandon(id));
-            self.model.requests.forget_where(|t| matches!(t, Target::Complete(n) if *n == need));
+        let asked: Vec<(TabId, Need)> = cache.inflight.keys().filter(|(_, n)| *n == need).cloned().collect();
+        for key in asked {
+            if let Some((id, _)) = cache.inflight.remove(&key) {
+                fx.commands.push(Command::Abandon(id));
+            }
         }
+        self.model.requests.forget_where(|t| matches!(t, Target::Complete(_, n) if *n == need));
     }
 
     /// A part of the tree is being refreshed or dropped: what completion
     /// kept for it is stale.
     pub(super) fn invalidate_completions(&mut self, node: &NodeId, fx: &mut Effects) {
         let inflight = self.model.completions.invalidate(node);
-        self.model.requests.forget_where(|t| matches!(t, Target::Complete(n) if n.is_under(node)));
+        self.model.requests.forget_where(|t| matches!(t, Target::Complete(_, n) if n.is_under(node)));
         fx.commands.extend(inflight.into_iter().map(Command::Abandon));
     }
 }

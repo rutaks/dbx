@@ -33,7 +33,7 @@ pub(super) fn with_keys() -> Catalogue {
 pub(super) fn put(h: &mut Harness, sql: &str) {
     let rows: Vec<&str> = sql.split('\n').collect();
     let (row, col) = rows.iter().enumerate().find_map(|(r, l)| l.find('|').map(|i| (r, l[..i].chars().count()))).expect("a caret");
-    h.app.ui.editor.set_text(&sql.replacen('|', "", 1));
+    h.app.ui.tab.editor.set_text(&sql.replacen('|', "", 1));
     for _ in row..rows.len() - 1 {
         h.press("up");
     }
@@ -41,7 +41,7 @@ pub(super) fn put(h: &mut Harness, sql: &str) {
     for _ in 0..col {
         h.press("right");
     }
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row, col });
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row, col });
 }
 
 async fn complete_at(h: &mut Harness, sql: &str) {
@@ -52,7 +52,7 @@ async fn complete_at(h: &mut Harness, sql: &str) {
 
 /// (name, owner, insert) of the items of one kind.
 fn of_kind(h: &Harness, kind: ItemKind) -> Vec<(String, Option<String>, String)> {
-    h.app.ui.complete.popup.items().iter().filter(|i| i.kind == kind).map(|i| (i.name.clone(), i.owner.clone(), i.insert.clone())).collect()
+    h.app.ui.tab.complete.popup.items().iter().filter(|i| i.kind == kind).map(|i| (i.name.clone(), i.owner.clone(), i.insert.clone())).collect()
 }
 
 fn col(name: &str, owner: &str, insert: &str) -> (String, Option<String>, String) {
@@ -60,7 +60,7 @@ fn col(name: &str, owner: &str, insert: &str) -> (String, Option<String>, String
 }
 
 fn position(h: &Harness, name: &str, owner: &str) -> usize {
-    h.app.ui.complete.popup.items().iter().position(|i| i.name == name && i.owner.as_deref() == Some(owner)).unwrap_or_else(|| panic!("{name} of {owner} in {:?}", names(h)))
+    h.app.ui.tab.complete.popup.items().iter().position(|i| i.name == name && i.owner.as_deref() == Some(owner)).unwrap_or_else(|| panic!("{name} of {owner} in {:?}", names(h)))
 }
 
 // ---- scope ----------------------------------------------------------------------
@@ -80,7 +80,7 @@ async fn the_select_list_offers_the_columns_of_every_table_in_scope_each_with_it
     }
     // Accepting the one of the second table inserts it qualified.
     let at = position(&h, "film_id", "fa");
-    h.app.ui.complete.popup.select(at);
+    h.app.ui.tab.complete.popup.select(at);
     h.press("tab");
     assert!(text(&h).starts_with("select fa.film_id from film f"), "{}", text(&h));
 }
@@ -117,7 +117,7 @@ async fn a_column_of_an_outer_query_is_always_inserted_qualified_and_so_is_any_c
     assert!(cols.contains(&col("film_id", "f", "f.film_id")), "an outer column is qualified, and `film_id` alone would be fa's: {cols:?}");
     assert!(cols.iter().all(|c| c.2.contains('.')), "{cols:?}");
     let at = position(&h, "film_id", "f");
-    h.app.ui.complete.popup.select(at);
+    h.app.ui.tab.complete.popup.select(at);
     h.press("enter");
     assert_eq!(text(&h), "select * from film f where exists (select 1 from film_actor fa where f.film_id");
     // At the same level: while a source's columns are not known, none is bare.
@@ -151,7 +151,7 @@ async fn outside_a_subquery_its_alias_and_select_list_names_are_offered() {
 async fn a_cte_is_a_table_after_its_definition_and_its_select_list_names_are_its_columns() {
     let mut h = editing(with_keys()).await;
     complete_at(&mut h, "with c as (select film_id, title from film) select * from |").await;
-    let ctes: Vec<String> = h.app.ui.complete.popup.items().iter().filter(|i| i.kind == ItemKind::Cte).map(|i| i.name.clone()).collect();
+    let ctes: Vec<String> = h.app.ui.tab.complete.popup.items().iter().filter(|i| i.kind == ItemKind::Cte).map(|i| i.name.clone()).collect();
     assert_eq!(ctes, ["c"], "{:?}", names(&h));
     complete_at(&mut h, "with c as (select * from |) select * from c").await;
     assert!(!names(&h).contains(&"c".to_string()), "not inside its own definition: {:?}", names(&h));
@@ -200,7 +200,7 @@ async fn dbxs_analysis_is_used_when_it_parses_and_the_tokens_when_it_does_not() 
     assert!(of_kind(&h, ItemKind::Column).iter().any(|c| c.1.as_deref() == Some("f")));
     // Nothing to resolve: nothing asked, however much is typed.
     let before = asked(&h);
-    h.app.ui.editor.set_text("");
+    h.app.ui.tab.editor.set_text("");
     type_and_settle(&mut h, "select 1 + 1").await;
     h.advance(pause);
     h.settle().await;
@@ -213,7 +213,7 @@ async fn dbxs_analysis_is_used_when_it_parses_and_the_tokens_when_it_does_not() 
 async fn after_on_the_first_suggestion_is_the_foreign_key_condition_between_the_tables() {
     let mut h = editing(with_keys()).await;
     complete_at(&mut h, "select * from film f join film_actor fa on |").await;
-    let first = &h.app.ui.complete.popup.items()[0];
+    let first = &h.app.ui.tab.complete.popup.items()[0];
     assert_eq!((first.name.as_str(), first.kind), ("f.film_id = fa.film_id", ItemKind::Condition), "{:?}", names(&h));
     let keys: Vec<TablePath> = h.fake.calls().into_iter().filter_map(|c| if let Call::ForeignKeys(t) = c { Some(t) } else { None }).collect();
     assert!(keys.iter().any(|t| t.table == "film_actor"), "{keys:?}");
@@ -233,11 +233,11 @@ async fn after_on_the_first_suggestion_is_the_foreign_key_condition_between_the_
 async fn accepting_a_table_after_from_adds_an_alias_made_unique_in_the_statement() {
     let mut h = editing(with_keys()).await;
     type_and_settle(&mut h, "select * from fil").await;
-    h.app.ui.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
+    h.app.ui.tab.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
     h.press("enter");
     assert_eq!(text(&h), "select * from film f");
     type_and_settle(&mut h, " join fil").await;
-    h.app.ui.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
+    h.app.ui.tab.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
     h.press("enter");
     assert_eq!(text(&h), "select * from film f join film f2");
     // Initials of the underscore-separated words.
@@ -254,20 +254,20 @@ async fn no_alias_when_the_option_is_off_when_one_was_typed_or_the_table_is_comp
     let mut h = editing(with_keys()).await;
     h.app.model.settings.alias_on_table = false;
     type_and_settle(&mut h, "select * from fil").await;
-    h.app.ui.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
+    h.app.ui.tab.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
     h.press("enter");
     assert_eq!(text(&h), "select * from film");
 
     let mut h = editing(with_keys()).await;
     complete_at(&mut h, "select * from fil| f").await;
-    h.app.ui.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
+    h.app.ui.tab.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
     h.press("tab");
     assert_eq!(text(&h), "select * from film f", "the user's alias stays the only one");
 
     for sql in ["insert into fil|", "update fil|"] {
         let mut h = editing(with_keys()).await;
         complete_at(&mut h, sql).await;
-        h.app.ui.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
+        h.app.ui.tab.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
         h.press("enter");
         assert_eq!(text(&h), sql.replace("fil|", "film"), "{sql}");
     }
@@ -277,8 +277,8 @@ async fn no_alias_when_the_option_is_off_when_one_was_typed_or_the_table_is_comp
 async fn no_alias_is_added_when_the_statement_already_names_the_table_before_a_dot_and_the_row_shows_the_alias() {
     let mut h = editing(with_keys()).await;
     complete_at(&mut h, "select film_actor.actor_id from film_a|").await;
-    h.app.ui.complete.popup.select(names(&h).iter().position(|n| n == "film_actor").unwrap());
-    let row = h.app.ui.complete.popup.selected_item().unwrap().clone();
+    h.app.ui.tab.complete.popup.select(names(&h).iter().position(|n| n == "film_actor").unwrap());
+    let row = h.app.ui.tab.complete.popup.selected_item().unwrap().clone();
     assert_eq!(row.alias, None);
     h.press("enter");
     assert_eq!(text(&h), "select film_actor.actor_id from film_actor");
@@ -290,8 +290,8 @@ async fn no_alias_is_added_when_the_statement_already_names_the_table_before_a_d
     // An alias the statement has taken, or a table or CTE it names, is not generated.
     let mut h = editing(with_keys()).await;
     complete_at(&mut h, "with f as (select 1) select * from fil|").await;
-    h.app.ui.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
-    assert_eq!(h.app.ui.complete.popup.selected_item().unwrap().alias.as_deref(), Some("f2"));
+    h.app.ui.tab.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
+    assert_eq!(h.app.ui.tab.complete.popup.selected_item().unwrap().alias.as_deref(), Some("f2"));
 }
 
 // ---- column lists -----------------------------------------------------------------
@@ -302,7 +302,7 @@ async fn insert_into_a_table_offers_one_item_that_inserts_every_column() {
     complete_at(&mut h, "insert into film (|").await;
     let lists = of_kind(&h, ItemKind::ColumnList);
     assert_eq!(lists.len(), 1, "{:?}", names(&h));
-    assert_eq!(h.app.ui.complete.popup.items()[0].kind, ItemKind::ColumnList, "first");
+    assert_eq!(h.app.ui.tab.complete.popup.items()[0].kind, ItemKind::ColumnList, "first");
     h.press("enter");
     assert_eq!(text(&h), "insert into film (film_id, title, rating");
 }
@@ -311,13 +311,13 @@ async fn insert_into_a_table_offers_one_item_that_inserts_every_column() {
 async fn group_by_and_order_by_offer_the_select_lists_expressions_and_aliases_first() {
     let mut h = editing(with_keys()).await;
     complete_at(&mut h, "select title as t, lower(title) from film f group by |").await;
-    let first: Vec<(String, ItemKind)> = h.app.ui.complete.popup.items().iter().take(3).map(|i| (i.name.clone(), i.kind)).collect();
+    let first: Vec<(String, ItemKind)> = h.app.ui.tab.complete.popup.items().iter().take(3).map(|i| (i.name.clone(), i.kind)).collect();
     assert_eq!(
         first,
         [("t".to_string(), ItemKind::Select), ("title".to_string(), ItemKind::Select), ("lower(title)".to_string(), ItemKind::Select)]
     );
     complete_at(&mut h, "select film_id, count(*) n from film f order by |").await;
-    assert_eq!(h.app.ui.complete.popup.items()[0].kind, ItemKind::Select);
+    assert_eq!(h.app.ui.tab.complete.popup.items()[0].kind, ItemKind::Select);
 }
 
 // ---- keywords against columns -------------------------------------------------------
@@ -339,10 +339,10 @@ async fn a_name_in_two_schemas_is_inserted_qualified_and_a_name_in_one_bare() {
     cat.relations.push(relation("archive", "film", CandidateKind::Table));
     let mut h = editing(cat).await;
     type_and_settle(&mut h, "select * from fil").await;
-    let films: Vec<Option<String>> = h.app.ui.complete.popup.items().iter().filter(|i| i.name == "film").map(|i| i.owner.clone()).collect();
+    let films: Vec<Option<String>> = h.app.ui.tab.complete.popup.items().iter().filter(|i| i.name == "film").map(|i| i.owner.clone()).collect();
     assert_eq!(films, [Some("public".to_string()), Some("archive".to_string())], "{:?}", names(&h));
     assert!(!names(&h).contains(&"badge".to_string()), "other schemas are offered only for a name they share");
-    h.app.ui.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
+    h.app.ui.tab.complete.popup.select(names(&h).iter().position(|n| n == "film").unwrap());
     h.press("enter");
     assert_eq!(text(&h), "select * from public.film f");
 }

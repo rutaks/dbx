@@ -110,7 +110,7 @@ async fn typing_in_the_focused_editor_inserts_text_and_no_sidebar_key_fires() {
         let mods = if c.is_ascii_uppercase() { KeyModifiers::SHIFT } else { KeyModifiers::NONE };
         commands.extend(key(&mut h, code, mods));
     }
-    assert_eq!(h.app.ui.editor.text(), "select e, d, r, u, j;\nfrom G");
+    assert_eq!(h.app.ui.tab.editor.text(), "select e, d, r, u, j;\nfrom G");
     assert!(commands.is_empty(), "{commands:?}");
     assert!(h.app.ui.overlay.is_none(), "`e` did not open the edit form");
     assert_eq!(h.app.ui.sidebar.cursor, cursor_before);
@@ -125,7 +125,7 @@ async fn the_prefix_and_the_run_keys_never_reach_the_editor() {
     assert!(matches!(h.app.ui.mode, Mode::Prefix { .. }), "ctrl+g is the prefix, not the widget's");
     h.press("esc");
     h.press("f5 alt+enter");
-    assert_eq!(h.app.ui.editor.text(), "x", "no newline from alt+enter (an intention action, not a run key), nothing from f5");
+    assert_eq!(h.app.ui.tab.editor.text(), "x", "no newline from alt+enter (an intention action, not a run key), nothing from f5");
 }
 
 #[tokio::test]
@@ -134,11 +134,11 @@ async fn ctrl_c_is_taken_before_the_editor_so_its_copy_never_runs() {
     h.press("ctrl+g l");
     h.type_text("select 1");
     h.press("shift+left shift+left");
-    let selected = h.app.ui.editor.selection();
+    let selected = h.app.ui.tab.editor.selection();
     assert!(selected.is_some());
     h.press("ctrl+c");
     // The widget's copy would have ended the selection.
-    assert_eq!(h.app.ui.editor.selection(), selected);
+    assert_eq!(h.app.ui.tab.editor.selection(), selected);
 }
 
 #[tokio::test]
@@ -147,14 +147,14 @@ async fn a_paste_into_the_editor_turns_every_line_ending_into_one_newline() {
     h.press("ctrl+g l");
     let fx = h.app.update(Event::Paste("select 1\r\nfrom a\rwhere b\n;\u{1b}[31m".into()), base());
     assert!(fx.repaint);
-    assert_eq!(h.app.ui.editor.text(), "select 1\nfrom a\nwhere b\n;\u{fffd}[31m", "control characters are replaced");
+    assert_eq!(h.app.ui.tab.editor.text(), "select 1\nfrom a\nwhere b\n;\u{fffd}[31m", "control characters are replaced");
 }
 
 #[tokio::test]
 async fn a_paste_while_the_sidebar_has_focus_does_not_reach_the_editor() {
     let mut h = started(&["local pg"]).await;
     h.app.update(Event::Paste("select 1".into()), base());
-    assert_eq!(h.app.ui.editor.text(), "");
+    assert_eq!(h.app.ui.tab.editor.text(), "");
 }
 
 // ---- the tab's target -----------------------------------------------------------
@@ -263,7 +263,7 @@ async fn while_running_the_mode_bar_shows_elapsed_time_that_advances_with_now() 
     assert_eq!(h.app.next_deadline(), Some(base() + Duration::from_secs(4)));
     // Typing goes on meanwhile.
     h.type_text(" x");
-    assert!(h.app.ui.editor.text().ends_with(" x"));
+    assert!(h.app.ui.tab.editor.text().ends_with(" x"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -616,47 +616,49 @@ async fn a_paste_too_large_or_with_a_line_too_long_is_refused_whole_with_a_notic
     for (what, text) in [("a long line", long_line), ("a large text", too_big)] {
         h.app.ui.notice = None;
         h.app.update(Event::Paste(text), base());
-        assert_eq!(h.app.ui.editor.text(), "keep", "{what}: nothing of it is pasted");
+        assert_eq!(h.app.ui.tab.editor.text(), "keep", "{what}: nothing of it is pasted");
         assert!(notice_text(&h).contains("not pasted"), "{what}: {:?}", notice_text(&h));
     }
 }
 
 #[tokio::test]
 async fn typing_after_the_largest_paste_allowed_stays_quick() {
+    // Counted, not timed (design sections 24 and 26): after the largest
+    // paste, a key costs one pass of the tokenizer however many frames
+    // follow, and a frame walks only the lines the editor shows, each only
+    // as far as the editor is wide.
     use super::editor::{LINE_LIMIT, PASTE_LIMIT};
     let mut h = started(&["local pg"]).await;
     h.press("ctrl+g l");
-    // As many lines of the longest length as fit, all on screen-height rows.
-    let line = "z".repeat(LINE_LIMIT - 1);
-    let text = vec![line; PASTE_LIMIT / LINE_LIMIT].join("\n");
-    assert!(text.len() <= PASTE_LIMIT);
-    let started = std::time::Instant::now();
-    h.app.update(Event::Paste(text), base());
-    frame_rows(&mut h.app, 114, 30);
-    let paste_took = started.elapsed();
-    let started = std::time::Instant::now();
-    for _ in 0..10 {
-        h.type_text("a");
-    }
-    let keys_only = started.elapsed() / 10;
-    let started = std::time::Instant::now();
-    for _ in 0..10 {
+    // The most text allowed, twice: as many lines of the longest length as
+    // fit, and as many lines (far more than the editor shows) of 255.
+    for width in [LINE_LIMIT - 1, 255] {
+        let line = "z".repeat(width);
+        let lines = PASTE_LIMIT / (width + 1);
+        let text = vec![line; lines].join("\n");
+        assert!(text.len() <= PASTE_LIMIT);
+        h.app.ui.tab.editor.set_text("");
+        h.app.update(Event::Paste(text), base());
         frame_rows(&mut h.app, 114, 30);
+        assert_eq!(h.app.ui.tab.editor.lines().len(), lines);
+        for _ in 0..5 {
+            let before = h.app.ui.tab.syntax.stats();
+            h.type_text("a");
+            frame_rows(&mut h.app, 114, 30);
+            frame_rows(&mut h.app, 114, 30);
+            let after = h.app.ui.tab.syntax.stats();
+            assert_eq!(after.runs, before.runs + 1, "one key, two frames: one tokenizer pass");
+            assert_eq!(after.lines_tokenized, before.lines_tokenized + lines, "the pass reads the buffer once");
+            let shown = h.app.ui.hits.editor_text;
+            let walked = h.app.ui.tab.syntax.lines_painted;
+            assert!(walked <= shown.height as usize, "a frame walked {walked} lines; the editor shows {}", shown.height);
+            // A line is read from its start to the right edge of the window
+            // (the caret is at the end of the paste, so the window is scrolled
+            // right), never past it.
+            let (graphemes, left) = (h.app.ui.tab.syntax.graphemes_painted, h.app.ui.tab.editor.scroll_top().1);
+            assert!(graphemes <= walked * (left + shown.width as usize), "a frame read {graphemes} graphemes of {walked} lines, {left} scrolled, {} wide", shown.width);
+        }
     }
-    let frame_only = started.elapsed() / 10;
-    eprintln!("OBSERVED key alone {keys_only:?}, frame alone {frame_only:?}");
-    let started = std::time::Instant::now();
-    for _ in 0..10 {
-        h.type_text("a");
-        frame_rows(&mut h.app, 114, 30);
-    }
-    let per_key = started.elapsed() / 10;
-    eprintln!("OBSERVED largest paste: {paste_took:?}; a key and a frame after it: {per_key:?}");
-    // Budgets for this unoptimised test build. The widget walks every visible
-    // line whole on each frame; in a release build the same frame (16 lines
-    // of 16 KiB) took 10 ms and the key 1 ms. A 1 MB line took over a minute.
-    assert!(paste_took < std::time::Duration::from_millis(1_000), "{paste_took:?}");
-    assert!(per_key < std::time::Duration::from_millis(250), "{per_key:?}");
 }
 
 #[tokio::test]
@@ -668,18 +670,20 @@ async fn a_ten_megabyte_cell_costs_a_frame_almost_nothing() {
     set.rows = vec![vec![Cell::Value("a".into()), Cell::Value(big.clone()), Cell::Value(format!("{big}\n{big}"))]];
     let mut h = ran(Ok(set)).await;
     frame_rows(&mut h.app, 114, 30);
-    // The frame without the big cells, for comparison.
+    // The frame without the big cells, for comparison. Counted, not timed:
+    // the graphemes of cell values a frame reads.
     let mut small = ran(Ok(rows_of(&[&["a"]]))).await;
-    let time = |h: &mut Harness| {
-        let started = std::time::Instant::now();
-        for _ in 0..5 {
-            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(114, 30)).unwrap();
-            term.draw(|f| h.app.view(f)).unwrap();
-        }
-        started.elapsed() / 5
+    let read = |h: &mut Harness| {
+        let before = super::view::cell_graphemes_read();
+        frame_rows(&mut h.app, 114, 30);
+        super::view::cell_graphemes_read() - before
     };
-    let (with, without) = (time(&mut h), time(&mut small));
-    eprintln!("OBSERVED frame with a 10 MB cell {with:?}, without {without:?}");
-    assert!(with.saturating_sub(without) < std::time::Duration::from_millis(5), "{with:?} vs {without:?}");
+    let (with, without) = (read(&mut h), read(&mut small));
+    // Each big cell is read only as far as the widest column could show it.
+    let cap = 8 * super::grid::MAX_COLUMN as usize + 1;
+    assert!(with - without <= 2 * cap, "a frame read {with} graphemes of cells, {without} without the big ones");
+    let measured = h.app.ui.tab.grid.widths.measured;
+    read(&mut h);
+    assert_eq!(h.app.ui.tab.grid.widths.measured, measured, "a second frame measures no column again");
     assert!(results_rows(&mut h).iter().any(|r| r.contains("ééé") && r.ends_with('…')));
 }

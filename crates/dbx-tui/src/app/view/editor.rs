@@ -33,8 +33,8 @@ const TAB: usize = 4;
 /// the editor: its cell, when it is inside the text area.
 pub(super) fn cell_of(app: &App, at: crate::core::Cursor) -> Option<(u16, u16)> {
     let text = app.ui.hits.editor_text;
-    let (top, left) = app.ui.editor.scroll_top();
-    let line = app.ui.editor.lines().get(at.row)?;
+    let (top, left) = app.ui.tab.editor.scroll_top();
+    let line = app.ui.tab.editor.lines().get(at.row)?;
     if at.row < top {
         return None;
     }
@@ -55,7 +55,7 @@ pub(super) fn cell_of(app: &App, at: crate::core::Cursor) -> Option<(u16, u16)> 
 const BAR: &str = "▎";
 
 pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, focused: bool, kind: Option<&DbKind>, dialect: Option<crate::core::Dialect>, placeholder: &str) {
-    let lines = app.ui.editor.lines().len();
+    let lines = app.ui.tab.editor.lines().len();
     let gutter = gutter_width(lines).min(area.width.saturating_sub(8));
     let gutter_area = Rect { width: gutter, ..area };
     let text = Rect { x: area.x + gutter, width: area.width - gutter, ..area };
@@ -63,18 +63,18 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
     app.ui.hits.editor_text = text;
     app.ui.hits.editor_gutter = gutter_area;
 
-    app.ui.editor.layout(text);
-    let (top, left) = app.ui.editor.scroll_top();
+    app.ui.tab.editor.layout(text);
+    let (top, left) = app.ui.tab.editor.scroll_top();
     let ui = &mut app.ui;
-    let range = ui.syntax.prepare(&ui.editor, kind, dialect);
+    let range = ui.tab.syntax.prepare(&mut ui.syntax, &ui.tab.editor, kind, dialect);
 
     let theme = p.theme;
     let pane = p.within(area);
     pane.fill(buf, Style::default().bg(theme.color(Role::EditorBg)).fg(theme.color(Role::Text)));
     let on = |role: Role| Style::default().fg(theme.color(role)).add_modifier(theme.modifier(role));
-    let caret = ui.editor.cursor();
+    let caret = ui.tab.editor.cursor();
 
-    if ui.editor.is_empty() {
+    if ui.tab.editor.is_empty() {
         let row = Style::default().bg(theme.color(Role::CurrentLine));
         pane.within(text.intersection(Rect { height: 1, ..text })).fill(buf, row);
         let number = on(Role::LineNumberActive);
@@ -91,13 +91,14 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
         return;
     }
 
-    let selection = ui.editor.selection();
-    let mut painted = 0;
-    let braces = matching_bracket(ui.syntax.colours(), caret);
+    let selection = ui.tab.editor.selection();
+    let (mut painted, mut walked) = (0, 0);
+    let braces = matching_bracket(ui.tab.syntax.colours(), caret);
     let bar_rows = range.map(|(a, b)| a.row..=if b.col == 0 && b.row > a.row { b.row - 1 } else { b.row });
     for y in 0..text.height {
         let row = top + y as usize;
-        let Some(line) = ui.editor.lines().get(row) else { break };
+        let Some(line) = ui.tab.editor.lines().get(row) else { break };
+        walked += 1;
         let at_caret = row == caret.row;
         let base_bg = theme.color(if at_caret { Role::CurrentLine } else { Role::EditorBg });
         let sy = text.y + y;
@@ -111,12 +112,12 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
         let number = on(if at_caret { Role::LineNumberActive } else { Role::LineNumber }).bg(theme.color(Role::EditorBg));
         gutter_text(&pane, buf, gutter_area, sy, &(row + 1).to_string(), number);
 
-        let spans = ui.syntax.colours().line(row).unwrap_or(&[]);
+        let spans = ui.tab.syntax.colours().line(row).unwrap_or(&[]);
         let selected = selection.and_then(|(a, b)| {
             (a.row <= row && row <= b.row).then_some((if row == a.row { a.col } else { 0 }, if row == b.row { b.col } else { usize::MAX }))
         });
         let finds: Vec<(usize, usize)> = ui
-            .bar
+            .tab.bar
             .as_ref()
             .map(|b| {
                 let from = b.matches.partition_point(|m| m.0.row < row);
@@ -127,7 +128,7 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
         let look = Look {
             theme,
             spans,
-            marks: ui.marks.row(row),
+            marks: ui.tab.marks.row(row),
             selected,
             marked: &marked,
             finds: &finds,
@@ -144,7 +145,8 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect, foc
             }
         }
     }
-    ui.syntax.graphemes_painted = painted;
+    ui.tab.syntax.graphemes_painted = painted;
+    ui.tab.syntax.lines_painted = walked;
 }
 
 /// Writes `n` right-aligned in the gutter, leaving the bar column and one
@@ -258,8 +260,8 @@ fn paint_line(p: &Painter, buf: &mut Buffer, text: Rect, y: u16, line: &str, lef
 /// The bar on the editor's last row: `find`, the query, and on the right how
 /// many matches there are (or `no match`).
 pub(super) fn draw_bar(app: &mut App, p: &Painter, buf: &mut Buffer, row: Rect, focused: bool) {
-    let lines = app.ui.editor.lines().len();
-    let Some(bar) = app.ui.bar.as_mut() else { return };
+    let lines = app.ui.tab.editor.lines().len();
+    let Some(bar) = app.ui.tab.bar.as_mut() else { return };
     let theme = p.theme;
     let pane = p.within(row);
     let bg = theme.color(Role::Surface0);

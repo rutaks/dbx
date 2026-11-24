@@ -30,6 +30,7 @@ pub mod requests;
 pub mod settings;
 pub mod sidebar;
 pub mod syntax;
+pub mod tab;
 pub mod template;
 pub mod text_field;
 pub mod theme;
@@ -65,6 +66,8 @@ mod mouse_tests;
 mod run_tests;
 #[cfg(test)]
 mod syntax_tests;
+#[cfg(test)]
+mod tabs_tests;
 #[cfg(test)]
 mod capabilities_tests;
 #[cfg(test)]
@@ -136,16 +139,44 @@ pub struct Model {
     /// What the Core told us about each connection's databases, schemas,
     /// tables and columns.
     pub schema: SchemaCache,
-    /// The query tabs. One until the tab bar arrives (slice 15).
+    /// The query tabs, in the order they were opened.
     pub tabs: Vec<QueryTab>,
+    /// Runs of tabs since removed that were let go of before they ended: each
+    /// may still be running until its stale reply says it ended.
+    pub orphaned: Vec<(TabId, query::Abandoned)>,
     pub requests: Requests,
     /// What the completion popup has asked the Core for and kept.
     pub completions: complete::CompletionCache,
     pub settings: settings::Settings,
     /// The id the next run gets.
     pub next_run: u64,
+    /// The id the next query tab gets. Never reused: a session is named by
+    /// its tab, and a late close of a removed tab's session must not reach a
+    /// new one.
+    pub next_tab: u32,
     /// The most rows a run fetches.
     pub row_cap: usize,
+}
+
+impl Model {
+    /// Tab `id`, while it exists.
+    pub fn tab(&self, id: TabId) -> Option<&QueryTab> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    pub fn tab_mut(&mut self, id: TabId) -> Option<&mut QueryTab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    /// The active tab, given its id (`Ui.tab.id`), which is always in the
+    /// model. Taking the id keeps the borrow to `model`, apart from `ui`.
+    pub fn active(&self, id: TabId) -> &QueryTab {
+        self.tab(id).expect("the active tab is in the model")
+    }
+
+    pub fn active_mut(&mut self, id: TabId) -> &mut QueryTab {
+        self.tab_mut(id).expect("the active tab is in the model")
+    }
 }
 
 /// `ctrl+c`: never a key for the focused pane.
@@ -177,10 +208,11 @@ pub struct Capabilities {
 #[derive(Debug)]
 pub struct Ui {
     pub caps: Capabilities,
-    /// The find or go-to-line bar on the editor's last row, while open.
-    pub bar: Option<bar::Bar>,
-    /// What was last searched for: where the find bar starts with no selection.
-    pub last_find: String,
+    /// What the active query tab shows: its editor, popup, template, marks,
+    /// find bar and grid (`tab::TabUi`).
+    pub tab: tab::TabUi,
+    /// The other tabs' `TabUi`, as they were left.
+    pub parked: Vec<tab::TabUi>,
     pub focus: PaneId,
     pub zoomed: bool,
     pub mode: Mode,
@@ -205,19 +237,10 @@ pub struct Ui {
     /// back on the same one (by id) when the new list arrives.
     pub reload_anchor: Option<ConnectionId>,
     pub note: Option<SidebarNote>,
-    /// The SQL editor of the query tab.
-    pub editor: editor::Editor,
-    /// What the editor draws from: colours, type names, the statement range.
+    /// What every tab's editor shares of the Core's syntax answers: the
+    /// statement finder and the type names of each kind of database.
     pub syntax: syntax::SyntaxState,
-    /// The completion popup.
-    pub complete: complete::CompleteUi,
-    /// The live template being filled in, if any.
-    pub template: template::TemplateUi,
-    /// What the loaded schema says about the names in the buffer.
-    pub marks: marks::Marks,
     pub notice: Option<Notice>,
-    /// The results pane's cell cursor and window.
-    pub grid: grid::GridUi,
     /// The `now` of the last update: what the view measures elapsed time by.
     pub now: Option<Instant>,
     /// Where the user put the dividers; `None` is the automatic size. The
@@ -361,16 +384,18 @@ impl App {
                 connections: Loadable::Loading,
                 schema: SchemaCache::default(),
                 tabs: vec![QueryTab::new(TabId(1))],
+                orphaned: Vec::new(),
                 requests: Requests::default(),
                 completions: complete::CompletionCache::default(),
                 settings: settings::Settings::default(),
                 next_run: 1,
+                next_tab: 2,
                 row_cap: DEFAULT_ROW_CAP,
             },
             ui: Ui {
                 caps: Capabilities::default(),
-                bar: None,
-                last_find: String::new(),
+                tab: tab::TabUi::new(TabId(1)),
+                parked: Vec::new(),
                 focus: PaneId::Sidebar,
                 zoomed: false,
                 mode: Mode::Normal,
@@ -386,13 +411,8 @@ impl App {
                 next_form_serial: 1,
                 reload_anchor: None,
                 note: None,
-                editor: editor::Editor::new(),
                 syntax: syntax::SyntaxState::default(),
-                complete: complete::CompleteUi::default(),
-                template: template::TemplateUi::default(),
-                marks: marks::Marks::default(),
                 notice: None,
-                grid: grid::GridUi::default(),
                 now: None,
                 layout: LayoutPrefs::default(),
                 layout_unsaved: false,
@@ -467,7 +487,7 @@ impl App {
             Mode::Prefix { expires } => Some(expires),
             Mode::Normal | Mode::Resize => None,
         };
-        [prefix, self.query_deadline(), self.ui.marks.deadline()].into_iter().flatten().min()
+        [prefix, self.query_deadline(), self.ui.tab.marks.deadline()].into_iter().flatten().min()
     }
 
     pub fn view(&mut self, frame: &mut Frame) {
@@ -538,7 +558,7 @@ impl App {
         }
         if self.ui.focus == PaneId::Editor {
             self.close_completion(fx);
-            match self.ui.editor.paste(text) {
+            match self.ui.tab.editor.paste(text) {
                 Ok(changed) => fx.repaint |= changed,
                 Err(why) => self.notify(format!("The text was not pasted: {why}."), true, fx),
             }
@@ -603,7 +623,7 @@ impl App {
                 None
             }
             // With nothing running, `ctrl+c` in the editor copies a selection.
-            (Action::CancelDirect, Editor) if self.tab().run.in_flight().is_none() && self.ui.editor.selection().is_some() => {
+            (Action::CancelDirect, Editor) if self.tab().run.in_flight().is_none() && self.ui.tab.editor.selection().is_some() => {
                 self.copy_selection(false, fx);
                 None
             }
@@ -658,7 +678,7 @@ impl App {
             }
         } else if self.ui.hits.editor.contains(at) {
             let (rows, cols) = if sideways { (0, 4 * step as i16) } else { (WHEEL_ROWS as i16 * step as i16, 0) };
-            fx.repaint |= self.ui.editor.scroll(rows, cols);
+            fx.repaint |= self.ui.tab.editor.scroll(rows, cols);
         } else if self.ui.hits.results.contains(at) {
             if sideways {
                 self.scroll_grid(0, step, fx);
@@ -708,7 +728,7 @@ impl App {
         } else if self.ui.hits.sidebar_list.contains(at) {
             self.click_sidebar_row(x, y, now, fx);
         } else if self.ui.hits.results.contains(at) {
-            if self.ui.grid.bar.contains(at) {
+            if self.ui.tab.grid.bar.contains(at) {
                 self.ui.clicks.forget();
                 self.ui.drag = self.press_grid_bar(y, fx);
             } else {
@@ -725,11 +745,11 @@ impl App {
         } else if self.ui.hits.editor_text.contains(at) {
             let text = self.ui.hits.editor_text;
             let (col, row) = ((x - text.x) as i32, (y - text.y) as i32);
-            let line = self.ui.editor.row_at(col, row);
+            let line = self.ui.tab.editor.row_at(col, row);
             let changed = if self.ui.clicks.press(now, ClickKey::Text(line, 0)) {
-                self.ui.editor.select_word(col, row)
+                self.ui.tab.editor.select_word(col, row)
             } else {
-                self.ui.editor.click(col, row)
+                self.ui.tab.editor.click(col, row)
             };
             fx.repaint |= changed;
             self.ui.drag = Some(Drag::EditorSelect);
@@ -751,7 +771,7 @@ impl App {
             Some(Drag::GridBar { grab }) => self.drag_grid_bar(y, grab, fx),
             Some(Drag::EditorSelect) => {
                 let text = self.ui.hits.editor_text;
-                fx.repaint |= self.ui.editor.drag(i32::from(x) - i32::from(text.x), i32::from(y) - i32::from(text.y));
+                fx.repaint |= self.ui.tab.editor.drag(i32::from(x) - i32::from(text.x), i32::from(y) - i32::from(text.y));
             }
             None => {}
         }
@@ -761,7 +781,7 @@ impl App {
     fn on_release(&mut self, fx: &mut Effects) {
         match self.ui.drag.take() {
             Some(Drag::Sidebar | Drag::Split) => self.save_layout(fx),
-            Some(Drag::EditorSelect) => fx.repaint |= self.ui.editor.end_drag(),
+            Some(Drag::EditorSelect) => fx.repaint |= self.ui.tab.editor.end_drag(),
             _ => {}
         }
     }
@@ -930,9 +950,9 @@ impl App {
         // except that a cancelled run's last word says it has ended.
         let target = match self.model.requests.settle(id) {
             Settled::Current(target) => target,
-            Settled::Stale(Target::Run(_)) => {
+            Settled::Stale(Target::Run(tab)) => {
                 if let CoreReply::Ran(result) = reply {
-                    self.on_ran_after_cancel(id, result, fx);
+                    self.on_ran_after_cancel(tab, id, result, fx);
                 }
                 return;
             }
@@ -943,11 +963,18 @@ impl App {
             (Target::TestConnection(serial), CoreReply::Tested(result)) => self.on_tested(serial, result),
             (Target::SaveConnection(serial), CoreReply::Saved(result)) => self.on_saved(serial, result, fx),
             (Target::RemoveConnection(id), CoreReply::Removed(result)) => self.on_removed(id, result, fx),
-            (Target::Run(_), CoreReply::Ran(result)) => self.on_ran(result, fx),
-            (Target::Complete(need), reply) => {
+            (Target::Run(tab), CoreReply::Ran(result)) => {
+                self.on_ran_in(tab, result, fx);
+                // A tab that is not on screen changed out of sight.
+                if !self.is_active(tab) {
+                    return;
+                }
+            }
+            (Target::Complete(tab, need), reply) => {
                 // Whether the screen changed is its own business: a reply for
-                // a word the caret has left repaints nothing.
-                if self.on_complete_reply(need, reply, fx) {
+                // a word the caret has left, or for a tab not on screen,
+                // repaints nothing.
+                if self.on_complete_reply(tab, need, reply, fx) {
                     fx.repaint = true;
                 }
                 return;
@@ -974,8 +1001,15 @@ impl App {
                 for gone in self.model.schema.connections().into_iter().filter(|c| !list.iter().any(|k| &k.id == c)) {
                     self.forget_connection(&gone, fx);
                 }
-                if let Some(t) = self.tab().target.clone().filter(|t| !list.iter().any(|k| k.id == t.connection)) {
-                    self.connection_removed(&t.connection, fx);
+                let gone: Vec<ConnectionId> = self
+                    .model
+                    .tabs
+                    .iter()
+                    .filter_map(|t| t.target.as_ref().map(|t| t.connection.clone()))
+                    .filter(|c| !list.iter().any(|k| &k.id == c))
+                    .collect();
+                for c in gone {
+                    self.connection_removed(&c, fx);
                 }
                 Loadable::Ready(list)
             }

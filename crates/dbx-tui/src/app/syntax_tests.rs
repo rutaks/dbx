@@ -14,7 +14,7 @@ use crate::harness::Harness;
 /// caret at the end of it.
 async fn editor_with(text: &str) -> Harness {
     let mut h = on_pagila().await;
-    h.app.ui.editor.set_text(text);
+    h.app.ui.tab.editor.set_text(text);
     frame_rows(&mut h.app, 114, 30);
     h
 }
@@ -183,7 +183,7 @@ async fn a_selection_is_what_runs_so_no_statement_is_outlined_then() {
 async fn without_a_target_nothing_is_outlined_but_the_text_is_still_coloured() {
     let mut h = started_without_target().await;
     h.press("ctrl+g l");
-    h.app.ui.editor.set_text("select 1;");
+    h.app.ui.tab.editor.set_text("select 1;");
     frame_rows(&mut h.app, 114, 30);
     assert_eq!(bar_rows(&mut h), Vec::<u16>::new());
     assert_eq!(fg(&mut h, 0, 0), Some(Role::SynKeyword));
@@ -237,17 +237,17 @@ async fn a_5000_line_buffer_is_tokenized_once_per_edit_and_not_per_redraw_or_car
     let text: String = (0..5000).map(|i| format!("select {i}, 'x' from t;")).collect::<Vec<_>>().join("\n");
     let mut h = editor_with(&text).await;
     frame_rows(&mut h.app, 114, 30);
-    let first = h.app.ui.syntax.stats();
+    let first = h.app.ui.tab.syntax.stats();
     assert_eq!(first.lines_tokenized, 5000 * first.runs, "{first:?}");
     frame_rows(&mut h.app, 114, 30);
     h.press("up up left home");
     frame_rows(&mut h.app, 114, 30);
     h.press("pageup");
     frame_rows(&mut h.app, 114, 30);
-    assert_eq!(h.app.ui.syntax.stats(), first, "redraws and caret moves tokenize nothing");
+    assert_eq!(h.app.ui.tab.syntax.stats(), first, "redraws and caret moves tokenize nothing");
     h.type_text("x");
     frame_rows(&mut h.app, 114, 30);
-    let after = h.app.ui.syntax.stats();
+    let after = h.app.ui.tab.syntax.stats();
     assert_eq!(after.runs, first.runs + 1, "{first:?} -> {after:?}");
     // The view is far from the top, and the colours are right where it is.
     let t = h.app.ui.hits.editor_text;
@@ -262,7 +262,7 @@ async fn a_comment_opened_far_above_the_view_colours_what_is_in_view_as_comment(
     let mut h = editor_with(&lines.join("\n")).await;
     frame_rows(&mut h.app, 114, 30);
     frame_rows(&mut h.app, 114, 30);
-    assert!(h.app.ui.editor.scroll_top().0 > 900, "the view is far below the comment's start");
+    assert!(h.app.ui.tab.editor.scroll_top().0 > 900, "the view is far below the comment's start");
     let t = h.app.ui.hits.editor_text;
     assert_eq!(role_at(&mut h.app, t.x + 2, t.y + 3).fg, Some(Role::SynComment));
 }
@@ -275,7 +275,7 @@ async fn painting_a_very_long_line_walks_only_what_fits_on_screen_and_still_draw
     h.press("up home");
     frame_rows(&mut h.app, 114, 30);
     let t = h.app.ui.hits.editor_text;
-    let walked = h.app.ui.syntax.graphemes_painted;
+    let walked = h.app.ui.tab.syntax.graphemes_painted;
     assert!(walked < 2 * t.width as usize + 20, "walked {walked} graphemes for a {} column pane", t.width);
     // The caret (reversed) is at the start of the long line.
     let (x, y) = at(&h, 0, 0);
@@ -284,6 +284,6 @@ async fn painting_a_very_long_line_walks_only_what_fits_on_screen_and_still_draw
     // A selection running past the line's end must not make it walk it all.
     h.press("shift+down");
     frame_rows(&mut h.app, 114, 30);
-    let walked = h.app.ui.syntax.graphemes_painted;
+    let walked = h.app.ui.tab.syntax.graphemes_painted;
     assert!(walked < 2 * t.width as usize + 40, "walked {walked} with a selection");
 }

@@ -959,23 +959,27 @@ async fn a_failed_removal_does_not_replace_the_overlay_that_is_open_and_is_still
 }
 
 #[tokio::test]
-async fn a_hundred_thousand_characters_pasted_into_a_field_are_cut_at_4_kib_and_draw_fast() {
+async fn a_hundred_thousand_characters_pasted_into_a_field_are_cut_at_4_kib_and_draw_in_bounded_work() {
     let mut h = empty().await;
     h.press("ctrl+g n tab");
     let big = "x".repeat(100_000);
-    let started = std::time::Instant::now();
+    // Work is counted, not timed: the field is cut to 4096 characters, and
+    // drawing it reads them a bounded number of times over (never the 100 000).
+    let steps = || super::text_field::WINDOW_STEPS.with(|s| s.get());
+    let before = steps();
     let fx = h.app.update(Event::Paste(big), base());
     h.run(fx);
     let rows = screen(&mut h);
-    let took = started.elapsed();
-    assert!(took < Duration::from_millis(50), "paste and render took {took:?}");
+    let worked = steps() - before;
+    assert!(worked <= 4 * 4_096, "paste and render read the field {worked} times for 4096 characters");
     let text = rows.join("\n");
     assert!(text.contains("cut at 4096 characters"), "the cut is shown: {text}");
     h.press("ctrl+a");
     h.type_text("y");
-    let started = std::time::Instant::now();
+    let before = steps();
     let _ = screen(&mut h);
-    assert!(started.elapsed() < Duration::from_millis(50));
+    let worked = steps() - before;
+    assert!(worked <= 4 * 4_096, "a redraw read the field {worked} times");
 }
 
 #[tokio::test]

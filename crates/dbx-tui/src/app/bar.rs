@@ -93,25 +93,25 @@ fn key(c: Cursor) -> (usize, usize) {
 impl App {
     /// Whether the bar is open and the editor is where keys go.
     pub(super) fn bar_open(&self) -> bool {
-        self.ui.bar.is_some() && self.ui.focus == PaneId::Editor
+        self.ui.tab.bar.is_some() && self.ui.focus == PaneId::Editor
     }
 
     /// Opens (or steps) the find bar, or opens go to line.
     pub(super) fn bar_action(&mut self, action: Action, fx: &mut Effects) {
         match action {
             Action::GotoLine => {
-                let origin = self.ui.editor.cursor();
-                self.ui.bar = Some(Bar::new(BarKind::Goto, "", origin));
+                let origin = self.ui.tab.editor.cursor();
+                self.ui.tab.bar = Some(Bar::new(BarKind::Goto, "", origin));
                 fx.repaint = true;
             }
             Action::Find => {
-                if matches!(&self.ui.bar, Some(b) if b.kind == BarKind::Find) {
+                if matches!(&self.ui.tab.bar, Some(b) if b.kind == BarKind::Find) {
                     return;
                 }
                 self.open_find(fx);
             }
             Action::FindNext | Action::FindPrev => {
-                if !matches!(&self.ui.bar, Some(b) if b.kind == BarKind::Find) {
+                if !matches!(&self.ui.tab.bar, Some(b) if b.kind == BarKind::Find) {
                     self.open_find(fx);
                 }
                 self.step_match(action == Action::FindNext, fx);
@@ -123,15 +123,15 @@ impl App {
     /// The find bar, with the selected text as the query when it is on one line,
     /// else the last one searched for.
     fn open_find(&mut self, fx: &mut Effects) {
-        let doc = self.ui.editor.doc();
+        let doc = self.ui.tab.editor.doc();
         let selected = doc.sel().filter(|(a, b)| a.row == b.row).map(|(a, b)| doc.text_of(a, b));
         let origin = doc.sel().map_or(doc.caret, |(a, _)| a);
-        let text = selected.unwrap_or_else(|| self.ui.last_find.clone());
+        let text = selected.unwrap_or_else(|| self.ui.tab.last_find.clone());
         let mut bar = Bar::new(BarKind::Find, &text, origin);
         self.refresh_matches(&mut bar);
         // The selection already on a match is the current one.
         bar.current = doc.sel().and_then(|s| bar.matches.iter().position(|m| *m == s));
-        self.ui.bar = Some(bar);
+        self.ui.tab.bar = Some(bar);
         fx.repaint = true;
     }
 
@@ -140,11 +140,11 @@ impl App {
         if bar.kind != BarKind::Find {
             return;
         }
-        let stamp = (self.ui.editor.revision(), bar.field.text().to_string());
+        let stamp = (self.ui.tab.editor.revision(), bar.field.text().to_string());
         if bar.stamp.as_ref() == Some(&stamp) {
             return;
         }
-        bar.matches = find_matches(self.ui.editor.lines(), &stamp.1);
+        bar.matches = find_matches(self.ui.tab.editor.lines(), &stamp.1);
         bar.stamp = Some(stamp);
         if bar.current.is_some_and(|i| i >= bar.matches.len()) {
             bar.current = None;
@@ -153,27 +153,27 @@ impl App {
 
     /// Called by the view: matches follow edits made while the bar is open.
     pub(super) fn refresh_bar(&mut self) {
-        if let Some(mut bar) = self.ui.bar.take() {
+        if let Some(mut bar) = self.ui.tab.bar.take() {
             self.refresh_matches(&mut bar);
-            self.ui.bar = Some(bar);
+            self.ui.tab.bar = Some(bar);
         }
     }
 
     /// Selects match `i`, the caret at its end.
     fn select_match(&mut self, i: usize, fx: &mut Effects) {
-        let Some(bar) = &mut self.ui.bar else { return };
+        let Some(bar) = &mut self.ui.tab.bar else { return };
         let Some(&(a, b)) = bar.matches.get(i) else { return };
         bar.current = Some(i);
-        self.ui.editor.select_range(a, b);
+        self.ui.tab.editor.select_range(a, b);
         fx.repaint = true;
     }
 
     /// The next (or previous) match after the one selected, wrapping round.
     fn step_match(&mut self, forward: bool, fx: &mut Effects) {
-        let Some(mut bar) = self.ui.bar.take() else { return };
+        let Some(mut bar) = self.ui.tab.bar.take() else { return };
         self.refresh_matches(&mut bar);
         let n = bar.matches.len();
-        let doc = self.ui.editor.doc();
+        let doc = self.ui.tab.editor.doc();
         let on = doc.sel().and_then(|s| bar.matches.iter().position(|m| *m == s));
         let (from, to) = doc.sel().unwrap_or((doc.caret, doc.caret));
         let next = if n == 0 {
@@ -185,24 +185,24 @@ impl App {
         } else {
             Some(bar.matches.iter().rposition(|(_, b)| key(*b) <= key(from)).unwrap_or(n - 1))
         };
-        self.ui.bar = Some(bar);
+        self.ui.tab.bar = Some(bar);
         match next {
             Some(i) => self.select_match(i, fx),
             None => fx.repaint = true,
         }
-        if let Some(b) = &self.ui.bar {
-            self.ui.last_find = b.field.text().to_string();
+        if let Some(b) = &self.ui.tab.bar {
+            self.ui.tab.last_find = b.field.text().to_string();
         }
     }
 
     /// The query changed: the first match from where the bar opened is selected.
     fn query_changed(&mut self, fx: &mut Effects) {
-        let Some(mut bar) = self.ui.bar.take() else { return };
+        let Some(mut bar) = self.ui.tab.bar.take() else { return };
         self.refresh_matches(&mut bar);
         let first = bar.matches.iter().position(|(a, _)| key(*a) >= key(bar.origin)).or(if bar.matches.is_empty() { None } else { Some(0) });
         bar.current = None;
-        self.ui.last_find = bar.field.text().to_string();
-        self.ui.bar = Some(bar);
+        self.ui.tab.last_find = bar.field.text().to_string();
+        self.ui.tab.bar = Some(bar);
         if let Some(i) = first {
             self.select_match(i, fx);
         }
@@ -212,9 +212,9 @@ impl App {
     /// A key while the bar is open: everything but the prefix and the direct
     /// keys (which were taken before) is the bar's.
     pub(super) fn bar_key(&mut self, key: &KeyEvent, combo: &KeyCombo, fx: &mut Effects) {
-        let Some(kind) = self.ui.bar.as_ref().map(|b| b.kind) else { return };
+        let Some(kind) = self.ui.tab.bar.as_ref().map(|b| b.kind) else { return };
         if combo.code == KeyCode::Esc && combo.mods.is_empty() {
-            self.ui.bar = None;
+            self.ui.tab.bar = None;
             fx.repaint = true;
             return;
         }
@@ -236,7 +236,7 @@ impl App {
         if kind == BarKind::Goto && matches!(combo.code, KeyCode::Char(c) if !c.is_ascii_digit()) {
             return;
         }
-        let Some(bar) = &mut self.ui.bar else { return };
+        let Some(bar) = &mut self.ui.tab.bar else { return };
         match bar.field.handle_key(key) {
             Edit::Changed if kind == BarKind::Find => self.query_changed(fx),
             Edit::Ignored => {}
@@ -246,7 +246,7 @@ impl App {
 
     /// A paste while the bar is open goes into its field.
     pub(super) fn bar_paste(&mut self, text: &str, fx: &mut Effects) {
-        let Some(bar) = &mut self.ui.bar else { return };
+        let Some(bar) = &mut self.ui.tab.bar else { return };
         let kind = bar.kind;
         if kind == BarKind::Goto {
             let digits: String = text.chars().filter(char::is_ascii_digit).collect();
@@ -259,11 +259,11 @@ impl App {
     }
 
     fn go_to_line(&mut self, fx: &mut Effects) {
-        let Some(bar) = &self.ui.bar else { return };
+        let Some(bar) = &self.ui.tab.bar else { return };
         let Ok(n) = bar.field.text().parse::<usize>() else { return };
-        let row = n.saturating_sub(1).min(self.ui.editor.lines().len().saturating_sub(1));
-        self.ui.bar = None;
-        self.ui.editor.move_to(Cursor { row, col: 0 });
+        let row = n.saturating_sub(1).min(self.ui.tab.editor.lines().len().saturating_sub(1));
+        self.ui.tab.bar = None;
+        self.ui.tab.editor.move_to(Cursor { row, col: 0 });
         fx.repaint = true;
     }
 }

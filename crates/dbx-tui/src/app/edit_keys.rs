@@ -57,7 +57,7 @@ impl App {
 
     /// Applies `f` to the document as one undo step.
     fn edit_doc(&mut self, fx: &mut Effects, f: impl FnOnce(&mut Doc) -> bool) {
-        match self.ui.editor.edit(f) {
+        match self.ui.tab.editor.edit(f) {
             Ok(changed) => fx.repaint |= changed,
             Err(why) => self.notify(format!("Not done: {why}."), true, fx),
         }
@@ -84,22 +84,22 @@ impl App {
             Action::LineComment => self.edit_doc(fx, edit_ops::toggle_line_comment),
             Action::BlockComment => self.edit_doc(fx, edit_ops::toggle_block_comment),
             Action::ExtendSelection => {
-                let text = self.ui.editor.text();
-                let statement = self.statement_range_at(&text, self.ui.editor.cursor());
-                fx.repaint |= self.ui.editor.extend_selection(statement);
+                let text = self.ui.tab.editor.text();
+                let statement = self.statement_range_at(&text, self.ui.tab.editor.cursor());
+                fx.repaint |= self.ui.tab.editor.extend_selection(statement);
             }
-            Action::ShrinkSelection => fx.repaint |= self.ui.editor.shrink_selection(),
+            Action::ShrinkSelection => fx.repaint |= self.ui.tab.editor.shrink_selection(),
             Action::SelectAll => self.edit_doc(fx, |d| {
                 edit_ops::select_all(d);
                 true
             }),
             Action::Undo => {
                 self.leave_template(fx);
-                fx.repaint |= self.ui.editor.undo();
+                fx.repaint |= self.ui.tab.editor.undo();
             }
             Action::Redo => {
                 self.leave_template(fx);
-                fx.repaint |= self.ui.editor.redo();
+                fx.repaint |= self.ui.tab.editor.redo();
             }
             Action::Copy => self.copy_selection(false, fx),
             Action::Cut => self.copy_selection(true, fx),
@@ -141,13 +141,13 @@ impl App {
     }
 
     fn move_statement(&mut self, up: bool, fx: &mut Effects) {
-        let text = self.ui.editor.text();
+        let text = self.ui.tab.editor.text();
         let kind = self.active_kind().unwrap_or_default();
-        let mut doc = self.ui.editor.doc();
+        let mut doc = self.ui.tab.editor.doc();
         let syntax = &self.ui.syntax;
         let moved = edit_ops::move_statement(&mut doc, up, &|at| syntax.statement_at(&kind, &text, at));
         match moved {
-            Ok(true) => match self.ui.editor.apply(&doc) {
+            Ok(true) => match self.ui.tab.editor.apply(&doc) {
                 Ok(changed) => fx.repaint |= changed,
                 Err(why) => self.notify(format!("Not done: {why}."), true, fx),
             },
@@ -160,9 +160,9 @@ impl App {
     /// with `whole` the whole editor. The result is one undo step; text that
     /// does not tokenize is left alone with a notice.
     fn reformat(&mut self, whole: bool, fx: &mut Effects) {
-        let text = self.ui.editor.text();
+        let text = self.ui.tab.editor.text();
         let chars: Vec<char> = text.chars().collect();
-        let doc = self.ui.editor.doc();
+        let doc = self.ui.tab.editor.doc();
         let mut starts = vec![0usize];
         starts.extend(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1));
         let off = |c: Cursor| starts[c.row.min(starts.len() - 1)] + c.col;
@@ -236,7 +236,7 @@ impl App {
             Cursor { row: row.min(lines.len() - 1), col: left }
         };
         let doc = Doc::from_lines(&lines, new_anchor.map(at), at(new_caret));
-        match self.ui.editor.apply(&doc) {
+        match self.ui.tab.editor.apply(&doc) {
             Ok(changed) => fx.repaint |= changed,
             Err(why) => self.notify(format!("Not done: {why}."), true, fx),
         }
@@ -244,13 +244,13 @@ impl App {
 
     fn matching_brace(&mut self, fx: &mut Effects) {
         let (kind, dialect) = (self.active_kind(), self.active_dialect());
-        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref(), dialect);
-        let caret = self.ui.editor.cursor();
-        let Some([here, partner]) = super::highlight::matching_bracket(self.ui.syntax.colours(), caret) else { return };
+        self.ui.tab.syntax.refresh(&mut self.ui.syntax, &self.ui.tab.editor, kind.as_ref(), dialect);
+        let caret = self.ui.tab.editor.cursor();
+        let Some([here, partner]) = super::highlight::matching_bracket(self.ui.tab.syntax.colours(), caret) else { return };
         // Beside the partner, on the outside of the pair.
         let after = (partner.0, partner.1) > (here.0, here.1);
         let to = Cursor { row: partner.0, col: if after { partner.1 + 1 } else { partner.1 } };
-        self.ui.editor.move_to(to);
+        self.ui.tab.editor.move_to(to);
         fx.repaint = true;
     }
 
@@ -258,7 +258,7 @@ impl App {
     /// break) on the terminal's clipboard; cut also removes it. A text over the
     /// clipboard's limit is refused, and not cut.
     pub(super) fn copy_selection(&mut self, cut: bool, fx: &mut Effects) {
-        let doc = self.ui.editor.doc();
+        let doc = self.ui.tab.editor.doc();
         let (text, what) = match doc.sel() {
             Some((a, b)) => (doc.text_of(a, b), "the selection"),
             None => (format!("{}\n", doc.lines()[doc.caret.row]), "the line"),
@@ -278,10 +278,10 @@ impl App {
     /// pass is the same cache).
     pub(super) fn caret_in_literal_now(&mut self) -> bool {
         let (kind, dialect) = (self.active_kind(), self.active_dialect());
-        self.ui.syntax.refresh(&self.ui.editor, kind.as_ref(), dialect);
-        let caret = self.ui.editor.cursor();
+        self.ui.tab.syntax.refresh(&mut self.ui.syntax, &self.ui.tab.editor, kind.as_ref(), dialect);
+        let caret = self.ui.tab.editor.cursor();
         let Some(before) = caret.col.checked_sub(1) else { return false };
-        let Some(span) = self.ui.syntax.colours().line(caret.row).and_then(|spans| spans.iter().find(|s| s.start <= before && before < s.end)).copied() else {
+        let Some(span) = self.ui.tab.syntax.colours().line(caret.row).and_then(|spans| spans.iter().find(|s| s.start <= before && before < s.end)).copied() else {
             return false;
         };
         if !matches!(span.role, Role::SynString | Role::SynComment) {
@@ -291,7 +291,7 @@ impl App {
             return true;
         }
         // At the end of the token: inside only when it is not closed.
-        let chars: Vec<char> = self.ui.editor.lines()[caret.row].chars().skip(span.start).take(span.end - span.start).collect();
+        let chars: Vec<char> = self.ui.tab.editor.lines()[caret.row].chars().skip(span.start).take(span.end - span.start).collect();
         match span.role {
             Role::SynString => !(chars.len() >= 2 && chars.first() == chars.last()),
             _ => {
@@ -307,7 +307,7 @@ impl App {
     /// (indentation) and `backspace` (an empty pair). Returns whether it did.
     pub(super) fn smart_key(&mut self, key: &KeyEvent, fx: &mut Effects) -> bool {
         let plain = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
-        if !plain || self.ui.template.active() {
+        if !plain || self.ui.tab.template.active() {
             return false;
         }
         let s = &self.model.settings;
@@ -316,8 +316,8 @@ impl App {
             KeyCode::Char(c) if auto_pair && matches!(c, '(' | '[' | ')' | ']' | '\'' | '"') => {
                 let in_literal = matches!(c, '\'' | '"') && self.caret_in_literal_now();
                 let mut handled = false;
-                let before = self.ui.editor.revision();
-                let result = self.ui.editor.edit(|d| match edit_ops::type_char(d, c, in_literal) {
+                let before = self.ui.tab.editor.revision();
+                let result = self.ui.tab.editor.edit(|d| match edit_ops::type_char(d, c, in_literal) {
                     Some(changed) => {
                         handled = true;
                         changed
@@ -325,7 +325,7 @@ impl App {
                     None => false,
                 });
                 match result {
-                    Ok(changed) => fx.repaint |= changed || self.ui.editor.revision() != before,
+                    Ok(changed) => fx.repaint |= changed || self.ui.tab.editor.revision() != before,
                     Err(why) => self.notify(format!("Not done: {why}."), true, fx),
                 }
                 handled
@@ -352,7 +352,7 @@ impl App {
     /// where the caret is in no subquery, the Core's own pick; inside one, as
     /// the setting says: ask, or the smallest.
     pub(super) fn run_requested(&mut self, now: Instant, fx: &mut Effects) {
-        if self.model.settings.run_at_caret == RunAtCaret::Statement || self.ui.editor.selection().is_some() {
+        if self.model.settings.run_at_caret == RunAtCaret::Statement || self.ui.tab.editor.selection().is_some() {
             return self.run_statement(now, fx);
         }
         let candidates = self.run_candidates();
@@ -375,15 +375,15 @@ impl App {
     /// What can run here, smallest first: the subquery (or CTE) the caret is in,
     /// the statement, and the whole buffer. The whole buffer comes last.
     fn run_candidates(&mut self) -> Vec<Candidate> {
-        let text = self.ui.editor.text();
-        let caret = self.ui.editor.cursor();
+        let text = self.ui.tab.editor.text();
+        let caret = self.ui.tab.editor.cursor();
         let Some(statement) = self.statement_range_at(&text, caret) else { return Vec::new() };
-        let scope = super::complete_context::analyse(self.ui.editor.lines(), caret).scope;
+        let scope = super::complete_context::analyse(self.ui.tab.editor.lines(), caret).scope;
         let mut out = Vec::new();
         // The subquery: the innermost block when a `(` stands right before it,
         // up to the `)` that closes it (the block's own range stops short of its
         // last token, so the text is scanned for the closing parenthesis).
-        let around = scope.levels.first().and_then(|l| parenthesised(self.ui.editor.lines(), l.range.0));
+        let around = scope.levels.first().and_then(|l| parenthesised(self.ui.tab.editor.lines(), l.range.0));
         if let Some(inner) = around {
             let strictly_inside = (inner.0.row, inner.0.col) >= (statement.0.row, statement.0.col)
                 && (inner.1.row, inner.1.col) <= (statement.1.row, statement.1.col)
@@ -394,7 +394,7 @@ impl App {
             }
         }
         out.push(Candidate::new("statement", &text, statement));
-        let rows = self.ui.editor.lines();
+        let rows = self.ui.tab.editor.lines();
         let last = rows.len().saturating_sub(1);
         let end = Cursor { row: last, col: rows.get(last).map_or(0, |l| l.chars().count()) };
         out.push(Candidate::new("all", &text, (Cursor::default(), end)));

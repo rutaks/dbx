@@ -9,12 +9,12 @@ use crate::core::Cursor;
 use crate::harness::Harness;
 
 fn caret(h: &Harness) -> (usize, usize) {
-    let c = h.app.ui.editor.cursor();
+    let c = h.app.ui.tab.editor.cursor();
     (c.row, c.col)
 }
 
 fn templates(h: &Harness) -> Vec<String> {
-    h.app.ui.complete.popup.items().iter().filter(|i| i.kind == ItemKind::Template).map(|i| i.name.clone()).collect()
+    h.app.ui.tab.complete.popup.items().iter().filter(|i| i.kind == ItemKind::Template).map(|i| i.name.clone()).collect()
 }
 
 /// Types `abbr` at an empty statement and expands it with `tab`.
@@ -32,16 +32,16 @@ async fn sel_then_tab_expands_with_the_caret_on_the_table_variable_and_tab_moves
     expanded(&mut h, "sel").await;
     assert_eq!(text(&h), "select * from ;");
     assert_eq!(caret(&h), (0, 14), "on the table variable");
-    assert!(h.app.ui.template.active());
+    assert!(h.app.ui.tab.template.active());
     type_and_settle(&mut h, "fil").await;
     assert!(visible(&h), "a variable that names a table opens the normal table completion");
     assert_eq!(names(&h)[0], "film");
     h.press("tab");
     assert_eq!(text(&h), "select * from film;", "tab accepts the table; a template adds no alias of its own");
-    assert!(h.app.ui.template.active());
+    assert!(h.app.ui.tab.template.active());
     h.press("tab");
     assert_eq!(caret(&h), (0, 19), "the last tab puts the caret at the template's end");
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
     assert_eq!(text(&h), "select * from film;");
 }
 
@@ -52,9 +52,9 @@ async fn esc_leaves_template_mode_and_keeps_the_text() {
     type_and_settle(&mut h, "fi").await;
     assert!(visible(&h));
     h.press("esc");
-    assert!(!visible(&h) && h.app.ui.template.active(), "the first esc closes only the popup");
+    assert!(!visible(&h) && h.app.ui.tab.template.active(), "the first esc closes only the popup");
     h.press("esc");
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
     assert_eq!(text(&h), "select * from fi;");
 }
 
@@ -63,15 +63,15 @@ async fn a_template_the_word_is_exactly_comes_first_highlighted_with_its_preview
     for key in ["enter", "tab"] {
         let mut h = editing(pagila()).await;
         type_and_settle(&mut h, "del").await;
-        let first = h.app.ui.complete.popup.items()[0].clone();
+        let first = h.app.ui.tab.complete.popup.items()[0].clone();
         assert_eq!((first.name.as_str(), first.kind), ("del", ItemKind::Template), "{:?}", names(&h));
-        assert_eq!(h.app.ui.complete.popup.selected_item().map(|i| i.name.clone()), Some("del".into()), "highlighted");
+        assert_eq!(h.app.ui.tab.complete.popup.selected_item().map(|i| i.name.clone()), Some("del".into()), "highlighted");
         assert!(first.detail.as_deref().is_some_and(|d| d.starts_with("delete from")), "a preview of the expansion: {first:?}");
         let screen = super::testing::frame_rows(&mut h.app, 114, 30).join("\n");
         assert!(screen.contains("template") && screen.contains("delete from"), "{screen}");
         h.press(key);
         assert_eq!(text(&h), "delete from  where ;", "{key}");
-        assert!(h.app.ui.template.active(), "{key}");
+        assert!(h.app.ui.tab.template.active(), "{key}");
     }
     // A template that is the only match is shown too, and enter expands it.
     let mut h = editing(pagila()).await;
@@ -109,7 +109,7 @@ async fn templates_are_offered_only_where_a_statement_starts() {
     type_and_settle(&mut h, "select * from sel").await;
     assert!(templates(&h).is_empty(), "{:?}", names(&h));
     h.press("tab");
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
     assert!(!text(&h).contains("select * from select * from"), "{}", text(&h));
     let mut h = editing(pagila()).await;
     type_and_settle(&mut h, "select 1; del").await;
@@ -120,10 +120,10 @@ async fn templates_are_offered_only_where_a_statement_starts() {
     assert!(templates(&h).is_empty(), "{:?}", names(&h));
     h.press("tab");
     assert!(text(&h).starts_with("drop table ins") && !text(&h).contains("insert"), "{}", text(&h));
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
     // A comment before the word is not a statement.
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("-- note\n/* x */ ");
+    h.app.ui.tab.editor.set_text("-- note\n/* x */ ");
     h.press("ctrl+end");
     type_and_settle(&mut h, "del").await;
     h.press("tab");
@@ -144,12 +144,12 @@ async fn selw_shares_its_alias_between_its_places_and_shift_tab_goes_back() {
     h.press("tab");
     assert_eq!(text(&h), "select * from film f where f.;", "accepting the table fills the alias");
     h.press("tab");
-    assert_eq!(h.app.ui.editor.selection(), Some((Cursor { row: 0, col: 19 }, Cursor { row: 0, col: 20 })), "a filled variable is selected: typing replaces it");
+    assert_eq!(h.app.ui.tab.editor.selection(), Some((Cursor { row: 0, col: 19 }, Cursor { row: 0, col: 20 })), "a filled variable is selected: typing replaces it");
     h.type_text("x");
     assert_eq!(text(&h), "select * from film x where x.;", "typing in one place types in both");
     h.press("tab");
     assert_eq!(caret(&h), (0, 29), "after the dot: where the template ends");
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
 }
 
 #[tokio::test]
@@ -165,15 +165,15 @@ async fn typing_in_the_first_place_of_a_shared_variable_fills_the_other() {
 #[tokio::test]
 async fn moving_the_caret_out_of_the_template_leaves_template_mode_and_keeps_the_text() {
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select 1;\nsel");
+    h.app.ui.tab.editor.set_text("select 1;\nsel");
     h.press("tab");
     h.settle().await;
     assert_eq!(text(&h), "select 1;\nselect * from ;");
-    assert!(h.app.ui.template.active());
+    assert!(h.app.ui.tab.template.active());
     h.press("left");
-    assert!(h.app.ui.template.active(), "inside the template");
+    assert!(h.app.ui.tab.template.active(), "inside the template");
     h.press("up");
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
     assert_eq!(text(&h), "select 1;\nselect * from ;");
 }
 
@@ -184,7 +184,7 @@ async fn the_whole_expansion_is_one_undo_step() {
     assert_eq!(text(&h), "select * from ;");
     h.press("ctrl+z");
     assert_eq!(text(&h), "sel", "one undo gives back what was typed");
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
     h.press("ctrl+shift+z");
     assert_eq!(text(&h), "select * from ;");
 }
@@ -196,9 +196,9 @@ async fn an_undo_or_a_redo_leaves_template_mode_and_then_undoes_without_being_mi
     h.press("tab");
     h.type_text("ab");
     assert_eq!(text(&h), "select * from  ab where ab.;");
-    assert!(h.app.ui.template.active());
+    assert!(h.app.ui.tab.template.active());
     h.press("ctrl+z");
-    assert!(!h.app.ui.template.active(), "an undo ends template mode");
+    assert!(!h.app.ui.tab.template.active(), "an undo ends template mode");
     // From here undo is the editor's own: it walks back to what was typed.
     for _ in 0..30 {
         h.press("ctrl+z");
@@ -208,7 +208,7 @@ async fn an_undo_or_a_redo_leaves_template_mode_and_then_undoes_without_being_mi
         h.press("ctrl+shift+z");
     }
     assert_eq!(text(&h), "select * from  ab where ab.;", "and redo walks forward");
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
     // A redo also leaves the mode.
     let mut h = editing(pagila()).await;
     expanded(&mut h, "selw").await;
@@ -216,7 +216,7 @@ async fn an_undo_or_a_redo_leaves_template_mode_and_then_undoes_without_being_mi
     h.type_text("a");
     h.press("ctrl+z");
     h.press("ctrl+shift+z");
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
 }
 
 #[tokio::test]
@@ -248,7 +248,7 @@ async fn a_column_list_that_comes_late_is_written_only_while_its_table_is_still_
     h.press("shift+tab");
     h.type_text("film_actor");
     h.settle().await;
-    assert!(h.app.ui.template.active());
+    assert!(h.app.ui.tab.template.active());
     // film's reply arrives: it is not written under `film_actor`.
     tokio::time::advance(Duration::from_secs(6)).await;
     h.settle().await;
@@ -303,7 +303,7 @@ async fn film_dot_from_then_tab_becomes_select_from_film_with_the_caret_after_se
     h.press("tab");
     assert_eq!(text(&h), "select  from film");
     assert_eq!(caret(&h), (0, 7));
-    assert!(!h.app.ui.template.active());
+    assert!(!h.app.ui.tab.template.active());
 }
 
 #[tokio::test]

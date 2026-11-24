@@ -387,10 +387,10 @@ async fn editing() -> Harness {
 }
 
 fn set(h: &mut Harness, text: &str, anchor: Option<Cursor>, caret: Cursor) {
-    h.app.ui.editor.set_text(text);
+    h.app.ui.tab.editor.set_text(text);
     match anchor {
-        Some(a) => h.app.ui.editor.select_range(a, caret),
-        None => h.app.ui.editor.move_to(caret),
+        Some(a) => h.app.ui.tab.editor.select_range(a, caret),
+        None => h.app.ui.tab.editor.move_to(caret),
     }
 }
 
@@ -410,15 +410,15 @@ async fn every_reformat_key_formats_the_statement_under_the_caret_and_one_undo_r
         set(&mut h, before, None, c(1, 8));
         h.press(keys);
         assert_eq!(
-            h.app.ui.editor.text(),
+            h.app.ui.tab.editor.text(),
             "select 1;\nselect\n    a,\n    b\nfrom t\nwhere x = 1\n    and y = 2;\nselect 3",
             "{keys}"
         );
-        assert_eq!(h.app.ui.editor.cursor(), c(2, 5), "{keys}: the caret stays right after the `a` it was after");
+        assert_eq!(h.app.ui.tab.editor.cursor(), c(2, 5), "{keys}: the caret stays right after the `a` it was after");
         h.press("ctrl+z");
-        assert_eq!(h.app.ui.editor.text(), before, "{keys}: one undo restores the text exactly");
+        assert_eq!(h.app.ui.tab.editor.text(), before, "{keys}: one undo restores the text exactly");
         h.press("ctrl+shift+z");
-        assert!(h.app.ui.editor.text().contains("from t\nwhere"), "{keys}: and redo formats again");
+        assert!(h.app.ui.tab.editor.text().contains("from t\nwhere"), "{keys}: and redo formats again");
     }
 }
 
@@ -428,9 +428,9 @@ async fn the_second_action_formats_the_whole_editor() {
     let before = "select a from t;select b from u\n";
     set(&mut h, before, None, c(0, 3));
     h.press("ctrl+g +");
-    assert_eq!(h.app.ui.editor.text(), "select\n    a\nfrom t;\n\nselect\n    b\nfrom u\n");
+    assert_eq!(h.app.ui.tab.editor.text(), "select\n    a\nfrom t;\n\nselect\n    b\nfrom u\n");
     h.press("ctrl+z");
-    assert_eq!(h.app.ui.editor.text(), before);
+    assert_eq!(h.app.ui.tab.editor.text(), before);
 }
 
 #[tokio::test]
@@ -440,13 +440,13 @@ async fn with_a_selection_only_the_selection_changes_and_stays_selected() {
     set(&mut h, before, Some(c(1, 2)), c(1, 30));
     h.press("cmd+alt+l");
     assert_eq!(
-        h.app.ui.editor.text(),
+        h.app.ui.tab.editor.text(),
         "select 1 from t;\n  select\n      a,\n      b\n  from u\n  where x = 1;\nselect 3 from v"
     );
-    let (a, b) = h.app.ui.editor.selection().expect("still selected");
+    let (a, b) = h.app.ui.tab.editor.selection().expect("still selected");
     assert_eq!((a, b), (c(1, 2), c(5, 14)));
     h.press("ctrl+z");
-    assert_eq!(h.app.ui.editor.text(), before);
+    assert_eq!(h.app.ui.tab.editor.text(), before);
 }
 
 #[tokio::test]
@@ -455,7 +455,7 @@ async fn keyword_case_is_a_setting_and_a_quoted_column_named_select_does_not_cha
     h.app.model.settings = Settings { format_keyword_case: KeywordCase::Upper, ..Settings::default() };
     set(&mut h, "select \"select\" from t", None, c(0, 0));
     h.press("ctrl+g =");
-    assert_eq!(h.app.ui.editor.text(), "SELECT\n    \"select\"\nFROM t");
+    assert_eq!(h.app.ui.tab.editor.text(), "SELECT\n    \"select\"\nFROM t");
 }
 
 #[tokio::test]
@@ -463,13 +463,13 @@ async fn an_unterminated_string_leaves_the_buffer_untouched_and_raises_one_notic
     let mut h = editing().await;
     let before = "select a,b from t where x='oops";
     set(&mut h, before, None, c(0, 4));
-    let rev = h.app.ui.editor.revision();
+    let rev = h.app.ui.tab.editor.revision();
     h.press("ctrl+alt+l");
-    assert_eq!(h.app.ui.editor.text(), before);
-    assert_eq!(h.app.ui.editor.revision(), rev, "not even a no-op edit");
+    assert_eq!(h.app.ui.tab.editor.text(), before);
+    assert_eq!(h.app.ui.tab.editor.revision(), rev, "not even a no-op edit");
     let notice = notices(&h).expect("a notice");
     assert!(notice.contains("Not reformatted") && notice.to_lowercase().contains("unterminated"), "{notice}");
-    assert!(!h.app.ui.editor.undo(), "and no undo step was made");
+    assert!(!h.app.ui.tab.editor.undo(), "and no undo step was made");
 }
 
 #[tokio::test]
@@ -478,9 +478,9 @@ async fn text_already_formatted_is_left_alone_with_no_undo_step() {
     let before = "select\n    a\nfrom t";
     set(&mut h, before, None, c(1, 5));
     h.press("ctrl+g =");
-    assert_eq!(h.app.ui.editor.text(), before);
-    assert_eq!(h.app.ui.editor.cursor(), c(1, 5));
-    assert!(!h.app.ui.editor.undo());
+    assert_eq!(h.app.ui.tab.editor.text(), before);
+    assert_eq!(h.app.ui.tab.editor.cursor(), c(1, 5));
+    assert!(!h.app.ui.tab.editor.undo());
 }
 
 #[tokio::test]
@@ -507,12 +507,12 @@ async fn a_selection_inside_a_string_comment_quoted_name_or_dollar_body_is_refus
         set(&mut h, text, None, c(0, 0));
         let flat = text.replace('\n', " ");
         let start = flat.find(picked).unwrap();
-        let rev = h.app.ui.editor.revision();
+        let rev = h.app.ui.tab.editor.revision();
         set(&mut h, text, Some(c(0, start)), c(0, start + picked.chars().count()));
         h.press("ctrl+alt+l");
-        assert_eq!(h.app.ui.editor.text(), text, "{text}");
-        assert_eq!(h.app.ui.editor.revision(), rev + 1, "{text}: only the set_text above");
-        assert!(!h.app.ui.editor.undo(), "{text}: no undo step");
+        assert_eq!(h.app.ui.tab.editor.text(), text, "{text}");
+        assert_eq!(h.app.ui.tab.editor.revision(), rev + 1, "{text}: only the set_text above");
+        assert!(!h.app.ui.tab.editor.undo(), "{text}: no undo step");
         let notice = notices(&h).unwrap_or_else(|| panic!("{text}: a notice"));
         assert!(notice.contains("Not reformatted") && notice.contains("select"), "{text}: {notice}");
     }
@@ -520,11 +520,11 @@ async fn a_selection_inside_a_string_comment_quoted_name_or_dollar_body_is_refus
     let mut h = editing().await;
     set(&mut h, "select 'a,b' as s,c from t", Some(c(0, 0)), c(0, 26));
     h.press("ctrl+alt+l");
-    assert_eq!(h.app.ui.editor.text(), "select\n    'a,b' as s,\n    c\nfrom t");
+    assert_eq!(h.app.ui.tab.editor.text(), "select\n    'a,b' as s,\n    c\nfrom t");
     // A selection ending in the middle of a word is not on a token boundary.
     let mut h = editing().await;
     set(&mut h, "select abc from t", Some(c(0, 0)), c(0, 9));
     h.press("ctrl+alt+l");
-    assert_eq!(h.app.ui.editor.text(), "select abc from t");
+    assert_eq!(h.app.ui.tab.editor.text(), "select abc from t");
     assert!(notices(&h).is_some());
 }

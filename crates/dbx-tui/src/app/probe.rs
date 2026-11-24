@@ -27,7 +27,8 @@ impl GridProbe {
     /// whole screen.
     pub fn new(set: ResultSet) -> Self {
         let mut app = App::new();
-        app.model.tabs[0].outcome = Some(Outcome::Rows(set));
+        let id = app.ui.tab.id;
+        app.model.active_mut(id).outcome = Some(Outcome::Rows(set));
         app.ui.focus = PaneId::Results;
         app.ui.zoomed = true;
         GridProbe { app }

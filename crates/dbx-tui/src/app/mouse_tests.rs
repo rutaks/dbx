@@ -425,9 +425,9 @@ async fn with_overlay(which: usize) -> Harness {
         0 => h.app.ui.overlay = Some(Overlay::Error(ErrorOverlay { title: "Store unavailable".into(), message: "Could not open it.".into() })),
         1 => h.app.ui.overlay = Some(Overlay::Failure(FailureOverlay { title: "Failed".into(), message: "It did not work.".into() })),
         2 => h.app.ui.overlay = Some(Overlay::ConfirmRemove(ConfirmRemove { id: cid("pg"), name: "pg".into() })),
-        3 => h.app.ui.overlay = Some(Overlay::ConfirmDropSession(ConfirmDropSession { target: "pg / edge".into(), stopped: false })),
-        4 => h.app.ui.overlay = Some(Overlay::ConfirmDropSession(ConfirmDropSession { target: "pg / edge".into(), stopped: true })),
-        5 => h.app.ui.overlay = Some(Overlay::ConfirmRerun(ConfirmRerun { statement: "select f()".into() })),
+        3 => h.app.ui.overlay = Some(Overlay::ConfirmDropSession(ConfirmDropSession { tab: TabId(1), target: "pg / edge".into(), stopped: false })),
+        4 => h.app.ui.overlay = Some(Overlay::ConfirmDropSession(ConfirmDropSession { tab: TabId(1), target: "pg / edge".into(), stopped: true })),
+        5 => h.app.ui.overlay = Some(Overlay::ConfirmRerun(ConfirmRerun { tab: TabId(1), statement: "select f()".into() })),
         6 => {
             h.press("ctrl+g n");
         }
@@ -473,7 +473,7 @@ async fn a_click_a_drag_or_the_wheel_outside_an_open_overlay_reaches_nothing_beh
     h.press("ctrl+g l");
     h.app.ui.overlay = Some(Overlay::Failure(FailureOverlay { title: "Failed".into(), message: "Nothing to see.".into() }));
     draw(&mut h);
-    let before = (h.app.ui.focus, h.app.ui.sidebar.cursor, h.app.ui.sidebar.scroll, h.app.ui.layout, h.app.ui.editor.cursor());
+    let before = (h.app.ui.focus, h.app.ui.sidebar.cursor, h.app.ui.sidebar.scroll, h.app.ui.layout, h.app.ui.tab.editor.cursor());
     let list = h.app.ui.hits.sidebar_list;
     let sep = h.app.ui.hits.sidebar_separator;
     let d = h.app.ui.hits.divider;
@@ -486,7 +486,7 @@ async fn a_click_a_drag_or_the_wheel_outside_an_open_overlay_reaches_nothing_beh
     }
     asked.extend(drag(&mut h, (sep.x, 5), (50, 5)));
     asked.extend(drag(&mut h, (d.x + 5, d.y), (d.x + 5, d.y + 4)));
-    let after = (h.app.ui.focus, h.app.ui.sidebar.cursor, h.app.ui.sidebar.scroll, h.app.ui.layout, h.app.ui.editor.cursor());
+    let after = (h.app.ui.focus, h.app.ui.sidebar.cursor, h.app.ui.sidebar.scroll, h.app.ui.layout, h.app.ui.tab.editor.cursor());
     assert_eq!(before, after, "nothing behind the overlay moved");
     assert!(asked.is_empty(), "no command: {asked:?}");
     assert!(h.app.ui.overlay.is_some(), "and the overlay is still open");
@@ -508,7 +508,7 @@ async fn a_drag_begun_before_an_overlay_opened_ends_when_the_button_goes_up_over
 
 async fn editor_with(text: &str) -> Harness {
     let mut h = plain().await;
-    h.app.ui.editor.set_text(text);
+    h.app.ui.tab.editor.set_text(text);
     draw(&mut h);
     h
 }
@@ -520,17 +520,17 @@ async fn a_click_in_the_editor_focuses_it_and_puts_the_caret_where_the_click_lan
     assert_eq!(h.app.ui.focus, PaneId::Sidebar);
     press_at(&mut h, text.x + 3, text.y, t0());
     assert_eq!(h.app.ui.focus, PaneId::Editor);
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 3 });
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 3 });
     press_at(&mut h, text.x + 4, text.y + 1, t0() + Duration::from_secs(5));
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 1, col: 4 });
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 1, col: 4 });
     // Past the end of a line and below the last one: the nearest place there is.
     press_at(&mut h, text.x + 40, text.y, t0() + Duration::from_secs(10));
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 11 });
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 11 });
     press_at(&mut h, text.x + 2, text.y + 9, t0() + Duration::from_secs(15));
-    assert_eq!(h.app.ui.editor.cursor().row, 1);
+    assert_eq!(h.app.ui.tab.editor.cursor().row, 1);
     // What is typed goes where the caret is.
     h.press("X");
-    assert!(h.app.ui.editor.text().contains("seXlect"), "{}", h.app.ui.editor.text());
+    assert!(h.app.ui.tab.editor.text().contains("seXlect"), "{}", h.app.ui.tab.editor.text());
 }
 
 #[tokio::test]
@@ -540,7 +540,7 @@ async fn the_editor_click_counts_wide_characters_by_their_cells() {
     // 日 takes cells 0-1, 本 cells 2-3, 語 cells 4-5, the space is cell 6.
     for (cell, char_index) in [(0u16, 0usize), (2, 1), (4, 2), (6, 3), (7, 4)] {
         press_at(&mut h, text.x + cell, text.y, t0() + Duration::from_secs(10 * (u64::from(cell) + 1)));
-        assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: char_index }, "cell {cell}");
+        assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: char_index }, "cell {cell}");
     }
 }
 
@@ -548,20 +548,20 @@ async fn the_editor_click_counts_wide_characters_by_their_cells() {
 async fn the_editor_click_accounts_for_how_far_the_view_is_scrolled() {
     let lines: Vec<String> = (0..80).map(|i| format!("line {i}")).collect();
     let mut h = editor_with(&lines.join("\n")).await;
-    let (top, _) = h.app.ui.editor.scroll_top();
+    let (top, _) = h.app.ui.tab.editor.scroll_top();
     assert!(top > 20, "the caret is at the end, so the view is scrolled: {top}");
     let text = h.app.ui.hits.editor_text;
     press_at(&mut h, text.x + 2, text.y + 2, t0());
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: top + 2, col: 2 }, "the third row drawn is line {}", top + 2);
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: top + 2, col: 2 }, "the third row drawn is line {}", top + 2);
     // The wheel scrolls the text under the pointer, whichever pane has focus.
     h.press("ctrl+g h");
     assert_eq!(h.app.ui.focus, PaneId::Sidebar);
     draw(&mut h);
-    let before = h.app.ui.editor.scroll_top().0;
+    let before = h.app.ui.tab.editor.scroll_top().0;
     let fx = wheel(&mut h, MouseEventKind::ScrollUp, text.x + 2, text.y + 2, KeyModifiers::NONE);
     draw(&mut h);
     assert!(fx.repaint);
-    assert_eq!(h.app.ui.editor.scroll_top().0, before - 3, "three lines a notch");
+    assert_eq!(h.app.ui.tab.editor.scroll_top().0, before - 3, "three lines a notch");
     assert_eq!(h.app.ui.focus, PaneId::Sidebar, "the wheel takes no focus");
 }
 
@@ -571,29 +571,29 @@ async fn a_drag_in_the_editor_selects_text_and_a_click_ends_the_selection() {
     let text = h.app.ui.hits.editor_text;
     let now = h.now();
     press_at(&mut h, text.x + 7, text.y, now);
-    assert_eq!(h.app.ui.editor.selection(), None, "a press alone selects nothing");
+    assert_eq!(h.app.ui.tab.editor.selection(), None, "a press alone selects nothing");
     let fx = drag_to(&mut h, text.x + 15, text.y);
     assert!(fx.repaint);
-    assert_eq!(h.app.ui.editor.selection(), Some((Cursor { row: 0, col: 7 }, Cursor { row: 0, col: 15 })));
+    assert_eq!(h.app.ui.tab.editor.selection(), Some((Cursor { row: 0, col: 7 }, Cursor { row: 0, col: 15 })));
     // Backwards, and over two lines.
     drag_to(&mut h, text.x + 2, text.y + 1);
-    assert_eq!(h.app.ui.editor.selection(), Some((Cursor { row: 0, col: 7 }, Cursor { row: 1, col: 2 })));
+    assert_eq!(h.app.ui.tab.editor.selection(), Some((Cursor { row: 0, col: 7 }, Cursor { row: 1, col: 2 })));
     drag_to(&mut h, text.x + 3, text.y);
-    assert_eq!(h.app.ui.editor.selection(), Some((Cursor { row: 0, col: 3 }, Cursor { row: 0, col: 7 })));
+    assert_eq!(h.app.ui.tab.editor.selection(), Some((Cursor { row: 0, col: 3 }, Cursor { row: 0, col: 7 })));
     release(&mut h, text.x + 3, text.y);
-    assert!(h.app.ui.editor.selection().is_some(), "the selection stays after the button goes up");
+    assert!(h.app.ui.tab.editor.selection().is_some(), "the selection stays after the button goes up");
     press_at(&mut h, text.x + 1, text.y + 1, t0() + Duration::from_secs(9));
-    assert_eq!(h.app.ui.editor.selection(), None, "a click ends it");
+    assert_eq!(h.app.ui.tab.editor.selection(), None, "a click ends it");
     // A press and release on the same place leaves no selection behind.
     let now = h.now() + Duration::from_secs(20);
     press_at(&mut h, text.x + 5, text.y, now);
     drag_to(&mut h, text.x + 5, text.y);
     release(&mut h, text.x + 5, text.y);
-    assert_eq!(h.app.ui.editor.selection(), None);
+    assert_eq!(h.app.ui.tab.editor.selection(), None);
     // Dragging past the bottom of the area keeps selecting (the view follows).
     press_at(&mut h, text.x, text.y, now + Duration::from_secs(5));
     drag_to(&mut h, text.x + 4, text.y + 30);
-    assert_eq!(h.app.ui.editor.selection().map(|s| s.1.row), Some(1), "clamped to the last line");
+    assert_eq!(h.app.ui.tab.editor.selection().map(|s| s.1.row), Some(1), "clamped to the last line");
 }
 
 #[tokio::test]
@@ -602,25 +602,25 @@ async fn a_double_click_in_the_editor_selects_the_word_and_two_slow_clicks_do_no
     let text = h.app.ui.hits.editor_text;
     press_at(&mut h, text.x + 9, text.y, t0());
     press_at(&mut h, text.x + 9, text.y, t0() + DOUBLE_CLICK);
-    assert_eq!(h.app.ui.editor.selection(), Some((Cursor { row: 0, col: 7 }, Cursor { row: 0, col: 14 })), "`film_id`: the underscore is part of the word");
-    assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 14 });
+    assert_eq!(h.app.ui.tab.editor.selection(), Some((Cursor { row: 0, col: 7 }, Cursor { row: 0, col: 14 })), "`film_id`: the underscore is part of the word");
+    assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 14 });
     release(&mut h, text.x + 9, text.y);
     // On the comma: the run of symbols.
     press_at(&mut h, text.x + 14, text.y, t0() + Duration::from_secs(5));
     press_at(&mut h, text.x + 14, text.y, t0() + Duration::from_secs(5) + Duration::from_millis(50));
-    assert_eq!(h.app.ui.editor.selection(), Some((Cursor { row: 0, col: 14 }, Cursor { row: 0, col: 15 })));
+    assert_eq!(h.app.ui.tab.editor.selection(), Some((Cursor { row: 0, col: 14 }, Cursor { row: 0, col: 15 })));
     // Too slow.
     let later = t0() + Duration::from_secs(30);
     press_at(&mut h, text.x + 18, text.y, later);
     press_at(&mut h, text.x + 18, text.y, later + DOUBLE_CLICK + Duration::from_millis(1));
-    assert_eq!(h.app.ui.editor.selection(), None);
+    assert_eq!(h.app.ui.tab.editor.selection(), None);
     // Then a third click, after a double-click, starts over.
     let later = t0() + Duration::from_secs(60);
     press_at(&mut h, text.x + 1, text.y, later);
     press_at(&mut h, text.x + 1, text.y, later + Duration::from_millis(10));
-    assert!(h.app.ui.editor.selection().is_some());
+    assert!(h.app.ui.tab.editor.selection().is_some());
     press_at(&mut h, text.x + 1, text.y, later + Duration::from_millis(20));
-    assert_eq!(h.app.ui.editor.selection(), None, "a third quick click is a first click");
+    assert_eq!(h.app.ui.tab.editor.selection(), None, "a third quick click is a first click");
 }
 
 // ---- the wheel -------------------------------------------------------------------
@@ -635,12 +635,12 @@ async fn the_wheel_over_the_results_scrolls_them_while_the_editor_keeps_focus() 
     let fx = wheel(&mut h, MouseEventKind::ScrollDown, r.x + 4, r.y + 3, KeyModifiers::NONE);
     wheel(&mut h, MouseEventKind::ScrollDown, r.x + 4, r.y + 3, KeyModifiers::NONE);
     assert!(fx.repaint);
-    assert_eq!(h.app.ui.grid.top, 6, "three rows a notch");
+    assert_eq!(h.app.ui.tab.grid.top, 6, "three rows a notch");
     assert_eq!(h.app.ui.focus, PaneId::Editor);
     // Over the editor it scrolls the editor, not the results.
     let e = h.app.ui.hits.editor_text;
     wheel(&mut h, MouseEventKind::ScrollDown, e.x + 2, e.y + 2, KeyModifiers::NONE);
-    assert_eq!(h.app.ui.grid.top, 6);
+    assert_eq!(h.app.ui.tab.grid.top, 6);
     // Over the divider, the mode bar, or the sidebar's separator: nothing to scroll, nothing drawn.
     let bar = h.app.ui.hits.mode_bar;
     let sep = h.app.ui.hits.sidebar_separator;
@@ -657,13 +657,13 @@ async fn shift_wheel_and_a_horizontal_wheel_scroll_the_grid_by_columns_over_the_
     draw(&mut h);
     let r = h.app.ui.hits.results;
     wheel(&mut h, MouseEventKind::ScrollDown, r.x + 4, r.y + 3, KeyModifiers::SHIFT);
-    assert_eq!(h.app.ui.grid.left, 1);
+    assert_eq!(h.app.ui.tab.grid.left, 1);
     wheel(&mut h, MouseEventKind::ScrollRight, r.x + 4, r.y + 3, KeyModifiers::NONE);
-    assert_eq!(h.app.ui.grid.left, 2);
+    assert_eq!(h.app.ui.tab.grid.left, 2);
     wheel(&mut h, MouseEventKind::ScrollLeft, r.x + 4, r.y + 3, KeyModifiers::NONE);
     wheel(&mut h, MouseEventKind::ScrollUp, r.x + 4, r.y + 3, KeyModifiers::SHIFT);
-    assert_eq!(h.app.ui.grid.left, 0);
-    assert_eq!(h.app.ui.grid.top, 0, "no row moved");
+    assert_eq!(h.app.ui.tab.grid.left, 0);
+    assert_eq!(h.app.ui.tab.grid.top, 0, "no row moved");
 }
 
 // ---- scrollbars --------------------------------------------------------------------
@@ -723,27 +723,27 @@ async fn a_click_in_the_results_scrollbar_jumps_there_and_dragging_the_thumb_scr
     let mut h = focused(text_set(1000, 3)).await;
     h.press("ctrl+g k");
     draw(&mut h);
-    let bar = h.app.ui.grid.bar;
+    let bar = h.app.ui.tab.grid.bar;
     assert!(!bar.is_empty() && bar.x == h.app.ui.hits.results.right() - 1, "{bar:?}");
     let (total, room) = (1000usize, bar.height as usize);
-    let cursor = h.app.ui.grid.row;
+    let cursor = h.app.ui.tab.grid.row;
     press_at(&mut h, bar.x, bar.bottom() - 1, t0());
-    assert_eq!(h.app.ui.grid.top, total - room, "the end");
+    assert_eq!(h.app.ui.tab.grid.top, total - room, "the end");
     assert_eq!(h.app.ui.focus, PaneId::Results, "a press on the scrollbar focuses the pane");
-    assert!(h.app.ui.grid.row >= h.app.ui.grid.top, "the cursor came along: it was {cursor}, now {}", h.app.ui.grid.row);
+    assert!(h.app.ui.tab.grid.row >= h.app.ui.tab.grid.top, "the cursor came along: it was {cursor}, now {}", h.app.ui.tab.grid.row);
     release(&mut h, bar.x, bar.bottom() - 1);
     draw(&mut h);
     // Drag the thumb from the bottom up to the middle.
-    let (top, len) = crate::app::view::scrollbar_thumb(total, room, h.app.ui.grid.top).unwrap();
+    let (top, len) = crate::app::view::scrollbar_thumb(total, room, h.app.ui.tab.grid.top).unwrap();
     let grab_row = bar.y + top as u16 + (len as u16) / 2;
     press_at(&mut h, bar.x, grab_row, t0() + Duration::from_secs(5));
     drag_to(&mut h, bar.x, bar.y + room as u16 / 2);
-    let at = h.app.ui.grid.top;
+    let at = h.app.ui.tab.grid.top;
     assert!((total - room) / 2 > at.saturating_sub(60) && at > 100 && at < total - room, "about the middle: {at}");
     release(&mut h, bar.x, bar.y);
     // A click in the column does not pick a cell: the cell cursor is where the window kept it.
-    let rows = h.app.ui.grid.rows_visible;
-    assert!((h.app.ui.grid.top..h.app.ui.grid.top + rows).contains(&h.app.ui.grid.row));
+    let rows = h.app.ui.tab.grid.rows_visible;
+    assert!((h.app.ui.tab.grid.top..h.app.ui.tab.grid.top + rows).contains(&h.app.ui.tab.grid.row));
 }
 
 // ---- double-clicks -----------------------------------------------------------------
@@ -755,7 +755,7 @@ async fn a_double_click_on_a_cell_opens_the_viewer_and_a_slow_second_click_does_
     let (x, y) = super::grid_tests::where_is(&mut h, "r3c2").unwrap();
     press_at(&mut h, x + 1, y, t0());
     assert!(h.app.ui.overlay.is_none());
-    assert_eq!((h.app.ui.grid.row, h.app.ui.grid.col), (3, 2));
+    assert_eq!((h.app.ui.tab.grid.row, h.app.ui.tab.grid.col), (3, 2));
     press_at(&mut h, x + 1, y, t0() + DOUBLE_CLICK + Duration::from_millis(1));
     assert!(h.app.ui.overlay.is_none(), "too slow");
     // Two quick presses on another cell: it opens that one.

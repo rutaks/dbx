@@ -6,7 +6,7 @@
 use ratatui::layout::Rect;
 
 use super::form::{ConnectionForm, Field};
-use crate::core::{ConnectionId, CoreError, CoreErrorKind};
+use crate::core::{ConnectionId, CoreError, CoreErrorKind, TabId};
 
 #[derive(Debug, Clone)]
 pub enum Overlay {
@@ -59,6 +59,9 @@ pub struct HelpOverlay {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmDropSession {
+    /// The tab the question was asked in: a yes acts on it, whichever tab is
+    /// active when it is answered.
+    pub tab: TabId,
     /// `connection / database`, as the editor's title names it.
     pub target: String,
     /// The run ended while the question was open: the box only says so.
@@ -67,6 +70,8 @@ pub struct ConfirmDropSession {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmRerun {
+    /// The tab the question was asked in.
+    pub tab: TabId,
     /// The statement's first non-blank line.
     pub statement: String,
 }

@@ -208,7 +208,7 @@ async fn a_postgres_dialect_connection_that_cannot_browse_asks_the_core_for_no_n
     h.settle().await;
     h.press("ctrl+space");
     h.settle().await;
-    h.app.ui.editor.set_text("select * from t t1 join u on t1.");
+    h.app.ui.tab.editor.set_text("select * from t t1 join u on t1.");
     h.press("ctrl+space");
     h.settle().await;
     h.advance(std::time::Duration::from_secs(5));

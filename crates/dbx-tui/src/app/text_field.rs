@@ -34,6 +34,13 @@ pub struct Window {
     pub cursor_col: u16,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Steps `window` has taken on this thread: graphemes read and loop
+    /// turns (work, for tests).
+    pub(crate) static WINDOW_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Default)]
 pub struct TextField {
     text: String,
@@ -230,6 +237,8 @@ impl TextField {
     pub fn window(&mut self, width: u16) -> Window {
         let width = width as usize;
         let cells = self.cells();
+        #[cfg(test)]
+        let mut steps = 2 * cells.len();
         let cursor = self.cursor();
         // prefix[i]: the columns before grapheme i, so any span is one subtraction.
         let mut prefix = Vec::with_capacity(cells.len() + 1);
@@ -248,11 +257,19 @@ impl TextField {
         let own = cells.get(cursor).map_or(1, |c| c.width.max(1));
         while scroll < cursor && before(scroll) + own > width {
             scroll += 1;
+            #[cfg(test)]
+            {
+                steps += 1;
+            }
         }
         // Do not leave empty room on the right while text is hidden on the left.
         let extra = usize::from(cursor == cells.len());
         while scroll > 0 && end - prefix[scroll - 1] + extra <= width {
             scroll -= 1;
+            #[cfg(test)]
+            {
+                steps += 1;
+            }
         }
 
         let mut text = String::new();
@@ -260,6 +277,10 @@ impl TextField {
         for cell in &cells[scroll..] {
             if used + cell.width > width {
                 break;
+            }
+            #[cfg(test)]
+            {
+                steps += 1;
             }
             used += cell.width;
             if self.masked {
@@ -270,6 +291,8 @@ impl TextField {
         }
         let cursor_col = before(scroll).min(width) as u16;
         self.scroll = scroll;
+        #[cfg(test)]
+        WINDOW_STEPS.with(|n| n.set(n.get() + steps));
         Window { text, cursor_col }
     }
 
@@ -700,13 +723,22 @@ mod tests {
 
     #[test]
     fn the_window_of_a_full_field_is_computed_in_linear_time() {
+        // Counted, not timed: each window reads the field a bounded number of
+        // times over, however far the cursor is from the scroll.
         let mut f = TextField::new();
         f.insert_str(&"日".repeat(10_000));
-        let started = std::time::Instant::now();
-        for _ in 0..50 {
+        // As much as the field holds.
+        let n = f.text().chars().count();
+        assert!(n > 1_000);
+        // The first window scrolls from the start to the cursor at the end
+        // once; after that, each window scrolls only as far as the cursor moved.
+        for i in 0..50 {
+            let before = WINDOW_STEPS.with(|s| s.get());
             f.window(60);
+            let steps = WINDOW_STEPS.with(|s| s.get()) - before;
+            let bound = if i == 0 { 3 * n } else { 2 * n } + 2 * 60 + 10;
+            assert!(steps <= bound, "window {i}: {steps} steps for {n} graphemes");
             f.left();
         }
-        assert!(started.elapsed() < std::time::Duration::from_millis(50), "{:?}", started.elapsed());
     }
 }

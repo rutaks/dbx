@@ -297,7 +297,7 @@ async fn when_the_run_ends_under_the_open_question_it_says_so_and_enter_only_dis
     let commands = h.press_fx("enter");
     assert!(commands.is_empty(), "nothing to stop any more: {commands:?}");
     assert!(h.app.ui.overlay.is_none());
-    assert_eq!(h.app.ui.editor.text(), "select 1", "the enter did not reach the editor");
+    assert_eq!(h.app.ui.tab.editor.text(), "select 1", "the enter did not reach the editor");
     assert_eq!(h.app.model.tabs[0].session(), session, "no new session");
 }
 
@@ -329,7 +329,7 @@ async fn quit_while_cancelling_or_with_the_question_open_cancels_again_closes_th
 async fn ctrl_c_with_nothing_running_does_nothing_at_all_in_any_pane_and_in_the_sidebar_never_cancels() {
     let mut h = on_pagila().await;
     h.type_text("select 1");
-    let selection = h.app.ui.editor.selection();
+    let selection = h.app.ui.tab.editor.selection();
     for (pane, keys) in [("editor", ""), ("results", "ctrl+g j"), ("sidebar", "ctrl+g h")] {
         if !keys.is_empty() {
             h.press(keys);
@@ -339,7 +339,7 @@ async fn ctrl_c_with_nothing_running_does_nothing_at_all_in_any_pane_and_in_the_
         assert!(!fx.repaint && fx.commands.is_empty(), "{pane}: {fx:?}");
         assert!(h.app.ui.notice.is_none() && h.app.ui.overlay.is_none(), "{pane}");
     }
-    assert_eq!(h.app.ui.editor.selection(), selection, "the widget's copy never ran");
+    assert_eq!(h.app.ui.tab.editor.selection(), selection, "the widget's copy never ran");
     // With a run in flight, ctrl+c in the sidebar still does nothing.
     h.fake.script_run(Scripted::ok(rows_of(&[&["1"]])).after(Duration::from_secs(5)));
     h.press("ctrl+g l f5");
@@ -378,7 +378,7 @@ async fn typing_moving_and_the_sidebar_stay_live_while_a_run_is_running_or_being
     let (mut h, _, _) = cancelling_deaf().await;
     advance(&mut h, 3_000).await; // overdue
     h.type_text(" -- more");
-    assert!(h.app.ui.editor.text().ends_with(" -- more"));
+    assert!(h.app.ui.tab.editor.text().ends_with(" -- more"));
     h.press("ctrl+g h");
     let before = h.app.ui.sidebar.cursor;
     h.press("k");

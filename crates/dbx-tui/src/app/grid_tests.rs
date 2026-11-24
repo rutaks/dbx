@@ -61,7 +61,7 @@ pub(super) fn pane(h: &mut Harness) -> Vec<String> {
 }
 
 pub(super) fn cursor(h: &Harness) -> (usize, usize) {
-    (h.app.ui.grid.row, h.app.ui.grid.col)
+    (h.app.ui.tab.grid.row, h.app.ui.tab.grid.col)
 }
 
 // ---- the cursor -----------------------------------------------------------------
@@ -91,7 +91,7 @@ async fn hjkl_and_the_arrows_move_the_cell_cursor_by_one_and_stop_at_the_edges()
 async fn pages_the_ends_of_a_row_and_the_first_and_last_row_move_the_cursor() {
     let mut h = focused(text_set(200, 30)).await;
     screen(&mut h);
-    let page = h.app.ui.grid.rows_visible;
+    let page = h.app.ui.tab.grid.rows_visible;
     assert!(page >= 5, "a page is more than a few rows: {page}");
     h.press("pagedown");
     assert_eq!(cursor(&h), (page, 0));
@@ -151,7 +151,7 @@ async fn columns_scroll_whole_and_the_cursor_column_is_drawn_complete() {
         h.press("l");
         screen(&mut h);
     }
-    let g = h.app.ui.grid.clone();
+    let g = h.app.ui.tab.grid.clone();
     assert!(g.left > 0, "scrolled right: {g:?}");
     assert!(g.left <= g.col && g.col < g.left + g.cols_visible, "the cursor column is among the drawn ones: {g:?}");
     let rows = pane(&mut h);
@@ -172,7 +172,7 @@ async fn a_column_wider_than_the_pane_shows_its_left_part() {
     let row = screen.iter().find(|r| r.contains("xxxx")).unwrap_or_else(|| panic!("{screen:#?}"));
     assert!(row.trim_end().ends_with('…'), "cut with an ellipsis: {row:?}");
     assert!(row.chars().count() <= (r.x + r.width) as usize);
-    assert_eq!(h.app.ui.grid.left, 1, "the wide column starts the window");
+    assert_eq!(h.app.ui.tab.grid.left, 1, "the wide column starts the window");
     assert_eq!(cursor(&h), (0, 1));
 }
 
@@ -349,14 +349,14 @@ async fn rows_shorter_or_longer_than_the_header_do_not_panic_and_a_missing_cell_
 async fn a_move_inside_the_sampled_rows_measures_nothing_and_a_jump_measures_a_bounded_amount() {
     let mut h = focused(text_set(10_000, 120)).await;
     screen(&mut h);
-    let start = h.app.ui.grid.widths.measured;
+    let start = h.app.ui.tab.grid.widths.measured;
     assert!(start > 0 && start < 20_000, "the first frame measured only the window: {start}");
     h.press("j j j l l");
     screen(&mut h);
-    assert_eq!(h.app.ui.grid.widths.measured, start, "moving inside the window rescans nothing");
+    assert_eq!(h.app.ui.tab.grid.widths.measured, start, "moving inside the window rescans nothing");
     h.press("G $");
     screen(&mut h);
-    let after = h.app.ui.grid.widths.measured - start;
+    let after = h.app.ui.tab.grid.widths.measured - start;
     assert!(after < 20_000, "jumping to the end measured {after} cells, not the 1,200,000 there are");
 }
 
@@ -563,21 +563,20 @@ async fn a_ten_megabyte_value_opens_and_scrolls_by_wrapping_only_what_is_on_scre
     let big = "é".repeat(5 * 1024 * 1024);
     let set = ResultSet { columns: vec![col("t", "text", CellKind::Text)], rows: vec![vec![Cell::Value(big)]], ..rows_of(&[]) };
     let mut h = focused(set).await;
-    let t = std::time::Instant::now();
+    // Counted, not timed: the graphemes the viewer visits to wrap.
     h.press("enter");
     screen(&mut h);
-    let open = t.elapsed();
-    let t = std::time::Instant::now();
+    let open = viewer(&h).work;
     h.press("pagedown pagedown j");
     screen(&mut h);
-    let scroll = t.elapsed();
+    let scroll = viewer(&h).work - open;
     let worked = viewer(&h).work;
     h.press("G");
     let text = screen(&mut h).join("\n");
     let at_end = viewer(&h).work - worked;
-    eprintln!("OBSERVED 10 MB viewer: open {open:?}, scroll {scroll:?}, G visited {at_end} graphemes");
-    assert!(open < std::time::Duration::from_millis(250), "{open:?}");
-    assert!(scroll < std::time::Duration::from_millis(100), "{scroll:?}");
+    eprintln!("OBSERVED 10 MB viewer: open visited {open}, scroll {scroll}, G {at_end} graphemes");
+    assert!(open < 50_000, "opening visited {open} graphemes of 5,242,880");
+    assert!(scroll < 20_000, "scrolling visited {scroll} graphemes");
     // G wraps the tail only (counted, not timed), and says `end` for the line
     // numbers it does not know.
     assert!(viewer(&h).anchored() && viewer(&h).total().is_none());
@@ -967,7 +966,7 @@ async fn a_copy_over_the_clipboard_limit_is_refused_with_a_notice_that_says_why(
 // ---- load more ------------------------------------------------------------------------
 
 /// `n` rows of `id`, `v`; cut by the row cap (`truncated`).
-fn truncated_set(n: usize) -> ResultSet {
+pub(super) fn truncated_set(n: usize) -> ResultSet {
     ResultSet {
         columns: vec![col("id", "int4", CellKind::Integer), col("v", "text", CellKind::Text)],
         rows: (0..n).map(|r| vec![Cell::Value(r.to_string()), Cell::Value(format!("v{r}"))]).collect(),
@@ -1051,7 +1050,7 @@ async fn load_more_is_refused_with_a_notice_for_a_statement_that_is_not_safe_to_
     assert_eq!(h.app.model.tabs[0].run, query::RunState::Idle);
 }
 
-fn unproven_set(n: usize) -> ResultSet {
+pub(super) fn unproven_set(n: usize) -> ResultSet {
     ResultSet { rerun: crate::core::Rerun::ReadOnlyUnproven, ran: "\n  select my_func(id) as v\nfrom t".into(), ..truncated_set(n) }
 }
 
@@ -1195,7 +1194,7 @@ async fn if_the_new_result_has_fewer_rows_than_the_cursors_row_the_cursor_clamps
     let said = notice_of(&h);
     assert!(said.contains("changed") && said.contains("600"), "{said:?}");
     screen(&mut h);
-    assert!(h.app.ui.grid.top <= 599);
+    assert!(h.app.ui.tab.grid.top <= 599);
 }
 
 #[tokio::test]
@@ -1278,7 +1277,7 @@ async fn a_new_result_starts_the_cursor_in_the_corner_and_a_load_more_keeps_it()
     let commands = h.press_fx("f5");
     answer(&mut h, &commands, Ok(truncated_set(40)));
     assert_eq!(cursor(&h), (0, 0));
-    assert_eq!((h.app.ui.grid.top, h.app.ui.grid.left), (0, 0));
+    assert_eq!((h.app.ui.tab.grid.top, h.app.ui.tab.grid.left), (0, 0));
 }
 
 // ---- the mouse and the mode bar -------------------------------------------------------
@@ -1319,29 +1318,29 @@ async fn the_wheel_scrolls_rows_the_shift_wheel_and_the_horizontal_wheel_scroll_
     let (x, y) = where_is(&mut h, "r0c0").unwrap();
     mouse(&mut h, MouseEventKind::ScrollDown, x, y, KeyModifiers::NONE);
     screen(&mut h);
-    assert_eq!(h.app.ui.grid.top, 3, "a notch is three rows");
-    assert!(h.app.ui.grid.row >= 3, "the cursor came with the window: {:?}", cursor(&h));
+    assert_eq!(h.app.ui.tab.grid.top, 3, "a notch is three rows");
+    assert!(h.app.ui.tab.grid.row >= 3, "the cursor came with the window: {:?}", cursor(&h));
     mouse(&mut h, MouseEventKind::ScrollUp, x, y, KeyModifiers::NONE);
     screen(&mut h);
-    assert_eq!(h.app.ui.grid.top, 0);
+    assert_eq!(h.app.ui.tab.grid.top, 0);
     // The wheel over the pane scrolls it even when another pane has focus.
     h.press("ctrl+g k");
     mouse(&mut h, MouseEventKind::ScrollDown, x, y, KeyModifiers::NONE);
     screen(&mut h);
-    assert_eq!((h.app.ui.grid.top, h.app.ui.focus), (3, PaneId::Editor));
+    assert_eq!((h.app.ui.tab.grid.top, h.app.ui.focus), (3, PaneId::Editor));
 
     mouse(&mut h, MouseEventKind::ScrollDown, x, y, KeyModifiers::SHIFT);
     screen(&mut h);
-    assert_eq!(h.app.ui.grid.left, 1, "shift+wheel scrolls a column");
-    assert!(h.app.ui.grid.col >= 1, "{:?}", cursor(&h));
+    assert_eq!(h.app.ui.tab.grid.left, 1, "shift+wheel scrolls a column");
+    assert!(h.app.ui.tab.grid.col >= 1, "{:?}", cursor(&h));
     mouse(&mut h, MouseEventKind::ScrollRight, x, y, KeyModifiers::NONE);
     screen(&mut h);
-    assert_eq!(h.app.ui.grid.left, 2, "so does a horizontal wheel");
+    assert_eq!(h.app.ui.tab.grid.left, 2, "so does a horizontal wheel");
     mouse(&mut h, MouseEventKind::ScrollLeft, x, y, KeyModifiers::NONE);
     mouse(&mut h, MouseEventKind::ScrollUp, x, y, KeyModifiers::SHIFT);
     screen(&mut h);
-    assert_eq!(h.app.ui.grid.left, 0);
-    let g = h.app.ui.grid.clone();
+    assert_eq!(h.app.ui.tab.grid.left, 0);
+    let g = h.app.ui.tab.grid.clone();
     assert!(g.left <= g.col && g.col < g.left + g.cols_visible.max(1), "{g:?}");
 }
 
@@ -1388,47 +1387,50 @@ async fn clicking_a_results_hint_does_what_its_key_does() {
     assert_eq!(cursor(&h), (0, 0));
 }
 
-// ---- performance budgets ---------------------------------------------------------------
+// ---- work per frame -------------------------------------------------------------------
+// Counted, not timed (design sections 16 and 19): the rows a frame measures
+// for the column widths, and the graphemes of cell values it reads.
 
-fn frame_time(h: &mut Harness) -> std::time::Duration {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
-    let started = std::time::Instant::now();
-    term.draw(|f| h.app.view(f)).unwrap();
-    started.elapsed()
+/// Draws a frame; returns the cells measured and the cell graphemes read.
+fn frame_work(h: &mut Harness) -> (usize, usize) {
+    let (measured, read) = (h.app.ui.tab.grid.widths.measured, super::view::cell_graphemes_read());
+    screen(h);
+    (h.app.ui.tab.grid.widths.measured - measured, super::view::cell_graphemes_read() - read)
 }
 
-/// The median of five frames.
-fn warm_frame(h: &mut Harness) -> std::time::Duration {
-    let mut times: Vec<_> = (0..5).map(|_| frame_time(h)).collect();
-    times.sort();
-    times[2]
+/// The most cell graphemes a frame may read: every cell it draws or
+/// measures, each only as far as the widest column shows.
+fn read_bound(h: &Harness, measured: usize) -> usize {
+    let g = &h.app.ui.tab.grid;
+    let cap = 8 * super::grid::MAX_COLUMN as usize + 1;
+    ((g.rows_visible + 1) * (g.spans.len() + 1) + measured) * cap
 }
 
 #[tokio::test]
-async fn a_10_000_by_120_result_draws_in_a_few_milliseconds_and_moving_rescans_nothing() {
+async fn a_10_000_by_120_result_measures_one_window_and_moving_rescans_nothing() {
     let mut h = focused(text_set(10_000, 120)).await;
-    let first = frame_time(&mut h);
-    let blank = {
-        // The same frame with nothing in the results pane, for what the rest of the screen costs.
-        let mut empty = ran(Ok(rows_of(&[]))).await;
-        empty.press("ctrl+g j");
-        warm_frame(&mut empty)
-    };
-    let warm = warm_frame(&mut h);
-    let measured = h.app.ui.grid.widths.measured;
+    let (first, read) = frame_work(&mut h);
+    let window = 2 * super::grid::CHUNK;
+    let columns = h.app.ui.tab.grid.spans.len() + 1;
+    assert!(first > 0 && first <= window * columns, "the first frame measures the window of the columns drawn once: {first}");
+    assert!(read <= read_bound(&h, first), "{read}");
+    let (warm, read) = frame_work(&mut h);
+    assert_eq!(warm, 0, "a second frame measures nothing");
+    assert!(read <= read_bound(&h, 0), "{read}");
     h.press("j j l pagedown");
-    let moved = warm_frame(&mut h);
-    assert_eq!(h.app.ui.grid.widths.measured, measured, "moving the cursor measured no cells");
+    let (moved, read) = frame_work(&mut h);
+    assert_eq!(moved, 0, "moving the cursor measured no cells");
+    assert!(read <= read_bound(&h, 0), "{read}");
     h.press("G $");
-    let end = warm_frame(&mut h);
-    eprintln!("OBSERVED 10,000x120: first frame {first:?}, warm {warm:?}, after moves {moved:?}, at the end {end:?}, an empty pane {blank:?}");
-    let budget = std::time::Duration::from_millis(10);
-    assert!(warm < budget && moved < budget && end < budget, "{warm:?} {moved:?} {end:?}");
-    assert!(first < std::time::Duration::from_millis(60), "the first frame measures the window once: {first:?}");
+    let (end, read) = frame_work(&mut h);
+    eprintln!("OBSERVED 10,000x120: first frame measured {first}, at the end {end}");
+    assert!(end <= window * (h.app.ui.tab.grid.spans.len() + 1), "a jump measures one window: {end}");
+    assert!(read <= read_bound(&h, end), "{read}");
+    assert_eq!(frame_work(&mut h).0, 0);
 }
 
 #[tokio::test]
-async fn a_result_with_one_ten_megabyte_cell_draws_and_moves_in_a_few_milliseconds() {
+async fn a_result_with_one_ten_megabyte_cell_reads_only_what_a_column_shows() {
     let big = "é".repeat(5 * 1024 * 1024);
     let set = ResultSet {
         columns: vec![col("a", "text", CellKind::Text), col("big", "text", CellKind::Text), col("z", "text", CellKind::Text)],
@@ -1436,21 +1438,18 @@ async fn a_result_with_one_ten_megabyte_cell_draws_and_moves_in_a_few_millisecon
         ..rows_of(&[])
     };
     let mut h = focused(set).await;
-    let first = frame_time(&mut h);
+    let (first, read) = frame_work(&mut h);
+    assert!(read <= read_bound(&h, first), "the first frame read {read} graphemes of cells");
     h.press("l");
-    let on_it = warm_frame(&mut h);
-    let measured = h.app.ui.grid.widths.measured;
+    let (_, on_it) = frame_work(&mut h);
+    let measured = h.app.ui.tab.grid.widths.measured;
     h.press("j k l h"); // and back on the big cell
-    let moved = warm_frame(&mut h);
-    assert_eq!(h.app.ui.grid.widths.measured, measured, "no rescan");
-    let t = std::time::Instant::now();
+    let (_, moved) = frame_work(&mut h);
+    assert_eq!(h.app.ui.tab.grid.widths.measured, measured, "no rescan");
+    let bound = read_bound(&h, 0);
+    assert!(on_it <= bound && moved <= bound, "{on_it} {moved} (bound {bound})");
     let sent = h.press_fx("y");
-    let copy = t.elapsed();
-    eprintln!("OBSERVED one 10 MB cell: first {first:?}, cursor on it {on_it:?}, after moves {moved:?}, a refused copy {copy:?}");
     assert!(sent.is_empty(), "too large to copy");
-    let budget = std::time::Duration::from_millis(10);
-    assert!(on_it < budget && moved < budget, "{on_it:?} {moved:?}");
-    assert!(first < std::time::Duration::from_millis(60), "{first:?}");
 }
 
 #[tokio::test]

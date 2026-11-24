@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::core::{CoreError, CoreErrorKind, DatabasePath, ResultSet, RunId, SessionId, TabId};
 
 
-/// One query tab. The tab bar arrives in slice 15; there is one tab until then.
+/// One query tab: what the Core said about it. What it shows is `tab::TabUi`.
 #[derive(Debug, Clone)]
 pub struct QueryTab {
     pub id: TabId,
@@ -192,13 +192,18 @@ use super::{App, Command, CoreCall, Effects, Loadable, Mode};
 use crate::core::{ConnectionId, RunRequest};
 
 impl App {
-    /// The tab statements run in: the only one, until tabs arrive.
+    /// The active tab: the one keys, the editor and the results pane act on.
     pub(super) fn tab(&self) -> &QueryTab {
-        &self.model.tabs[0]
+        self.model.active(self.ui.tab.id)
     }
 
     fn tab_mut(&mut self) -> &mut QueryTab {
-        &mut self.model.tabs[0]
+        self.model.active_mut(self.ui.tab.id)
+    }
+
+    /// Whether `tab` is the one on screen.
+    pub(super) fn is_active(&self, tab: TabId) -> bool {
+        self.ui.tab.id == tab
     }
 
     /// Shows a notice until `NOTICE_FOR` from now.
@@ -240,13 +245,13 @@ impl App {
         self.retarget(Some(at), fx);
     }
 
-    /// Points the tab somewhere else (or nowhere). A run in flight is
+    /// Points the active tab somewhere else (or nowhere). A run in flight is
     /// cancelled and its reply made stale; the old session is closed.
     fn retarget(&mut self, to: Option<DatabasePath>, fx: &mut Effects) {
         if self.tab().target == to {
             return;
         }
-        self.end_tab_session(fx);
+        self.end_session_of(self.ui.tab.id, fx);
         self.close_completion(fx);
         let tab = self.tab_mut();
         // A new session: the old one's close may land after the next run has
@@ -262,17 +267,19 @@ impl App {
         fx.repaint = true;
     }
 
-    /// Lets go of the tab's run, if one is in flight: cancelled (again, if
+    /// Lets go of tab `id`'s run, if one is in flight: cancelled (again, if
     /// it was being cancelled: a cancel that never reached dbx is not lost)
     /// and its reply made stale. A question about it goes too.
-    fn abandon_run(&mut self, fx: &mut Effects) {
-        let id = self.tab().id;
-        if let Some((run, request, _)) = self.tab().run.in_flight() {
-            fx.commands.push(Command::Cancel(run));
-            self.model.requests.supersede(Target::Run(id));
-            self.remember_abandoned(request);
-            self.tab_mut().run = RunState::Idle;
-            self.tab_mut().loading_more = None;
+    fn abandon_run_of(&mut self, id: TabId, fx: &mut Effects) {
+        let Some((run, request, _)) = self.model.tab(id).and_then(|t| t.run.in_flight()) else { return };
+        fx.commands.push(Command::Cancel(run));
+        self.model.requests.supersede(Target::Run(id));
+        self.remember_abandoned(id, request);
+        if let Some(tab) = self.model.tab_mut(id) {
+            tab.run = RunState::Idle;
+            tab.loading_more = None;
+        }
+        if self.is_active(id) {
             if matches!(self.ui.overlay, Some(Overlay::ConfirmDropSession(_))) {
                 self.ui.overlay = None;
             }
@@ -280,47 +287,59 @@ impl App {
         }
     }
 
-    /// Notes that the tab let go of run `request` before it ended.
-    fn remember_abandoned(&mut self, request: RequestId) {
-        let on = self.target_label().unwrap_or_else(|| "the server".into());
-        self.tab_mut().abandoned.push(Abandoned { request, on });
-    }
-
-    /// The places where a run the tab let go of may still be running.
-    pub fn abandoned_on(&self) -> Vec<String> {
-        self.tab().abandoned.iter().map(|a| a.on.clone()).collect()
-    }
-
-    /// Cancels the tab's run, if any, and closes its session, if any. The
-    /// shell closes the session only once the run has ended (or a moment has
-    /// passed), so the cancel can still reach the server.
-    fn end_tab_session(&mut self, fx: &mut Effects) {
-        self.abandon_run(fx);
-        if let Some(at) = self.tab().target.clone() {
-            fx.commands.push(Command::CloseSession(self.tab().session(), at));
+    /// Notes that tab `id` let go of run `request` before it ended.
+    fn remember_abandoned(&mut self, id: TabId, request: RequestId) {
+        let on = self.target_label_of(id).unwrap_or_else(|| "the server".into());
+        if let Some(tab) = self.model.tab_mut(id) {
+            tab.abandoned.push(Abandoned { request, on });
         }
     }
 
-    /// Quit: end the tab's session first.
+    /// The places where a run some tab let go of may still be running.
+    pub fn abandoned_on(&self) -> Vec<String> {
+        let own = self.model.tabs.iter().flat_map(|t| t.abandoned.iter().map(|a| a.on.clone()));
+        own.chain(self.model.orphaned.iter().map(|(_, a)| a.on.clone())).collect()
+    }
+
+    /// Cancels tab `id`'s run, if any, and closes its session, if any. The
+    /// shell closes the session only once the run has ended (or a moment has
+    /// passed), so the cancel can still reach the server.
+    pub(super) fn end_session_of(&mut self, id: TabId, fx: &mut Effects) {
+        self.abandon_run_of(id, fx);
+        if let Some(tab) = self.model.tab(id) {
+            if let Some(at) = tab.target.clone() {
+                fx.commands.push(Command::CloseSession(tab.session(), at));
+            }
+        }
+    }
+
+    /// Quit: end every tab's session first.
     pub(super) fn quit(&mut self, fx: &mut Effects) {
-        self.end_tab_session(fx);
+        let ids: Vec<TabId> = self.model.tabs.iter().map(|t| t.id).collect();
+        for id in ids {
+            self.end_session_of(id, fx);
+        }
         self.save_layout(fx);
         fx.commands.push(Command::Quit);
     }
 
-    /// A connection was removed: a tab pointed at it points nowhere now.
+    /// A connection was removed: every tab pointed at it points nowhere now.
     pub(super) fn connection_removed(&mut self, id: &ConnectionId, fx: &mut Effects) {
-        if self.tab().target.as_ref().is_some_and(|t| &t.connection == id) {
-            self.abandon_run(fx);
-            self.close_completion(fx);
+        let on: Vec<TabId> = self.model.tabs.iter().filter(|t| t.target.as_ref().is_some_and(|t| &t.connection == id)).map(|t| t.id).collect();
+        for tab in on {
+            self.abandon_run_of(tab, fx);
+            if self.is_active(tab) {
+                self.close_completion(fx);
+                fx.repaint = true;
+            }
             // dbx dropped the connection's pools, sessions with them.
-            let t = self.tab_mut();
-            t.session += 1;
-            t.run = RunState::Idle;
-            t.target = None;
-            t.outcome = None;
-            t.loading_more = None;
-            fx.repaint = true;
+            if let Some(t) = self.model.tab_mut(tab) {
+                t.session += 1;
+                t.run = RunState::Idle;
+                t.target = None;
+                t.outcome = None;
+                t.loading_more = None;
+            }
         }
     }
 
@@ -357,7 +376,7 @@ impl App {
             }
             _ => {}
         }
-        if self.ui.editor.text().trim().is_empty() {
+        if self.ui.tab.editor.text().trim().is_empty() {
             self.notify("Nothing to run: type a statement first.".into(), false, fx);
             return false;
         }
@@ -375,14 +394,14 @@ impl App {
         let run = crate::core::RunId(self.model.next_run);
         self.model.next_run += 1;
         let id = self.model.requests.begin(Target::Run(tab));
-        self.tab_mut().run_mentions_search_path = self.ui.editor.text().to_lowercase().contains("search_path");
+        self.tab_mut().run_mentions_search_path = self.ui.tab.editor.text().to_lowercase().contains("search_path");
         let request = RunRequest {
             connection: target.connection,
             database: Some(target.database),
             session: self.tab().session(),
-            buffer: self.ui.editor.text(),
-            cursor: self.ui.editor.cursor(),
-            selection: range.or_else(|| self.ui.editor.selection()),
+            buffer: self.ui.tab.editor.text(),
+            cursor: self.ui.tab.editor.cursor(),
+            selection: range.or_else(|| self.ui.tab.editor.selection()),
             row_cap: self.model.row_cap,
         };
         self.tab_mut().run = RunState::Running { run, request: id, started: now };
@@ -407,7 +426,7 @@ impl App {
             }
             RunState::Cancelling { .. } => {
                 let target = self.target_label().unwrap_or_default();
-                self.ui.overlay = Some(Overlay::ConfirmDropSession(ConfirmDropSession { target, stopped: false }));
+                self.ui.overlay = Some(Overlay::ConfirmDropSession(ConfirmDropSession { tab: self.ui.tab.id, target, stopped: false }));
                 self.ui.mode = Mode::Normal;
                 fx.repaint = true;
             }
@@ -426,37 +445,58 @@ impl App {
     /// aborting the run would cut short dbx's own cancel attempt, which it
     /// gives up to 5 s per try.
     pub(super) fn drop_session(&mut self, fx: &mut Effects) {
+        // The tab the question was asked in, whichever is active now.
+        let asked = match &self.ui.overlay {
+            Some(Overlay::ConfirmDropSession(ask)) => Some(ask.tab),
+            _ => None,
+        };
         self.ui.overlay = None;
         fx.repaint = true;
-        let RunState::Cancelling { started, request, .. } = self.tab().run else { return };
-        let Some(at) = self.tab().target.clone() else { return };
-        fx.commands.push(Command::CloseSession(self.tab().session(), at));
+        let id = asked.unwrap_or(self.ui.tab.id);
+        let Some(tab) = self.model.tab(id) else { return };
+        let RunState::Cancelling { started, request, .. } = tab.run else { return };
+        let Some(at) = tab.target.clone() else { return };
+        fx.commands.push(Command::CloseSession(tab.session(), at));
         let after = self.ui.now.map_or(Duration::ZERO, |now| now.saturating_duration_since(started));
-        self.remember_abandoned(request);
+        self.remember_abandoned(id, request);
         // A notice that said to wait for this run no longer holds.
-        self.ui.notice = None;
-        let tab = self.tab_mut();
+        if self.is_active(id) {
+            self.ui.notice = None;
+        }
+        let tab = self.model.active_mut(id);
         tab.session += 1;
         tab.run = RunState::Cancelled { after, statement: None, how: CancelEnd::Abandoned };
     }
 
-    /// A stale reply to a run. If it is the run being cancelled, the run has
-    /// ended: the tab is `Cancelled`, and what the reply carried is dropped.
-    /// Any other stale reply changes nothing and repaints nothing.
-    pub(super) fn on_ran_after_cancel(&mut self, id: RequestId, result: Result<ResultSet, CoreError>, fx: &mut Effects) {
-        self.after_run_forget_current_schema(fx);
-        // A run the tab let go of has ended: it is no longer running anywhere.
-        let before = self.tab().abandoned.len();
-        self.tab_mut().abandoned.retain(|a| a.request != id);
-        if self.tab().abandoned.len() != before {
-            fx.repaint = true;
+    /// A stale reply to a run of tab `tab`. If it is the run being cancelled,
+    /// the run has ended: the tab is `Cancelled`, and what the reply carried
+    /// is dropped. Any other stale reply changes nothing and repaints
+    /// nothing; nor does any reply for a tab that is not on screen.
+    pub(super) fn on_ran_after_cancel(&mut self, tab: TabId, id: RequestId, result: Result<ResultSet, CoreError>, fx: &mut Effects) {
+        if self.model.tab(tab).is_none() {
+            // A removed tab's run has ended: it is no longer running anywhere.
+            self.model.orphaned.retain(|(_, a)| a.request != id);
+            if !self.model.orphaned.iter().any(|(t, _)| *t == tab) {
+                self.model.requests.forget(&Target::Run(tab));
+            }
             return;
         }
-        let RunState::Cancelling { request, started, .. } = self.tab().run else { return };
+        self.after_run_forget_current_schema(tab, fx);
+        let active = self.is_active(tab);
+        let now = self.ui.now;
+        let Some(t) = self.model.tab_mut(tab) else { return };
+        // A run the tab let go of has ended: it is no longer running anywhere.
+        let before = t.abandoned.len();
+        t.abandoned.retain(|a| a.request != id);
+        if t.abandoned.len() != before {
+            fx.repaint |= active;
+            return;
+        }
+        let RunState::Cancelling { request, started, .. } = t.run else { return };
         if request != id {
             return;
         }
-        let after = self.ui.now.map_or(Duration::ZERO, |now| now.saturating_duration_since(started));
+        let after = now.map_or(Duration::ZERO, |now| now.saturating_duration_since(started));
         let (statement, how) = match result {
             Ok(set) => (Some(set.ran), CancelEnd::FinishedFirst),
             Err(e) if e.kind == CoreErrorKind::Cancelled => (e.statement, CancelEnd::Stopped),
@@ -469,7 +509,10 @@ impl App {
                 (e.statement, CancelEnd::Failed(named))
             }
         };
-        self.tab_mut().run = RunState::Cancelled { after, statement, how };
+        t.run = RunState::Cancelled { after, statement, how };
+        if !active {
+            return;
+        }
         // The run ended on its own: the question of stopping waiting is moot.
         // The box stays, saying so, so a key meant for it cannot land in the
         // editor; any key it takes only closes it.
@@ -479,76 +522,102 @@ impl App {
         fx.repaint = true;
     }
 
-    /// The reply to the tab's current run.
+    /// The reply to the active tab's current run.
+    #[cfg(test)]
     pub(super) fn on_ran(&mut self, result: Result<crate::core::ResultSet, CoreError>, fx: &mut Effects) {
-        self.after_run_forget_current_schema(fx);
+        self.on_ran_in(self.ui.tab.id, result, fx)
+    }
+
+    /// The reply to tab `tab`'s current run. For a tab that is not on
+    /// screen, only that tab changes: no notice, no repaint.
+    pub(super) fn on_ran_in(&mut self, tab: TabId, result: Result<crate::core::ResultSet, CoreError>, fx: &mut Effects) {
+        if self.model.tab(tab).is_none() {
+            return;
+        }
+        self.after_run_forget_current_schema(tab, fx);
+        let active = self.is_active(tab);
         let now = self.ui.now;
-        let tab = self.tab_mut();
-        let elapsed = match (now, tab.run.in_flight()) {
+        let Some(t) = self.model.tab_mut(tab) else { return };
+        let elapsed = match (now, t.run.in_flight()) {
             (Some(now), Some((_, _, started))) => now.saturating_duration_since(started),
             _ => Duration::ZERO,
         };
-        let more = tab.loading_more.take();
-        tab.run = RunState::Idle;
+        let more = t.loading_more.take();
+        t.run = RunState::Idle;
         match (result, more) {
             // "Load more" landed: the cursor stays on its row and column.
-            (Ok(set), Some(_)) => self.more_landed(set, fx),
+            (Ok(set), Some(_)) => self.more_landed(tab, set, fx),
             // It failed or was cut short: the rows on screen are still the
             // result, and the user is told.
             (Err(error), Some(_)) if error.kind != CoreErrorKind::Cancelled => {
                 let what = if error.kind == CoreErrorKind::Timeout { "timed out" } else { "failed" };
-                self.notify(format!("Load more {what}: {}", error.message), true, fx);
+                self.notify_tab(tab, format!("Load more {what}: {}", error.message), fx);
             }
             (Err(_), Some(_)) => {
-                let tab = self.tab_mut();
-                tab.run = RunState::Cancelled { after: elapsed, statement: None, how: CancelEnd::Stopped };
+                t.run = RunState::Cancelled { after: elapsed, statement: None, how: CancelEnd::Stopped };
             }
             (Ok(set), None) => {
-                let tab = self.tab_mut();
-                tab.result_session = tab.session;
-                tab.outcome = Some(Outcome::Rows(set));
+                t.result_session = t.session;
+                t.outcome = Some(Outcome::Rows(set));
                 // A new result: back to the corner, nothing measured, and a
                 // press on a cell of the old one pairs with nothing.
-                self.ui.grid.reset();
-                self.ui.clicks.forget();
+                if let Some(ui) = self.tab_ui_mut(tab) {
+                    ui.grid.reset();
+                }
+                if active {
+                    self.ui.clicks.forget();
+                }
             }
             // Cancelled by something other than this tab (it would have made
             // the reply stale): the run is over, and gave nothing to show.
             (Err(error), None) if error.kind == CoreErrorKind::Cancelled => {
-                tab.run = RunState::Cancelled { after: elapsed, statement: error.statement, how: CancelEnd::Stopped };
+                t.run = RunState::Cancelled { after: elapsed, statement: error.statement, how: CancelEnd::Stopped };
             }
             (Err(error), None) if error.kind == CoreErrorKind::Timeout => {
-                tab.outcome = Some(Outcome::TimedOut { error, elapsed });
-                self.ui.clicks.forget();
+                t.outcome = Some(Outcome::TimedOut { error, elapsed });
+                if active {
+                    self.ui.clicks.forget();
+                }
             }
             (Err(error), None) => {
-                tab.outcome = Some(Outcome::Failed { error, elapsed });
-                self.ui.clicks.forget();
+                t.outcome = Some(Outcome::Failed { error, elapsed });
+                if active {
+                    self.ui.clicks.forget();
+                }
             }
         }
     }
 
-    /// The rows of a "load more" arrived. They replace the result; the cursor
-    /// stays on the same row and column, and is brought back inside the new
-    /// result (with a notice) if the data changed and it is now shorter.
-    fn more_landed(&mut self, set: ResultSet, fx: &mut Effects) {
+    /// The rows of a "load more" arrived in tab `tab`. They replace the
+    /// result; the cursor stays on the same row and column, and is brought
+    /// back inside the new result (with a notice, when the tab is on screen)
+    /// if the data changed and it is now shorter.
+    fn more_landed(&mut self, tab: TabId, set: ResultSet, fx: &mut Effects) {
+        let active = self.is_active(tab);
         let (rows, cols) = (set.rows.len(), set.columns.len());
         // Load more only appends rows: what was on screen should be the start
         // of what came back. Compared once, here, not per frame.
-        let changed = match super::grid::shown(&self.model.tabs[0].outcome) {
+        let changed = match self.model.tab(tab).and_then(|t| super::grid::shown(&t.outcome)) {
             Some(old) => old.columns != set.columns || rows < old.rows.len() || old.rows[..] != set.rows[..old.rows.len()],
             None => false,
         };
-        let g = &mut self.ui.grid;
-        let row_moved = g.row >= rows.max(1);
-        g.row = g.row.min(rows.saturating_sub(1));
-        g.col = g.col.min(cols.saturating_sub(1));
-        // The rows changed under the column widths and the window.
-        g.widths.clear();
+        let mut row_moved = false;
+        if let Some(ui) = self.tab_ui_mut(tab) {
+            let g = &mut ui.grid;
+            row_moved = g.row >= rows.max(1);
+            g.row = g.row.min(rows.saturating_sub(1));
+            g.col = g.col.min(cols.saturating_sub(1));
+            // The rows changed under the column widths and the window.
+            g.widths.clear();
+        }
         let loaded = rows;
-        let tab = self.tab_mut();
-        tab.result_session = tab.session;
-        tab.outcome = Some(Outcome::Rows(set));
+        if let Some(t) = self.model.tab_mut(tab) {
+            t.result_session = t.session;
+            t.outcome = Some(Outcome::Rows(set));
+        }
+        if !active {
+            return;
+        }
         self.ui.clicks.forget();
         let loaded_text = super::view::thousands(loaded);
         if changed {
@@ -562,8 +631,9 @@ impl App {
         }
     }
 
-    /// When the time shown next changes: the notice's expiry, and while a run
-    /// is in flight, the next whole second of its elapsed time.
+    /// When the time shown next changes: the notice's expiry, and while the
+    /// active tab's run is in flight, the next whole second of its elapsed
+    /// time. A tab not on screen shows no time, so it wakes nothing.
     pub(super) fn query_deadline(&self) -> Option<Instant> {
         let notice = self.ui.notice.as_ref().map(|n| n.expires);
         let started = self.tab().run.in_flight().map(|(_, _, started)| started);
@@ -579,7 +649,9 @@ impl App {
         [notice, tick, bound].into_iter().flatten().min()
     }
 
-    /// Time passed: a notice may have expired, the running clock moved on.
+    /// Time passed: a notice may have expired, the running clock moved on, a
+    /// cancel may have taken too long (in any tab; only the active one
+    /// repaints).
     pub(super) fn on_time(&mut self, now: Instant, fx: &mut Effects) {
         let last = self.ui.now.replace(now);
         if self.ui.notice.as_ref().is_some_and(|n| now >= n.expires) {
@@ -592,10 +664,13 @@ impl App {
                 fx.repaint = true;
             }
         }
-        if let RunState::Cancelling { asked, stuck, .. } = &mut self.tab_mut().run {
-            if !*stuck && now >= *asked + CANCEL_BOUND {
-                *stuck = true;
-                fx.repaint = true;
+        let active = self.ui.tab.id;
+        for tab in &mut self.model.tabs {
+            if let RunState::Cancelling { asked, stuck, .. } = &mut tab.run {
+                if !*stuck && now >= *asked + CANCEL_BOUND {
+                    *stuck = true;
+                    fx.repaint |= tab.id == active;
+                }
             }
         }
     }
@@ -609,9 +684,14 @@ impl App {
         }
     }
 
-    /// What the editor's title says the tab runs on: `name / database`.
+    /// What the editor's title says the active tab runs on: `name / database`.
     pub(super) fn target_label(&self) -> Option<String> {
-        let at = self.tab().target.as_ref()?;
+        self.target_label_of(self.ui.tab.id)
+    }
+
+    /// `name / database` for tab `id`.
+    fn target_label_of(&self, id: TabId) -> Option<String> {
+        let at = self.model.tab(id)?.target.as_ref()?;
         let name = match &self.model.connections {
             Loadable::Ready(list) => list.iter().find(|c| c.id == at.connection).map(|c| c.name.clone()),
             _ => None,

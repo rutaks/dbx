@@ -179,45 +179,45 @@ impl App {
         let dialect = self.active_dialect();
         let target = self.tab().target.clone();
         let key = Key {
-            revision: self.ui.editor.revision(),
+            revision: self.ui.tab.editor.revision(),
             cache: self.model.completions.version,
             tree: self.model.schema.version(),
             target: target.clone(),
             dialect,
         };
-        if self.ui.marks.seen != Some(key.revision) {
-            self.ui.marks.seen = Some(key.revision);
-            self.ui.marks.edited_at = Some(now);
+        if self.ui.tab.marks.seen != Some(key.revision) {
+            self.ui.tab.marks.seen = Some(key.revision);
+            self.ui.tab.marks.edited_at = Some(now);
         }
-        let due = self.ui.marks.due.is_some_and(|d| now >= d);
-        if self.ui.marks.key.as_ref() == Some(&key) && !due {
+        let due = self.ui.tab.marks.due.is_some_and(|d| now >= d);
+        if self.ui.tab.marks.key.as_ref() == Some(&key) && !due {
             return;
         }
-        self.ui.marks.key = Some(key);
-        self.ui.marks.computed += 1;
+        self.ui.tab.marks.key = Some(key);
+        self.ui.tab.marks.computed += 1;
         let outcome = match target {
             Some(db) if self.core_names() => self.compute_marks(&db),
             _ => Outcome::default(),
         };
         let Outcome { found, mut needs, parse, keep, worked } = outcome;
-        self.ui.marks.marked += worked;
+        self.ui.tab.marks.marked += worked;
         for (key, relative) in keep {
-            if self.ui.marks.cache.len() >= MAX_CACHED {
-                self.ui.marks.cache.clear();
+            if self.ui.tab.marks.cache.len() >= MAX_CACHED {
+                self.ui.tab.marks.cache.clear();
             }
-            self.ui.marks.cache.insert(key, relative);
+            self.ui.tab.marks.cache.insert(key, relative);
         }
         // What the text says about itself is asked for once it has been still.
-        let still_since = self.ui.marks.edited_at.unwrap_or(now);
+        let still_since = self.ui.tab.marks.edited_at.unwrap_or(now);
         if parse.is_empty() {
-            self.ui.marks.due = None;
+            self.ui.tab.marks.due = None;
         } else if now >= still_since + PAUSE {
-            self.ui.marks.due = None;
+            self.ui.tab.marks.due = None;
             if let Some(db) = self.tab().target.clone() {
                 needs.extend(parse.into_iter().map(|(i, text)| (Need::Parse(db.clone(), i), text)));
             }
         } else {
-            self.ui.marks.due = Some(still_since + PAUSE);
+            self.ui.tab.marks.due = Some(still_since + PAUSE);
         }
         let mut rows: HashMap<usize, Vec<Mark>> = HashMap::new();
         let mut unresolved = Vec::new();
@@ -232,11 +232,11 @@ impl App {
         }
         unresolved.sort_unstable();
         unresolved.dedup();
-        if rows != self.ui.marks.rows {
+        if rows != self.ui.tab.marks.rows {
             fx.repaint = true;
         }
-        self.ui.marks.rows = rows;
-        self.ui.marks.unresolved = unresolved;
+        self.ui.tab.marks.rows = rows;
+        self.ui.tab.marks.unresolved = unresolved;
         if !needs.is_empty() {
             self.request_completion(needs, fx);
         }
@@ -244,7 +244,7 @@ impl App {
 
     fn compute_marks(&self, db: &DatabasePath) -> Outcome {
         let mut out = Outcome::default();
-        let lines = self.ui.editor.lines();
+        let lines = self.ui.tab.editor.lines();
         if lines.iter().map(String::len).sum::<usize>() > MAX_TEXT {
             return out;
         }
@@ -261,12 +261,13 @@ impl App {
         };
         for (i, st) in wanted {
             let key = StatementKey { db: db.clone(), text: st.text.clone(), cache: self.model.completions.schema_version, tree: self.model.schema.version() };
-            if let Some(relative) = self.ui.marks.cache.get(&key) {
+            if let Some(relative) = self.ui.tab.marks.cache.get(&key) {
                 out.found.extend(relative.iter().map(|&r| absolute(st.from, r)));
                 continue;
             }
             let known = self.model.completions.parsed.get(&(db.clone(), st.text.clone()));
-            let asked = self.model.completions.inflight.iter().any(|(n, (_, m))| matches!(n, Need::Parse(..)) && *m == st.text);
+            let tab = self.ui.tab.id;
+            let asked = self.model.completions.inflight.iter().any(|((t, n), (_, m))| *t == tab && matches!(n, Need::Parse(..)) && *m == st.text);
             let (marks, needs) = match known {
                 None if asked => continue,
                 None => {
@@ -311,7 +312,7 @@ impl App {
 
     fn mark_statement(&self, db: &DatabasePath, current: &str, st: &Statement, refs: &References) -> (Vec<Absolute>, Needs) {
         let (mut out, mut needs) = (Vec::new(), Vec::new());
-        let lines = self.ui.editor.lines();
+        let lines = self.ui.tab.editor.lines();
         let toks: Vec<&Token> = st.tokens.iter().collect();
         let parsed = Parsed::new(&toks, lines);
         // Whatever a set operation touches is left alone.
@@ -443,16 +444,16 @@ impl App {
     /// `F2` and `shift+F2`: the caret goes to the next or previous unresolved
     /// name, wrapping round the buffer.
     pub(super) fn goto_unresolved(&mut self, forward: bool, fx: &mut Effects) {
-        let caret = self.ui.editor.cursor();
+        let caret = self.ui.tab.editor.cursor();
         let at = (caret.row, caret.col);
-        let list = &self.ui.marks.unresolved;
+        let list = &self.ui.tab.marks.unresolved;
         let pick = if forward {
             list.iter().find(|p| **p > at).or(list.first())
         } else {
             list.iter().rev().find(|p| **p < at).or(list.last())
         };
         if let Some(&(row, col)) = pick {
-            self.ui.editor.move_to(Cursor { row, col });
+            self.ui.tab.editor.move_to(Cursor { row, col });
             fx.repaint = true;
         }
     }

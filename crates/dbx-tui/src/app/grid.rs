@@ -23,7 +23,7 @@ use super::query::{LoadMore, Outcome, RunState};
 use super::requests::Target;
 use super::viewer::{CellViewer, Scroll};
 use super::{App, Command, CoreCall, Effects};
-use crate::core::{row_ceiling, Cell, Cursor, Rerun, ResultSet, RunRequest};
+use crate::core::{row_ceiling, Cell, Cursor, Rerun, ResultSet, RunRequest, TabId};
 
 /// The most text one copy sends. The clipboard travels as an OSC 52 escape
 /// sequence (base64, so a third larger), and terminals cap those: xterm takes
@@ -49,8 +49,7 @@ pub struct Span {
     pub col: usize,
 }
 
-/// The grid's state. One per query tab; the tab bar arrives in slice 15, so
-/// it lives in `Ui` until then.
+/// The grid's state. One per query tab (`tab::TabUi`).
 #[derive(Debug, Clone, Default)]
 pub struct GridUi {
     /// The cursor: a row and a column of the result.
@@ -160,10 +159,10 @@ impl App {
 
     /// What a results key (or a click on its hint) does.
     pub(super) fn perform_results(&mut self, action: Action, _now: Instant, fx: &mut Effects) {
-        let Some(set) = shown(&self.model.tabs[0].outcome) else { return };
+        let Some(set) = shown(&self.model.active(self.ui.tab.id).outcome) else { return };
         let (rows, cols) = (set.rows.len(), set.columns.len());
-        let page = self.ui.grid.rows_visible.max(1);
-        let (row, col) = (self.ui.grid.row, self.ui.grid.col);
+        let page = self.ui.tab.grid.rows_visible.max(1);
+        let (row, col) = (self.ui.tab.grid.row, self.ui.tab.grid.col);
         match action {
             Action::OpenCell => {
                 if let Some(viewer) = CellViewer::open(set, row, col) {
@@ -177,7 +176,7 @@ impl App {
             Action::LoadMore => return self.load_more(_now, fx),
             _ => {}
         }
-        let g = &mut self.ui.grid;
+        let g = &mut self.ui.tab.grid;
         let last_row = rows.saturating_sub(1);
         match action {
             Action::GridLeft => g.col = col.saturating_sub(1),
@@ -201,7 +200,11 @@ impl App {
     /// `None` when it can go ahead (maybe after a question). The `m more` hint
     /// is shown only when this is `None`.
     pub(super) fn load_more_refusal(&self) -> Option<String> {
-        let tab = &self.model.tabs[0];
+        self.load_more_refusal_of(self.ui.tab.id)
+    }
+
+    fn load_more_refusal_of(&self, id: TabId) -> Option<String> {
+        let tab = self.model.tab(id)?;
         let set = shown(&tab.outcome).filter(|set| set.truncated)?;
         if tab.run.in_flight().is_some() {
             return Some("A statement is still running in this tab: load more once it has ended.".into());
@@ -230,33 +233,39 @@ impl App {
     /// ceiling. A statement that is read-only but that dbx cannot prove
     /// repeatable (it calls a function) is run only after the user says yes.
     pub(super) fn load_more(&mut self, now: Instant, fx: &mut Effects) {
-        let Some(set) = shown(&self.model.tabs[0].outcome).filter(|set| set.truncated) else { return };
+        let Some(set) = shown(&self.model.active(self.ui.tab.id).outcome).filter(|set| set.truncated) else { return };
         if let Some(text) = self.load_more_refusal() {
             return self.notify(text, true, fx);
         }
         if set.rerun == Rerun::ReadOnlyUnproven {
             let first = set.ran.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
-            self.ui.overlay = Some(Overlay::ConfirmRerun(ConfirmRerun { statement: first }));
+            self.ui.overlay = Some(Overlay::ConfirmRerun(ConfirmRerun { tab: self.ui.tab.id, statement: first }));
             fx.repaint = true;
             return;
         }
-        self.begin_load_more(now, fx);
+        self.begin_load_more(self.ui.tab.id, now, fx);
     }
 
     /// The answer yes to the re-run question.
     pub(super) fn confirm_rerun(&mut self, fx: &mut Effects) {
+        // The tab the question was asked in, whichever is active now.
+        let asked = match &self.ui.overlay {
+            Some(Overlay::ConfirmRerun(ask)) => Some(ask.tab),
+            _ => None,
+        };
         self.ui.overlay = None;
         fx.repaint = true;
+        let id = asked.unwrap_or(self.ui.tab.id);
         let now = self.ui.now.unwrap_or_else(Instant::now);
         // The state may have moved while the question was open.
-        if let Some(text) = self.load_more_refusal() {
+        if let Some(text) = self.load_more_refusal_of(id) {
             return self.notify(text, true, fx);
         }
-        self.begin_load_more(now, fx);
+        self.begin_load_more(id, now, fx);
     }
 
-    fn begin_load_more(&mut self, now: Instant, fx: &mut Effects) {
-        let tab = &self.model.tabs[0];
+    fn begin_load_more(&mut self, id: TabId, now: Instant, fx: &mut Effects) {
+        let Some(tab) = self.model.tab(id) else { return };
         let Some(set) = shown(&tab.outcome) else { return };
         let Some(target) = tab.target.clone() else { return };
         let fetched = set.rows.len();
@@ -265,32 +274,32 @@ impl App {
         // The whole statement is the selection, so the Core runs exactly it.
         let lines: Vec<&str> = set.ran.split('\n').collect();
         let end = Cursor { row: lines.len() - 1, col: lines.last().map_or(0, |l| l.chars().count()) };
-        let (ran, tab_id) = (set.ran.clone(), tab.id);
+        let (ran, session) = (set.ran.clone(), tab.session());
         let run = crate::core::RunId(self.model.next_run);
         self.model.next_run += 1;
-        let id = self.model.requests.begin(Target::Run(tab_id));
+        let request_id = self.model.requests.begin(Target::Run(id));
         let request = RunRequest {
             connection: target.connection,
             database: Some(target.database),
-            session: self.model.tabs[0].session(),
+            session,
             buffer: ran,
             cursor: Cursor::default(),
             selection: Some((Cursor::default(), end)),
             row_cap: cap,
         };
-        let tab = &mut self.model.tabs[0];
-        tab.run = RunState::Running { run, request: id, started: now };
+        let tab = self.model.active_mut(id);
+        tab.run = RunState::Running { run, request: request_id, started: now };
         tab.loading_more = Some(LoadMore { cap });
-        fx.commands.push(Command::Core(id, CoreCall::Run(run, request)));
+        fx.commands.push(Command::Core(request_id, CoreCall::Run(run, request)));
         fx.repaint = true;
     }
 
     /// The wheel over the results pane: `rows` rows and `cols` columns. The
     /// window moves; the cursor moves only as far as it must to stay in it.
     pub(super) fn scroll_grid(&mut self, rows: isize, cols: isize, fx: &mut Effects) {
-        let Some(set) = shown(&self.model.tabs[0].outcome) else { return };
+        let Some(set) = shown(&self.model.active(self.ui.tab.id).outcome) else { return };
         let (nrows, ncols) = (set.rows.len(), set.columns.len());
-        let g = &mut self.ui.grid;
+        let g = &mut self.ui.tab.grid;
         let before = (g.top, g.left, g.row, g.col);
         let room = g.rows_visible.max(1);
         g.top = g.top.saturating_add_signed(rows).min(nrows.saturating_sub(room));
@@ -312,8 +321,8 @@ impl App {
     /// Returns the cell the click landed on, when it landed on one (the gutter
     /// is not a cell), for double-clicks.
     pub(super) fn click_grid(&mut self, x: u16, y: u16, fx: &mut Effects) -> Option<(usize, usize)> {
-        let set = shown(&self.model.tabs[0].outcome)?;
-        let g = &mut self.ui.grid;
+        let set = shown(&self.model.active(self.ui.tab.id).outcome)?;
+        let g = &mut self.ui.tab.grid;
         if y < g.data.y || y >= g.data.bottom() {
             return None;
         }
@@ -340,8 +349,8 @@ impl App {
     /// jumps there (the thumb is centred on the press), or, on the thumb, it
     /// is grabbed where it was pressed. Returns the drag it begins.
     pub(super) fn press_grid_bar(&mut self, y: u16, fx: &mut Effects) -> Option<super::pointer::Drag> {
-        let set = shown(&self.model.tabs[0].outcome)?;
-        let (bar, top) = (self.ui.grid.bar, self.ui.grid.top);
+        let set = shown(&self.model.active(self.ui.tab.id).outcome)?;
+        let (bar, top) = (self.ui.tab.grid.bar, self.ui.tab.grid.top);
         let thumb = super::view::scrollbar_thumb(set.rows.len(), bar.height as usize, top)?;
         let (grab, _) = super::pointer::grab(thumb, y.saturating_sub(bar.y) as usize);
         self.drag_grid_bar(y, grab as u16, fx);
@@ -351,8 +360,8 @@ impl App {
     /// The pointer is at screen row `y` with the thumb grabbed `grab` rows
     /// below its top: scroll so the thumb is there.
     pub(super) fn drag_grid_bar(&mut self, y: u16, grab: u16, fx: &mut Effects) {
-        let Some(set) = shown(&self.model.tabs[0].outcome) else { return };
-        let (bar, top) = (self.ui.grid.bar, self.ui.grid.top);
+        let Some(set) = shown(&self.model.active(self.ui.tab.id).outcome) else { return };
+        let (bar, top) = (self.ui.tab.grid.bar, self.ui.tab.grid.top);
         let (total, room) = (set.rows.len(), bar.height as usize);
         let Some((_, len)) = super::view::scrollbar_thumb(total, room, top) else { return };
         let thumb_top = (y.saturating_sub(bar.y) as usize).saturating_sub(grab as usize);
@@ -415,8 +424,8 @@ impl App {
     }
 
     fn copy_cell(&mut self, fx: &mut Effects) {
-        let Some(set) = shown(&self.model.tabs[0].outcome) else { return };
-        match cell_at(set, self.ui.grid.row, self.ui.grid.col) {
+        let Some(set) = shown(&self.model.active(self.ui.tab.id).outcome) else { return };
+        match cell_at(set, self.ui.tab.grid.row, self.ui.tab.grid.col) {
             Some(Cell::Value(v)) => {
                 let v = v.clone();
                 self.copy_text(v, "cell", fx)
@@ -436,8 +445,8 @@ impl App {
     /// pasting it into a spreadsheet splits it: the text is exact, and the
     /// separators are the format's.
     fn copy_row(&mut self, fx: &mut Effects) {
-        let Some(set) = shown(&self.model.tabs[0].outcome) else { return };
-        let Some(row) = set.rows.get(self.ui.grid.row) else { return };
+        let Some(set) = shown(&self.model.active(self.ui.tab.id).outcome) else { return };
+        let Some(row) = set.rows.get(self.ui.tab.grid.row) else { return };
         let cells = (0..set.columns.len()).map(|c| match row.get(c) {
             Some(Cell::Value(v)) => v.as_str(),
             _ => "",

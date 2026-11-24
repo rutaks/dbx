@@ -89,13 +89,13 @@ pub(super) async fn type_and_settle(h: &mut Harness, text: &str) {
 }
 
 pub(super) fn names(h: &Harness) -> Vec<String> {
-    h.app.ui.complete.popup.items().iter().map(|i| i.name.clone()).collect()
+    h.app.ui.tab.complete.popup.items().iter().map(|i| i.name.clone()).collect()
 }
 
 /// The names that are not live templates (slice 12 lists those at a
 /// statement's start too).
 pub(super) fn keywords(h: &Harness) -> Vec<String> {
-    h.app.ui.complete.popup.items().iter().filter(|i| i.kind != ItemKind::Template).map(|i| i.name.clone()).collect()
+    h.app.ui.tab.complete.popup.items().iter().filter(|i| i.kind != ItemKind::Template).map(|i| i.name.clone()).collect()
 }
 
 pub(super) fn visible(h: &Harness) -> bool {
@@ -103,7 +103,7 @@ pub(super) fn visible(h: &Harness) -> bool {
 }
 
 pub(super) fn text(h: &Harness) -> String {
-    h.app.ui.editor.text()
+    h.app.ui.tab.editor.text()
 }
 
 /// The searches for schemas and tables, which are what a table position asks
@@ -139,7 +139,7 @@ async fn typing_sele_opens_the_popup_with_select_first_and_enter_leaves_select_i
     h.press("enter");
     assert_eq!(text(&h), "select", "enter inserts at the caret");
     assert!(!visible(&h), "and the popup is closed");
-    assert_eq!(h.app.ui.editor.cursor(), crate::core::Cursor { row: 0, col: 6 });
+    assert_eq!(h.app.ui.tab.editor.cursor(), crate::core::Cursor { row: 0, col: 6 });
 }
 
 #[tokio::test]
@@ -156,14 +156,14 @@ async fn enter_with_the_popup_open_is_not_a_line_break_and_with_it_closed_it_is(
 async fn tab_replaces_the_rest_of_the_word_to_the_right_and_enter_inserts_before_it() {
     for (key, want) in [("tab", "select * from film f"), ("enter", "select * from filmm_x")] {
         let mut h = editing(pagila()).await;
-        h.app.ui.editor.set_text("select * from film_x");
+        h.app.ui.tab.editor.set_text("select * from film_x");
         h.press("left left left");
         assert!(!visible(&h), "moving the caret opens nothing");
         h.press("ctrl+space");
         h.settle().await;
         assert!(names(&h).contains(&"film".to_string()), "{:?}", names(&h));
         let at = names(&h).iter().position(|n| n == "film").unwrap();
-        h.app.ui.complete.popup.select(at);
+        h.app.ui.tab.complete.popup.select(at);
         h.press(key);
         assert_eq!(text(&h), want, "{key}");
     }
@@ -179,7 +179,7 @@ async fn after_from_the_list_holds_tables_and_views_and_schemas_and_only_the_key
     for want in ["actor", "film", "film_list", "Order Items", "public", "staff"] {
         assert!(listed.iter().any(|n| n == want), "{want} in {listed:?}");
     }
-    for item in h.app.ui.complete.popup.items() {
+    for item in h.app.ui.tab.complete.popup.items() {
         if item.kind == ItemKind::Keyword {
             assert!(KEYWORDS_AFTER_FROM.contains(&item.name.as_str()), "keyword {} is not valid after from", item.name);
         }
@@ -188,7 +188,7 @@ async fn after_from_the_list_holds_tables_and_views_and_schemas_and_only_the_key
         assert!(!listed.iter().any(|n| n == not), "{not} in {listed:?}");
     }
     // The kinds are told apart.
-    let kind_of = |name: &str| h.app.ui.complete.popup.items().iter().find(|i| i.name == name).map(|i| i.kind);
+    let kind_of = |name: &str| h.app.ui.tab.complete.popup.items().iter().find(|i| i.name == name).map(|i| i.kind);
     assert_eq!(kind_of("film"), Some(ItemKind::Table));
     assert_eq!(kind_of("film_list"), Some(ItemKind::View));
     assert_eq!(kind_of("public"), Some(ItemKind::Schema));
@@ -202,7 +202,7 @@ async fn after_a_schema_and_a_dot_only_the_tables_of_that_schema_are_listed() {
     let listed = names(&h);
     assert!(listed.contains(&"film".to_string()) && listed.contains(&"actor".to_string()), "{listed:?}");
     assert!(!listed.contains(&"badge".to_string()), "a table of another schema: {listed:?}");
-    assert!(h.app.ui.complete.popup.items().iter().all(|i| matches!(i.kind, ItemKind::Table | ItemKind::View)), "{listed:?}");
+    assert!(h.app.ui.tab.complete.popup.items().iter().all(|i| matches!(i.kind, ItemKind::Table | ItemKind::View)), "{listed:?}");
     type_and_settle(&mut h, "fi").await;
     assert_eq!(names(&h), ["film", "film_list", "film_actor", "film_category"], "narrowed by what is typed, shorter first");
 }
@@ -210,15 +210,15 @@ async fn after_a_schema_and_a_dot_only_the_tables_of_that_schema_are_listed() {
 #[tokio::test]
 async fn a_dot_after_an_alias_lists_that_tables_columns_with_their_types() {
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select f. from film f");
+    h.app.ui.tab.editor.set_text("select f. from film f");
     h.press("home");
     for _ in 0..9 {
         h.press("right");
     }
-    assert_eq!(h.app.ui.editor.cursor().col, 9, "just after `f.`");
+    assert_eq!(h.app.ui.tab.editor.cursor().col, 9, "just after `f.`");
     h.press("ctrl+space");
     h.settle().await;
-    let items = h.app.ui.complete.popup.items();
+    let items = h.app.ui.tab.complete.popup.items();
     let listed: Vec<(&str, Option<&str>)> = items.iter().map(|i| (i.name.as_str(), i.detail.as_deref())).collect();
     assert_eq!(listed, [("film_id", Some("integer")), ("title", Some("text")), ("rating", Some("mpaa_rating"))]);
     assert!(items.iter().all(|i| i.kind == ItemKind::Column));
@@ -253,7 +253,7 @@ async fn the_initials_of_a_name_match_and_rank_below_a_name_that_starts_with_the
     type_and_settle(&mut h, "select * from fa").await;
     let listed = names(&h);
     assert_eq!(listed, ["fa_log", "film_actor"], "fa_log starts with fa; film_actor is fa by initials");
-    let tiers: Vec<_> = h.app.ui.complete.popup.items().iter().map(|i| i.matched.clone()).collect();
+    let tiers: Vec<_> = h.app.ui.tab.complete.popup.items().iter().map(|i| i.matched.clone()).collect();
     assert_eq!(tiers, [vec![0, 1], vec![0, 5]], "the matched characters are what is emphasised");
 }
 
@@ -263,7 +263,7 @@ async fn nothing_opens_inside_a_string_or_a_comment() {
         let mut h = editing(pagila()).await;
         type_and_settle(&mut h, sql).await;
         assert!(!visible(&h), "{sql}: {:?}", names(&h));
-        assert!(!h.app.ui.complete.is_open(), "{sql}");
+        assert!(!h.app.ui.tab.complete.is_open(), "{sql}");
     }
     // The key does not open one there either.
     let mut h = editing(pagila()).await;
@@ -304,7 +304,7 @@ async fn a_name_typed_in_full_that_is_all_there_is_to_offer_opens_no_popup_so_en
 async fn a_word_too_long_to_be_a_name_is_not_matched_against_anything() {
     let mut h = editing(pagila()).await;
     type_and_settle(&mut h, &format!("select {}", "a".repeat(300))).await;
-    assert!(!h.app.ui.complete.is_open());
+    assert!(!h.app.ui.tab.complete.is_open());
     assert!(h.tasks.is_empty());
     let longest = searches(&h).iter().map(|r| r.prefix.len()).max().unwrap_or(0);
     assert!(longest <= 128, "the Core was asked about a {longest}-character word");
@@ -317,13 +317,13 @@ async fn esc_closes_the_popup_and_leaves_the_text_and_the_next_esc_is_not_swallo
     let mut h = editing(pagila()).await;
     type_and_settle(&mut h, "sel").await;
     assert!(visible(&h));
-    let given = h.app.ui.editor.keys_given();
+    let given = h.app.ui.tab.editor.keys_given();
     h.press("esc");
-    assert!(!visible(&h) && !h.app.ui.complete.is_open());
+    assert!(!visible(&h) && !h.app.ui.tab.complete.is_open());
     assert_eq!(text(&h), "sel", "the text is untouched");
-    assert_eq!(h.app.ui.editor.keys_given(), given, "the first esc was the popup's");
+    assert_eq!(h.app.ui.tab.editor.keys_given(), given, "the first esc was the popup's");
     h.press("esc");
-    assert_eq!(h.app.ui.editor.keys_given(), given + 1, "the next esc went on to the editor");
+    assert_eq!(h.app.ui.tab.editor.keys_given(), given + 1, "the next esc went on to the editor");
     assert_eq!(text(&h), "sel");
 }
 
@@ -335,11 +335,11 @@ async fn esc_with_a_completion_that_has_nothing_to_show_yet_is_still_the_editors
     fake.script_catalogue(slow);
     let mut h = editing_on(fake).await;
     h.type_text("select * from fi");
-    assert!(h.app.ui.complete.is_open() && !visible(&h), "waiting for the Core, nothing to list yet");
-    let given = h.app.ui.editor.keys_given();
+    assert!(h.app.ui.tab.complete.is_open() && !visible(&h), "waiting for the Core, nothing to list yet");
+    let given = h.app.ui.tab.editor.keys_given();
     h.press("esc");
-    assert!(!h.app.ui.complete.is_open());
-    assert_eq!(h.app.ui.editor.keys_given(), given + 1, "nothing was shown, so nothing was swallowed");
+    assert!(!h.app.ui.tab.complete.is_open());
+    assert_eq!(h.app.ui.tab.editor.keys_given(), given + 1, "nothing was shown, so nothing was swallowed");
 }
 
 #[tokio::test]
@@ -351,20 +351,20 @@ async fn up_and_down_and_ctrl_n_and_ctrl_p_move_the_selection_and_stop_at_the_en
     let len = names(&h).len();
     assert!(len > 3);
     h.press("up");
-    assert_eq!(h.app.ui.complete.popup.selected(), 0, "up at the first item stays");
+    assert_eq!(h.app.ui.tab.complete.popup.selected(), 0, "up at the first item stays");
     h.press("down down");
-    assert_eq!(h.app.ui.complete.popup.selected(), 2);
+    assert_eq!(h.app.ui.tab.complete.popup.selected(), 2);
     h.press("ctrl+n");
-    assert_eq!(h.app.ui.complete.popup.selected(), 3);
+    assert_eq!(h.app.ui.tab.complete.popup.selected(), 3);
     h.press("ctrl+p ctrl+p");
-    assert_eq!(h.app.ui.complete.popup.selected(), 1);
+    assert_eq!(h.app.ui.tab.complete.popup.selected(), 1);
     for _ in 0..len + 3 {
         h.press("down");
     }
-    assert_eq!(h.app.ui.complete.popup.selected(), len - 1, "down at the last item stays");
+    assert_eq!(h.app.ui.tab.complete.popup.selected(), len - 1, "down at the last item stays");
     assert_eq!(text(&h), "select * from ", "none of it reached the text");
     h.press("pageup");
-    assert!(h.app.ui.complete.popup.selected() < len - 1);
+    assert!(h.app.ui.tab.complete.popup.selected() < len - 1);
 }
 
 #[tokio::test]
@@ -377,12 +377,12 @@ async fn a_list_longer_than_the_popup_scrolls() {
     h.type_text("select * from zz");
     h.settle().await;
     assert_eq!(names(&h).len(), 25);
-    assert_eq!(h.app.ui.complete.popup.rows(), super::complete_popup::MAX_ROWS);
+    assert_eq!(h.app.ui.tab.complete.popup.rows(), super::complete_popup::MAX_ROWS);
     for _ in 0..14 {
         h.press("down");
     }
-    assert_eq!(h.app.ui.complete.popup.selected(), 14);
-    assert_eq!(h.app.ui.complete.popup.top(), 5, "the window followed the selection");
+    assert_eq!(h.app.ui.tab.complete.popup.selected(), 14);
+    assert_eq!(h.app.ui.tab.complete.popup.top(), 5, "the window followed the selection");
     let rows = frame_rows(&mut h.app, 114, 30);
     assert!(rows.iter().any(|r| r.contains("zz14")), "the selected row is on screen");
     assert!(!rows.iter().any(|r| r.contains("zz00")), "the first rows scrolled out");
@@ -402,13 +402,13 @@ async fn any_other_key_goes_to_the_editor_and_the_list_follows_the_text() {
     assert!(names(&h).contains(&"film".to_string()));
     // Leaving the word closes it.
     h.type_text(" ");
-    assert!(!h.app.ui.complete.is_open());
+    assert!(!h.app.ui.tab.complete.is_open());
     // Moving the caret out of the word closes it too.
     let mut h = editing(pagila()).await;
     type_and_settle(&mut h, "select * from fi").await;
     assert!(visible(&h));
     h.press("home");
-    assert!(!h.app.ui.complete.is_open(), "the caret left the word");
+    assert!(!h.app.ui.tab.complete.is_open(), "the caret left the word");
 }
 
 // ---- quoting ------------------------------------------------------------------------
@@ -519,7 +519,7 @@ async fn a_function_is_searched_for_by_what_is_typed_and_listed_after_the_keywor
     type_and_settle(&mut h, "select lo").await;
     assert_eq!(names(&h)[0], "lower", "a prefix match of the shorter name comes first");
     assert!(names(&h).contains(&"locked".to_string()), "keywords are in the list too");
-    let found = h.app.ui.complete.popup.items()[0].clone();
+    let found = h.app.ui.tab.complete.popup.items()[0].clone();
     assert_eq!((found.kind, found.detail.as_deref()), (ItemKind::Function, Some("text")));
     let functions: Vec<_> = searches(&h).into_iter().filter(|r| r.kind == SearchKind::Function).collect();
     assert_eq!(functions.iter().map(|r| r.schema.clone().unwrap()).collect::<Vec<_>>(), ["public", "pg_catalog"]);
@@ -535,7 +535,7 @@ async fn the_common_aggregates_are_listed_without_the_core_because_dbxs_search_d
     let mut h = editing_on(fake).await;
     h.type_text("select cou");
     assert_eq!(names(&h), ["count"], "from the client's own list, with the Core still thinking");
-    let count = &h.app.ui.complete.popup.items()[0];
+    let count = &h.app.ui.tab.complete.popup.items()[0];
     assert_eq!(count.kind, ItemKind::Function);
     // Not offered where only a table is.
     let mut h = editing(pagila()).await;
@@ -546,7 +546,7 @@ async fn the_common_aggregates_are_listed_without_the_core_because_dbxs_search_d
 #[tokio::test]
 async fn columns_of_the_tables_in_the_statement_are_listed_with_the_keywords() {
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select ti from film");
+    h.app.ui.tab.editor.set_text("select ti from film");
     h.press("home");
     for _ in 0..9 {
         h.press("right");
@@ -554,7 +554,7 @@ async fn columns_of_the_tables_in_the_statement_are_listed_with_the_keywords() {
     h.press("ctrl+space");
     h.settle().await;
     assert_eq!(names(&h)[0], "title");
-    assert!(h.app.ui.complete.popup.items().iter().any(|i| i.kind == ItemKind::Keyword), "keywords match `ti`: {:?}", names(&h));
+    assert!(h.app.ui.tab.complete.popup.items().iter().any(|i| i.kind == ItemKind::Keyword), "keywords match `ti`: {:?}", names(&h));
 }
 
 #[tokio::test]
@@ -562,12 +562,12 @@ async fn a_kind_other_than_postgres_gets_keywords_and_the_core_is_never_asked() 
     let mut h = editing(pagila()).await;
     h.app.model.connections = Loadable::Ready(vec![super::connections_tests::conn("local pg", DbKind::MySql)]);
     // The tab's connection is now a MySQL one.
-    h.app.ui.editor.set_text("");
+    h.app.ui.tab.editor.set_text("");
     let before = h.fake.calls().len();
     type_and_settle(&mut h, "sele").await;
     assert_eq!(names(&h)[0], "select");
     type_and_settle(&mut h, "ct * from fi").await;
-    assert!(h.app.ui.complete.popup.items().iter().all(|i| i.kind == ItemKind::Keyword), "{:?}", names(&h));
+    assert!(h.app.ui.tab.complete.popup.items().iter().all(|i| i.kind == ItemKind::Keyword), "{:?}", names(&h));
     assert_eq!(h.fake.calls().len(), before, "nothing was asked of the Core");
 }
 
@@ -579,7 +579,7 @@ async fn a_failing_core_leaves_the_keywords_and_is_not_asked_again_on_every_key(
     let asked = h.fake.calls().len();
     assert!(visible(&h), "keywords are still offered");
     // Keywords, and the functions the client knows without the Core.
-    assert!(h.app.ui.complete.popup.items().iter().all(|i| i.kind == ItemKind::Keyword || (i.kind == ItemKind::Function && i.detail.is_none())));
+    assert!(h.app.ui.tab.complete.popup.items().iter().all(|i| i.kind == ItemKind::Keyword || (i.kind == ItemKind::Function && i.detail.is_none())));
     type_and_settle(&mut h, "tl").await;
     type_and_settle(&mut h, "e").await;
     assert_eq!(h.fake.calls().len(), asked, "a failure is not retried while the part of the tree is not refreshed");
@@ -611,7 +611,7 @@ async fn while_a_call_is_in_flight_typed_characters_appear_at_once_and_the_list_
     h.type_text("n");
     assert_eq!(text(&h), "select len");
     assert!(!visible(&h), "nothing cached matches `len` yet");
-    assert!(h.app.ui.complete.is_open(), "but it is waiting");
+    assert!(h.app.ui.tab.complete.is_open(), "but it is waiting");
     for _ in 0..2 {
         h.settle().await;
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -628,17 +628,17 @@ async fn a_reply_that_arrives_after_the_caret_left_the_word_does_not_open_or_cha
     fake.script_catalogue(slow);
     let mut h = editing_on(fake).await;
     h.type_text("select * from fi");
-    assert!(h.app.ui.complete.is_open() && !visible(&h));
+    assert!(h.app.ui.tab.complete.is_open() && !visible(&h));
     // The caret leaves the word before the reply comes.
     h.type_text(" ");
-    assert!(!h.app.ui.complete.is_open());
+    assert!(!h.app.ui.tab.complete.is_open());
     h.settle().await;
     tokio::time::advance(Duration::from_secs(5)).await;
     let repainted = h.repaints;
     h.settle().await;
     assert_eq!(h.repaints, repainted, "the reply changed nothing on screen, so it repainted nothing");
-    assert!(h.app.ui.complete.popup.is_empty(), "no popup was opened");
-    assert!(!visible(&h) && !h.app.ui.complete.is_open());
+    assert!(h.app.ui.tab.complete.popup.is_empty(), "no popup was opened");
+    assert!(!visible(&h) && !h.app.ui.tab.complete.is_open());
     assert_eq!(text(&h), "select * from fi ");
     assert!(!h.app.model.completions.is_empty(), "what it said was kept for later");
 }
@@ -652,7 +652,7 @@ async fn a_reply_for_a_word_the_caret_has_moved_to_another_of_changes_nothing() 
     let mut h = editing_on(fake).await;
     h.type_text("select * from fi");
     h.type_text(" where ti");
-    let anchor = h.app.ui.complete.anchor();
+    let anchor = h.app.ui.tab.complete.anchor();
     assert_eq!(anchor, Some(crate::core::Cursor { row: 0, col: 23 }), "the second word");
     for _ in 0..3 {
         h.settle().await;
@@ -660,7 +660,7 @@ async fn a_reply_for_a_word_the_caret_has_moved_to_another_of_changes_nothing() 
     }
     h.settle().await;
     // The popup is for `ti`, not `fi`.
-    for item in h.app.ui.complete.popup.items() {
+    for item in h.app.ui.tab.complete.popup.items() {
         assert!(item.name.to_lowercase().contains("ti"), "{item:?}");
     }
 }
@@ -696,7 +696,7 @@ async fn a_longer_word_that_needs_a_new_search_makes_the_older_reply_stale() {
     assert_eq!(prefixes, ["", "zz00"], "{prefixes:?}");
     tokio::time::advance(Duration::from_secs(5)).await;
     h.settle().await;
-    assert!(h.app.ui.complete.popup.items().iter().all(|i| i.name.starts_with("zz00")), "{:?}", names(&h).len());
+    assert!(h.app.ui.tab.complete.popup.items().iter().all(|i| i.name.starts_with("zz00")), "{:?}", names(&h).len());
 }
 
 // ---- how it looks and the mouse ---------------------------------------------------------------
@@ -759,27 +759,27 @@ async fn the_popup_goes_above_the_word_when_there_is_no_room_below_and_is_clippe
     let mut h = editing(pagila()).await;
     h.app.ui.layout.editor = Some(940);
     let lines: Vec<String> = (1..=24).map(|i| format!("select {i};")).collect();
-    h.app.ui.editor.set_text(&format!("{}\nselect * from ", lines.join("\n")));
+    h.app.ui.tab.editor.set_text(&format!("{}\nselect * from ", lines.join("\n")));
     h.press("ctrl+space");
     h.settle().await;
     frame_rows(&mut h.app, 114, 30);
     let popup = h.app.ui.hits.popup;
     // The editor scrolled to keep the caret in view.
-    let caret_row = h.app.ui.hits.editor_text.y + (24 - h.app.ui.editor.scroll_top().0) as u16;
+    let caret_row = h.app.ui.hits.editor_text.y + (24 - h.app.ui.tab.editor.scroll_top().0) as u16;
     assert!(!popup.is_empty());
     assert_eq!(popup.bottom(), caret_row, "above the caret's row, ending where it begins");
     assert!(popup.bottom() <= 30 && popup.right() <= 114);
 
     // In a terminal that is too small for either side, it is cut to fit.
     let mut small = editing(pagila()).await;
-    small.app.ui.editor.set_text("select * from ");
+    small.app.ui.tab.editor.set_text("select * from ");
     small.press("ctrl+space");
     small.settle().await;
     let rows = frame_rows(&mut small.app, 60, 8);
     assert_eq!(rows.len(), 8);
     let popup = small.app.ui.hits.popup;
     assert!(popup.bottom() <= 8 && popup.right() <= 60, "{popup:?}");
-    assert!(small.app.ui.complete.popup.selected() >= small.app.ui.complete.popup.top());
+    assert!(small.app.ui.tab.complete.popup.selected() >= small.app.ui.tab.complete.popup.top());
 }
 
 #[tokio::test]
@@ -789,7 +789,7 @@ async fn a_click_on_an_item_accepts_it_and_a_click_elsewhere_closes_the_popup() 
     frame_rows(&mut h.app, 114, 30);
     let popup = h.app.ui.hits.popup;
     let third = Rect { x: popup.x + 2, y: popup.y + 2, width: 1, height: 1 };
-    assert_eq!(h.app.ui.complete.popup.items()[2].name, "film_actor");
+    assert_eq!(h.app.ui.tab.complete.popup.items()[2].name, "film_actor");
     let fx = click(&mut h.app, third);
     h.run(fx);
     assert_eq!(text(&h), "select * from film_actor fa");
@@ -801,7 +801,7 @@ async fn a_click_on_an_item_accepts_it_and_a_click_elsewhere_closes_the_popup() 
     let text_area = h.app.ui.hits.editor_text;
     let fx = click(&mut h.app, Rect { x: text_area.x + 2, y: text_area.y, width: 1, height: 1 });
     h.run(fx);
-    assert!(!visible(&h) && !h.app.ui.complete.is_open());
+    assert!(!visible(&h) && !h.app.ui.tab.complete.is_open());
     assert_eq!(text(&h), "select * from fi", "the click only moved the caret");
 }
 
@@ -820,9 +820,9 @@ async fn the_wheel_over_the_popup_scrolls_its_list_and_not_the_editor() {
     let ev = |kind| crossterm::event::MouseEvent { kind, column, row, modifiers: crossterm::event::KeyModifiers::NONE };
     let scroll = h.app.update(Event::Mouse(ev(crossterm::event::MouseEventKind::ScrollDown)), base());
     assert!(scroll.repaint);
-    assert_eq!(h.app.ui.complete.popup.top(), 3);
-    assert_eq!(h.app.ui.complete.popup.selected(), 0, "the selection stayed where it was");
-    assert_eq!(h.app.ui.editor.scroll_top(), (0, 0));
+    assert_eq!(h.app.ui.tab.complete.popup.top(), 3);
+    assert_eq!(h.app.ui.tab.complete.popup.selected(), 0, "the selection stayed where it was");
+    assert_eq!(h.app.ui.tab.editor.scroll_top(), (0, 0));
 }
 
 #[tokio::test]
@@ -830,13 +830,13 @@ async fn a_popup_does_not_survive_the_editor_losing_focus_or_a_paste() {
     let mut h = editing(pagila()).await;
     type_and_settle(&mut h, "sel").await;
     h.press("ctrl+g");
-    assert!(!h.app.ui.complete.is_open(), "the prefix key closes it");
+    assert!(!h.app.ui.tab.complete.is_open(), "the prefix key closes it");
     h.press("esc");
     type_and_settle(&mut h, "e").await;
     assert!(visible(&h));
     let fx = h.app.update(Event::Paste("x".into()), base());
     h.run(fx);
-    assert!(!h.app.ui.complete.is_open());
+    assert!(!h.app.ui.tab.complete.is_open());
 }
 
 #[tokio::test]
@@ -845,7 +845,7 @@ async fn moving_the_focus_to_another_pane_closes_the_popup() {
     type_and_settle(&mut h, "sel").await;
     assert!(visible(&h));
     h.press("ctrl+g h");
-    assert!(!h.app.ui.complete.is_open());
+    assert!(!h.app.ui.tab.complete.is_open());
 }
 
 // ---- enter is a line break when the word is already typed in full ------------------------
@@ -891,7 +891,7 @@ async fn enter_accepts_when_the_selection_was_moved_and_tab_accepts_the_exact_ma
     let mut h = editing(with_events()).await;
     type_and_settle(&mut h, "select * from events where id").await;
     h.press("down");
-    assert_eq!(h.app.ui.complete.popup.selected_item().unwrap().name, "identity");
+    assert_eq!(h.app.ui.tab.complete.popup.selected_item().unwrap().name, "identity");
     h.press("enter");
     assert_eq!(text(&h), "select * from events where identity", "the user chose it");
 
@@ -915,7 +915,7 @@ async fn enter_accepts_when_the_selection_was_moved_and_tab_accepts_the_exact_ma
 #[tokio::test]
 async fn a_name_typed_in_full_in_quotes_is_a_line_break_too() {
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select * from \"Order Items\"");
+    h.app.ui.tab.editor.set_text("select * from \"Order Items\"");
     h.press("left");
     h.press("ctrl+space");
     h.settle().await;
@@ -930,7 +930,7 @@ async fn a_name_typed_in_full_in_quotes_is_a_line_break_too() {
 async fn typing_an_alias_after_a_table_opens_no_popup_and_enter_is_a_line_break_but_the_key_still_lists() {
     let mut h = editing(pagila()).await;
     type_and_settle(&mut h, "select * from film f").await;
-    assert!(!visible(&h) && !h.app.ui.complete.is_open(), "{:?}", names(&h));
+    assert!(!visible(&h) && !h.app.ui.tab.complete.is_open(), "{:?}", names(&h));
     h.press("enter");
     assert_eq!(text(&h), "select * from film f\n");
 
@@ -953,7 +953,7 @@ async fn enter_in_a_closed_quoted_name_replaces_it_through_the_closing_quote() {
         ("select * from \"Ord\" o", "select * from \"Order Items\" o"),
     ] {
         let mut h = editing(pagila()).await;
-        h.app.ui.editor.set_text(sql);
+        h.app.ui.tab.editor.set_text(sql);
         h.press("home");
         for _ in 0..17 {
             h.press("right");
@@ -970,7 +970,7 @@ async fn enter_in_a_closed_quoted_name_replaces_it_through_the_closing_quote() {
 async fn tab_and_enter_with_the_caret_mid_word_in_a_closed_quote_leave_one_closing_quote() {
     for key in ["enter", "tab"] {
         let mut h = editing(pagila()).await;
-        h.app.ui.editor.set_text("select * from \"Orders\"");
+        h.app.ui.tab.editor.set_text("select * from \"Orders\"");
         h.press("home");
         for _ in 0..17 {
             h.press("right");
@@ -980,7 +980,7 @@ async fn tab_and_enter_with_the_caret_mid_word_in_a_closed_quote_leave_one_closi
         assert_eq!(names(&h), ["Order Items"]);
         h.press(key);
         assert_eq!(text(&h), "select * from \"Order Items\" oi", "{key}");
-        assert_eq!(h.app.ui.editor.cursor().col, 30, "{key}: the caret is after the name and its alias");
+        assert_eq!(h.app.ui.tab.editor.cursor().col, 30, "{key}: the caret is after the name and its alias");
     }
 }
 
@@ -990,15 +990,15 @@ async fn a_quoted_name_is_offered_names_and_no_keywords_or_functions() {
     type_and_settle(&mut h, "select * from \"sel").await;
     assert!(!visible(&h), "no table matches `sel`, and `select` is not a name: {:?}", names(&h));
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select \"lo\" from film");
+    h.app.ui.tab.editor.set_text("select \"lo\" from film");
     h.press("home");
     for _ in 0..10 {
         h.press("right");
     }
     h.press("ctrl+space");
     h.settle().await;
-    assert!(h.app.ui.complete.popup.items().iter().all(|i| !matches!(i.kind, ItemKind::Keyword | ItemKind::Function)), "{:?}", names(&h));
-    h.app.ui.editor.set_text("select * from \"sel\"");
+    assert!(h.app.ui.tab.complete.popup.items().iter().all(|i| !matches!(i.kind, ItemKind::Keyword | ItemKind::Function)), "{:?}", names(&h));
+    h.app.ui.tab.editor.set_text("select * from \"sel\"");
     h.press("left");
     h.press("ctrl+space");
     h.settle().await;
@@ -1011,12 +1011,12 @@ async fn a_quoted_name_is_offered_names_and_no_keywords_or_functions() {
 #[tokio::test]
 async fn one_undo_restores_the_text_from_before_an_acceptance_and_one_redo_puts_it_back() {
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select * from fil_x");
+    h.app.ui.tab.editor.set_text("select * from fil_x");
     h.press("left left left");
     h.press("ctrl+space");
     h.settle().await;
     let at = names(&h).iter().position(|n| n == "film").unwrap();
-    h.app.ui.complete.popup.select(at);
+    h.app.ui.tab.complete.popup.select(at);
     h.press("tab");
     assert_eq!(text(&h), "select * from film f");
     h.press("ctrl+z");
@@ -1051,7 +1051,7 @@ async fn a_reply_that_re_ranks_the_list_keeps_the_item_the_user_has_seen_highlig
     }
     h.settle().await;
     assert_eq!(names(&h)[0], "lob", "the reply is a better match, and sorts first");
-    assert_eq!(h.app.ui.complete.popup.selected_item().unwrap().name, drawn, "but the highlighted item is the one that was drawn");
+    assert_eq!(h.app.ui.tab.complete.popup.selected_item().unwrap().name, drawn, "but the highlighted item is the one that was drawn");
     h.press("enter");
     assert_eq!(text(&h), "select locked", "enter inserted what the user saw");
 }
@@ -1070,7 +1070,7 @@ async fn a_reply_before_any_frame_showed_the_list_may_change_the_top_item() {
         tokio::time::advance(Duration::from_secs(5)).await;
     }
     h.settle().await;
-    assert_eq!(h.app.ui.complete.popup.selected_item().unwrap().name, "lob", "nothing was drawn, so the best match is the top");
+    assert_eq!(h.app.ui.tab.complete.popup.selected_item().unwrap().name, "lob", "nothing was drawn, so the best match is the top");
 }
 
 // ---- a failing Core ----------------------------------------------------------------------------------
@@ -1098,7 +1098,7 @@ async fn a_core_error_says_so_once_and_the_key_asks_again() {
     assert!(h.fake.calls().len() > asked, "asked again");
     assert!(notice(&h).is_none(), "{:?}", notice(&h));
     h.press("esc");
-    h.app.ui.editor.set_text("select * from fi");
+    h.app.ui.tab.editor.set_text("select * from fi");
     h.press("ctrl+space");
     h.settle().await;
     assert!(names(&h).contains(&"film".to_string()), "{:?}", names(&h));
@@ -1118,7 +1118,7 @@ async fn a_name_with_a_control_character_is_not_offered() {
     assert_eq!(names(&h), ["bad_ok"]);
     h.press("down");
     h.press("enter");
-    assert_eq!(h.app.ui.editor.lines().len(), 1, "nothing was split across rows: {:?}", h.app.ui.editor.lines());
+    assert_eq!(h.app.ui.tab.editor.lines().len(), 1, "nothing was split across rows: {:?}", h.app.ui.tab.editor.lines());
 }
 
 // ---- work done while typing -----------------------------------------------------------------------
@@ -1127,11 +1127,11 @@ async fn a_name_with_a_control_character_is_not_offered() {
 async fn typing_a_word_tokenizes_nothing_between_frames_and_one_frame_does_it_once() {
     let mut h = editing(pagila()).await;
     frame_rows(&mut h.app, 114, 30);
-    let base = h.app.ui.syntax.stats().runs;
+    let base = h.app.ui.tab.syntax.stats().runs;
     h.type_text("selectfilm");
-    assert_eq!(h.app.ui.syntax.stats().runs, base, "ten keystrokes between frames: no pass over the buffer");
+    assert_eq!(h.app.ui.tab.syntax.stats().runs, base, "ten keystrokes between frames: no pass over the buffer");
     frame_rows(&mut h.app, 114, 30);
-    assert_eq!(h.app.ui.syntax.stats().runs, base + 1, "the frame took one");
+    assert_eq!(h.app.ui.tab.syntax.stats().runs, base + 1, "the frame took one");
 }
 
 #[tokio::test]
@@ -1139,14 +1139,14 @@ async fn a_string_the_windowed_read_cannot_see_closes_the_popup_at_the_next_fram
     // The `;` on the row above the caret cuts the window, so the string that
     // began before it is not seen as one: the frame's full tokenization is.
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select 'abc\nmore; text\nsel");
+    h.app.ui.tab.editor.set_text("select 'abc\nmore; text\nsel");
     h.press("ctrl+space");
     h.settle().await;
     frame_rows(&mut h.app, 114, 30);
     assert!(!visible(&h), "{:?}", names(&h));
     // And `enter` before any frame does not put a keyword in the string.
     let mut h = editing(pagila()).await;
-    h.app.ui.editor.set_text("select 'abc\nmore; text\nsel");
+    h.app.ui.tab.editor.set_text("select 'abc\nmore; text\nsel");
     h.press("ctrl+space");
     h.press("enter");
     assert!(!text(&h).contains("select\nmore") && !text(&h).ends_with("select"), "{}", text(&h));
@@ -1176,16 +1176,16 @@ async fn a_run_that_mentions_search_path_drops_the_cached_current_schema_and_oth
     h.fake.script_run(Scripted::ok(super::run_tests::rows_of(&[&["1"]])));
     h.press("f5");
     ran_to_the_end(&mut h).await;
-    h.app.ui.editor.set_text("select * from fi");
+    h.app.ui.tab.editor.set_text("select * from fi");
     h.press("ctrl+space");
     h.settle().await;
     assert_eq!(current_schema_calls(&h), 1, "kept");
     // One that sets the search path drops it.
-    h.app.ui.editor.set_text("SET search_path TO staff");
+    h.app.ui.tab.editor.set_text("SET search_path TO staff");
     h.fake.script_run(Scripted::ok(super::run_tests::rows_of(&[])));
     h.press("f5");
     ran_to_the_end(&mut h).await;
-    h.app.ui.editor.set_text("select * from fi");
+    h.app.ui.tab.editor.set_text("select * from fi");
     h.press("ctrl+space");
     h.settle().await;
     assert_eq!(current_schema_calls(&h), 2, "asked again after the run");

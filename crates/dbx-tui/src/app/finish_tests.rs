@@ -64,7 +64,7 @@ async fn the_keys_complete_the_statement_in_one_undo_step() {
         put(&mut h, "select count(*|");
         h.press(keys);
         assert_eq!(text(&h), "select count(*);", "{keys}");
-        assert_eq!(h.app.ui.editor.cursor(), Cursor { row: 0, col: 16 }, "{keys}");
+        assert_eq!(h.app.ui.tab.editor.cursor(), Cursor { row: 0, col: 16 }, "{keys}");
         h.press("ctrl+z");
         assert_eq!(text(&h), "select count(*", "{keys}: one undo");
     }
@@ -74,10 +74,10 @@ async fn the_keys_complete_the_statement_in_one_undo_step() {
 async fn with_nothing_to_add_the_key_changes_nothing_and_leaves_no_undo_step() {
     let mut h = editing(pagila()).await;
     put(&mut h, "select 1;|");
-    let revision = h.app.ui.editor.revision();
+    let revision = h.app.ui.tab.editor.revision();
     h.press("cmd+shift+enter");
     assert_eq!(text(&h), "select 1;");
-    assert_eq!(h.app.ui.editor.revision(), revision);
+    assert_eq!(h.app.ui.tab.editor.revision(), revision);
 }
 
 #[tokio::test]
@@ -111,10 +111,10 @@ async fn a_statement_with_an_unterminated_string_comment_or_dollar_body_is_left_
     for (sql, what) in [("select 'abc|", "string"), ("select 1 /* later|", "comment"), ("do $$ begin perform 1|", "dollar"), ("select (1, 'x|", "string")] {
         let mut h = editing(pagila()).await;
         put(&mut h, sql);
-        let revision = h.app.ui.editor.revision();
+        let revision = h.app.ui.tab.editor.revision();
         h.press("cmd+shift+enter");
         assert_eq!(text(&h), sql.replace('|', ""), "{sql}");
-        assert_eq!(h.app.ui.editor.revision(), revision, "{sql}");
+        assert_eq!(h.app.ui.tab.editor.revision(), revision, "{sql}");
         let said = h.app.ui.notice.as_ref().map(|n| n.text.clone()).unwrap_or_default();
         assert!(said.contains("not finished") && said.contains(what), "{sql}: {said:?}");
     }
