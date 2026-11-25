@@ -395,6 +395,60 @@ through the painter (control characters become `�`); an inserted statement goe
 through the editor's paste cleaning. A failed search says why and that typing
 searches again; an empty history says to run a statement with the run key.
 
+## Export and copy (slice 19)
+
+In the results pane `e` opens the export overlay and `C` the copy-as list. Both
+work on **the rows the client holds**: when the row cap cut the result, the
+overlay says the file will hold the first N rows and that load more (`m`) or a
+narrower query gets the rest. Nothing re-runs the statement.
+
+- **Export to a file.** The overlay offers CSV, JSON, Excel, Markdown and SQL
+  INSERT statements, a path (default `<cwd>/<name>-<YYYYMMDD-HHMMSS>.<ext>`,
+  where `<name>` is the table of a browse tab and `result` otherwise; the
+  directory is the one the client was started in), for SQL the target table
+  and schema (the same default name; the schema of a browse tab), and for CSV
+  whether NULL is `\N` or an empty field. `tab`/`shift+tab` or the arrows move
+  between rows; `left`/`right` or `1`-`5` pick a format; `enter` writes; `esc`
+  closes. Each format's losses are listed in the overlay before writing.
+- **Writing** is a shell command (`Command::Export`), off the event loop: the
+  bytes go to a hidden temporary file in the target's directory, then a rename
+  (a hard link when the name must be new) puts them in place. A file that is
+  there is replaced only after a question that names it (`y`; `enter` is not a
+  yes; `esc` returns to the overlay as it was). A directory that is not there is
+  refused by name and not made. The notice (path, rows, bytes) appears only after
+  the shell reports the write returned success; a failure names the path and the
+  error and leaves the overlay as typed. Quitting waits a moment for a write in
+  flight.
+- **Copy as** (`C`, then `1` CSV, `2` JSON, `3` Markdown, `4` SQL INSERT, or the
+  arrows and `enter`, or a click) sends the text to the clipboard through
+  OSC 52, like the other copies, and says "Sent ... to the terminal clipboard".
+  Over 75,000 bytes it is refused, and the notice suggests exporting to a file.
+- **Row copy** (`Y`) says "Lossy: ..." when pasting may not give the row back:
+  NULL and an empty string both occur (both paste as an empty field), or a cell
+  holds a tab or a line break (a spreadsheet splits on it).
+
+dbx's own formats do the work (`dbx_core::csv_export`, `text_export`,
+`xlsx_export`, `database_export`; no new dependency). Our cells are exact text,
+dbx's formats take JSON values, so the adapter converts: NULL is `null`; an
+integer column's text is a JSON number only when it is exactly the text of an
+`i64` or a `u64`; everything else is a string with the exact text. A row longer
+than the header loses the cells past it; a shorter one stays short (a missing
+cell is not NULL). The values are the ones the client holds, so the known
+differences of `tests/fixtures/KNOWN_DIFFERENCES.md` come along (NaN and the
+infinities are NULL, for one).
+
+### What each format loses
+
+| Format | Loses, or changes | Checked by |
+|---|---|---|
+| CSV | Everything is quoted (`"1"`), NULL is a bare `\N` (or a bare empty field when the literal is empty, which a reader may take for `''`; the empty string is `""` either way). **The formula guard:** a text value whose first character after spaces is `=`, `+`, `-` (unless the whole value is a decimal of up to 15 digits), `@` (when an ASCII character follows), a tab or a carriage return gets a `'` in front; the file then holds the value with that `'`. A value that starts with `'` and would be read as guarded gets a second one. Integers that fit 64 bits are written without the guard. | `csv_read_back_equals_psqls_values...`: 5 cells of the fixtures carry the guard |
+| JSON | Nothing: NULL is `null`, an integer column's value that fits 64 bits is a number (`9007199254740993` exact), everything else is the exact text; keys are in column order. | `json_read_back_keeps_null...` |
+| Excel | NULL and `''` both **show** as an empty cell; the file tells them apart (NULL is a cell with no value, `''` is a text cell holding nothing). Text in a date or timestamp column (no time zone) becomes an Excel date, a number of days with a display style, so the text held (`2024-03-05 13:45:12.123456`) is not in the file (zoned and time-only values stay text). A numeric column's text of up to 15 significant digits becomes a number (`1.50` is the number 1.5 shown with two decimals); longer ones stay text with every digit, and so does `9007199254740993`. **There is no formula guard in Excel files**: `=1+1` is stored as text, not as a formula. **A value over Excel's limit of 32,767 characters is written whole** by `build_xlsx_workbook` (dbx splits such values over several cells only in its own re-running export, which this client does not use); Excel may cut it, and the overlay counts these values. | `excel_holds_null_as_an_empty_cell...`, `what_dbx_does_to_other_values_in_an_excel_file` |
+| Markdown | NULL looks like the text `NULL`; a line break (`\n` or `\r\n`) becomes `<br>`; `\|` for `|`; every cell is padded with trailing spaces to its column's width, so trailing spaces cannot be told from padding. | `markdown_read_back_differs_from_psql_only_by_the_listed_losses` |
+| SQL INSERT | Only the statements: the table is not created, so it must exist with columns of the same names. Values are written as the text held and the server converts them. The round trip into a table created `like` the source returned every row of `text_values`, `numbers`, `gt_text`, `gt_json` and `gt_integers` cell for cell. A result with no rows has nothing to insert and is refused. **dbx leaves some columns out** (`is_export_insert_column`): a Postgres `tsvector` column, a column named `__DBX_ROWID` (the synthetic row id of Postgres, Oracle and Xugu), SQL Server `timestamp`/`rowversion` columns. The overlay lists them by name before writing (`1 column is left out of the INSERT: doc`), and a result of only such columns is refused. Column, table and schema names that start and end with a quote are quoted whole (`guarded()`, see below), so the file carries the exact names. | `sql_inserts_run_into_a_scratch_table...`, `a_quoted_column_and_table_name_reload...`, `columns_dbx_will_not_insert_are_found_by_name` | `sql_inserts_run_into_a_scratch_table...` |
+
+**Names given to dbx's SQL builders** (design section 31): dbx's quoting passes a name that starts and ends with a quote through unescaped on Postgres, GaussDB and openGauss. Every name handed to a builder in `core/dbx.rs` goes through `guarded()` (`guarded_all`, `guarded_if` for the skip probe whose text is never run): the page select (schema, table, order columns, primary keys), the count select (schema, table) and the INSERT export (schema, table, columns). The unit test `every_name_given_to_a_dbx_sql_builder_goes_through_guarded` fails on a builder call or a name that skips it.
+
 ## Editor keys (slice 13)
 
 Every editing action is a named action in the live bindings (`Keybinds`), with
@@ -820,7 +874,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `first-query`, `history`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `export` (writes files in a scratch directory only), `first-query`, `history`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live

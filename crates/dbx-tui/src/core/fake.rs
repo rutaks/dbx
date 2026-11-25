@@ -360,6 +360,16 @@ impl Syntax for FakeCore {
     fn table_count_sql(&self, _kind: &DbKind, table: &TablePath) -> String {
         format!("select count(*) from {}", fake_table_name(table))
     }
+
+    /// dbx's own formats: they need no connection, so the fake does not
+    /// invent others.
+    fn export_bytes(&self, request: &ExportRequest) -> Result<Vec<u8>, String> {
+        super::dbx::export_bytes_for(request)
+    }
+
+    fn export_skipped_columns(&self, request: &ExportRequest) -> Vec<String> {
+        super::dbx::export_skipped_columns_for(request)
+    }
 }
 
 fn fake_table_name(table: &TablePath) -> String {

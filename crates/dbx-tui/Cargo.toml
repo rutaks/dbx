@@ -49,6 +49,8 @@ uuid = { version = "1", features = ["v4"] }
 dbx-tui = { path = ".", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+# Reads a spreadsheet export back (slice 19): the same version as dbx's.
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 # Layer 1: DbxCore against scratch stores. Process-wide key variables, so these
 # run in their own binary, serially (see README.md).

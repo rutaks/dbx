@@ -2,6 +2,7 @@
 //! character, which holds for everything drawn so far (ASCII and box glyphs).
 
 mod editor;
+mod export;
 mod form;
 mod history;
 mod overlays;
@@ -163,6 +164,8 @@ fn draw_overlay(
         Overlay::ConfirmRun(c) => overlays::draw_confirm_run(c, p, buf),
         Overlay::Help(h) => overlays::draw_help(h, keys, caps, p, buf),
         Overlay::History(h) => history::draw(h, keys, here, p, buf),
+        Overlay::Export(o) => export::draw(o, buttons, keys.key_for(Action::LoadMore).as_deref(), p, buf),
+        Overlay::CopyAs(c) => export::draw_copy_as(c, buttons, p, buf),
     }
 }
 
@@ -697,6 +700,8 @@ fn results_hints(app: &App, mut hints: Vec<Hint>, prefix: Hint) -> Vec<Hint> {
             hints.extend(one(Action::LoadMore, "more"));
         }
         hints.push(several(&[Action::GridLeft, Action::GridDown, Action::GridUp, Action::GridRight], "move"));
+        hints.extend(one(Action::Export, "export"));
+        hints.extend(one(Action::CopyAs, "copy as"));
     }
     // A browse tab pages and counts; the keys are offered where they work.
     if app.can_page_next() {

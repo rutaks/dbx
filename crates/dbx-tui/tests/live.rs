@@ -1603,3 +1603,451 @@ async fn a_production_flag_set_while_the_client_runs_is_seen_by_the_next_write()
     assert!(!format!("{refused:?}").contains(FIXTURE_PASSWORD));
     client.close_session(tab_session(1), &database(&id, "edge")).await.unwrap();
 }
+
+// ---- slice 19: export ---------------------------------------------------------------
+
+use dbx_tui::core::{Column, DbKind, ExportFormat, ExportRequest};
+
+/// The tables whose export is read back, in every format.
+const EXPORTED: [&str; 5] = ["text_values", "numbers", "gt_text", "gt_json", "gt_integers"];
+
+/// A table read through the client, with what `psql` says its cells are.
+struct Held {
+    table: &'static str,
+    set: dbx_tui::core::ResultSet,
+    /// `psql`'s text of every cell, by row and column: the truth the exports
+    /// are read back against. NaN and the infinities are NULL here, which is
+    /// what dbx hands the client (design section 2, a known loss), and what
+    /// every export holds.
+    want: Vec<Vec<Option<String>>>,
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// `public.<table>` read through `DbxCore`, ordered by id, and through `psql`.
+async fn held(core: &DbxCore, id: &ConnectionId, table: &'static str) -> Held {
+    let sql = format!("select * from public.{table} order by id");
+    let request = RunRequest { row_cap: 1000, ..run_request(id, "edge", 1, &sql) };
+    let set = core.run(RunId(rand_id()), request).await.unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    assert!(!set.truncated, "{table} fits the cap");
+    let queries: Vec<(String, String)> = set
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), format!("select x.{} from public.{table} as x order by x.id", quote_ident(&c.name))))
+        .collect();
+    let by_column = psql::query_all(&queries);
+    let mut want = vec![vec![None; set.columns.len()]; set.rows.len()];
+    for (c, column) in set.columns.iter().enumerate() {
+        let values = &by_column[&column.name];
+        assert_eq!(values.len(), set.rows.len(), "{table}.{}: psql and the client read as many rows", column.name);
+        for (r, v) in values.iter().enumerate() {
+            want[r][c] = v.clone();
+        }
+    }
+    for (r, row) in set.rows.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if *cell == Cell::Null && matches!(want[r][c].as_deref(), Some("NaN" | "Infinity" | "-Infinity")) {
+                assert_eq!((table, set.columns[c].name.as_str()), ("numbers", "approx"), "only the known loss is let through");
+                want[r][c] = None;
+            }
+        }
+    }
+    let held_texts = texts(&set.rows);
+    for (r, row) in want.iter().enumerate() {
+        for (c, w) in row.iter().enumerate() {
+            let short = |v: &Option<String>| v.as_ref().map(|s| s.chars().take(60).collect::<String>());
+            assert!(held_texts[r][c] == *w, "{table} row {} column {}: held {:?}, psql {:?} (the rows held are psql's, but for NaN and the infinities)", r + 1, set.columns[c].name, short(&held_texts[r][c]), short(w));
+        }
+    }
+    Held { table, set, want }
+}
+
+fn export_request(h: &Held, format: ExportFormat) -> ExportRequest {
+    ExportRequest {
+        format,
+        columns: h.set.columns.clone(),
+        rows: h.set.rows.clone(),
+        kind: Some(DbKind::Postgres),
+        table: h.table.into(),
+        schema: String::new(),
+        null_empty: false,
+    }
+}
+
+/// A read-back of CSV: each field as text, and whether it was quoted.
+fn parse_csv(text: &str) -> Vec<Vec<(String, bool)>> {
+    let mut records = Vec::new();
+    let mut record: Vec<(String, bool)> = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        let mut field = String::new();
+        let quoted = chars.peek() == Some(&'"');
+        if quoted {
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('"') if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        field.push('"');
+                    }
+                    Some('"') => break,
+                    Some(c) => field.push(c),
+                    None => panic!("a quoted field is never closed"),
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == ',' || c == '\n' {
+                    break;
+                }
+                field.push(c);
+                chars.next();
+            }
+        }
+        record.push((field, quoted));
+        match chars.next() {
+            Some(',') => {}
+            Some('\n') => records.push(std::mem::take(&mut record)),
+            None => {
+                records.push(record);
+                return records;
+            }
+            Some(c) => panic!("after a field comes a comma or a line end, not {c:?}"),
+        }
+    }
+}
+
+/// What dbx's formula guard acts on (`needs_formula_guard`, the first byte
+/// after spaces), for the cells the read-back may find altered.
+fn starts_like_a_formula(value: &str) -> bool {
+    matches!(value.trim_start_matches(' ').bytes().next(), Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'))
+}
+
+#[tokio::test]
+async fn csv_read_back_equals_psqls_values_with_null_as_backslash_n_but_for_the_formula_guard() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let mut guarded = 0;
+    for table in EXPORTED {
+        let h = held(&core, &id, table).await;
+        let bytes = core.export_bytes(&export_request(&h, ExportFormat::Csv)).unwrap_or_else(|e| panic!("{table}: {e}"));
+        let records = parse_csv(&String::from_utf8(bytes).expect("UTF-8"));
+        let names: Vec<String> = h.set.columns.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(records[0].iter().map(|f| f.0.clone()).collect::<Vec<_>>(), names, "{table}: the header");
+        assert_eq!(records.len(), h.want.len() + 1, "{table}: a record per row");
+        for (r, want_row) in h.want.iter().enumerate() {
+            for (c, want) in want_row.iter().enumerate() {
+                let (value, quoted) = &records[r + 1][c];
+                let got = if !quoted && value == "\\N" { None } else { Some(value.clone()) };
+                match (want, &got) {
+                    (w, g) if w == g => {}
+                    (Some(w), Some(g)) if *g == format!("'{w}") && starts_like_a_formula(w) => guarded += 1,
+                    _ => panic!("{table} row {} column {}: psql {want:?}, the file {got:?}", r + 1, names[c]),
+                }
+            }
+        }
+    }
+    eprintln!("OBSERVED CSV: {guarded} cells carry the formula guard (a quote in front)");
+    assert!(guarded > 0, "the fixtures hold values the guard alters, so the loss is exercised");
+}
+
+#[tokio::test]
+async fn csv_with_an_empty_null_literal_writes_null_bare_and_the_empty_string_quoted() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let h = held(&core, &id, "text_values").await;
+    let request = ExportRequest { null_empty: true, ..export_request(&h, ExportFormat::Csv) };
+    let records = parse_csv(&String::from_utf8(core.export_bytes(&request).unwrap()).unwrap());
+    let v = h.set.columns.iter().position(|c| c.name == "v").unwrap();
+    assert_eq!(records[1][v], (String::new(), false), "NULL: an empty field with no quotes");
+    assert_eq!(records[2][v], (String::new(), true), "the empty string: quoted");
+    assert_eq!(records[3][v], ("NULL".to_string(), true), "the text NULL: itself");
+}
+
+#[tokio::test]
+async fn json_read_back_keeps_null_empty_and_the_text_null_apart_and_2_to_the_53_plus_1_exact() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    for table in EXPORTED {
+        let h = held(&core, &id, table).await;
+        let bytes = core.export_bytes(&export_request(&h, ExportFormat::Json)).unwrap_or_else(|e| panic!("{table}: {e}"));
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        let rows = value.as_array().expect("an array of rows");
+        assert_eq!(rows.len(), h.want.len(), "{table}");
+        for (r, row) in rows.iter().enumerate() {
+            let keys: Vec<&str> = row.as_object().expect("an object").keys().map(String::as_str).collect();
+            assert_eq!(keys, h.set.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), "{table}: the keys are in column order");
+            for (c, column) in h.set.columns.iter().enumerate() {
+                let got = match &row[&column.name] {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    other => panic!("{table}.{}: {other:?}", column.name),
+                };
+                assert_eq!(got, h.want[r][c], "{table} row {} column {}", r + 1, column.name);
+            }
+        }
+        if table == "text_values" {
+            assert_eq!(rows[0]["v"], serde_json::Value::Null);
+            assert_eq!(rows[1]["v"], serde_json::json!(""));
+            assert_eq!(rows[2]["v"], serde_json::json!("NULL"));
+        }
+        if table == "gt_integers" {
+            assert_eq!(rows[8]["i8"].as_i64(), Some(9_007_199_254_740_993), "2^53 + 1 is a JSON number holding every digit");
+            assert_eq!(rows[2]["i8"].as_i64(), Some(i64::MIN));
+        }
+    }
+}
+
+/// A scratch schema on `edge`, dropped when it goes (a failed test included).
+struct ExportSchema(String);
+
+impl ExportSchema {
+    fn new(what: &str) -> Self {
+        let name = format!("scratch_19_{}_{what}", std::process::id());
+        psql_script(&format!("drop schema if exists {name} cascade; create schema {name};"));
+        ExportSchema(name)
+    }
+}
+
+impl Drop for ExportSchema {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["exec", "dbxtui-fixtures-postgres-1", "psql", "-U", "postgres", "-d", "edge", "--no-psqlrc", "-c", &format!("drop schema if exists {} cascade", self.0)])
+            .stdin(std::process::Stdio::null())
+            .output();
+    }
+}
+
+/// Runs a script on `edge` through `psql -f -`: any size, stopping at the
+/// first error.
+fn psql_script(sql: &str) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("docker")
+        .args(["exec", "-i", "dbxtui-fixtures-postgres-1", "env", "PGCLIENTENCODING=UTF8", "psql", "-U", "postgres", "-d", "edge", "--no-psqlrc", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("docker exec psql");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let script = sql.to_string();
+    let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+    let out = child.wait_with_output().expect("psql output");
+    writer.join().expect("writer").expect("script written");
+    assert!(out.status.success(), "psql: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[tokio::test]
+async fn sql_inserts_run_into_a_scratch_table_give_back_the_rows_held_row_by_row() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let scratch = ExportSchema::new("sql");
+    for table in EXPORTED {
+        let h = held(&core, &id, table).await;
+        psql_script(&format!("create table {}.{table} (like public.{table});", scratch.0));
+        let request = ExportRequest { schema: scratch.0.clone(), ..export_request(&h, ExportFormat::SqlInsert) };
+        let sql = String::from_utf8(core.export_bytes(&request).unwrap_or_else(|e| panic!("{table}: {e}"))).expect("UTF-8");
+        assert!(sql.contains(&scratch.0), "{table}: the statements name the scratch schema: {}", sql.chars().take(300).collect::<String>());
+        psql_script(&sql);
+        let queries: Vec<(String, String)> = h
+            .set
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), format!("select x.{} from {}.{table} as x order by x.id", quote_ident(&c.name), scratch.0)))
+            .collect();
+        let by_column = psql::query_all(&queries);
+        for (r, want_row) in h.want.iter().enumerate() {
+            for (c, want) in want_row.iter().enumerate() {
+                let got = by_column[&h.set.columns[c].name].get(r).cloned().unwrap_or_else(|| panic!("{table}: row {} is missing from the scratch table", r + 1));
+                assert_eq!(&got, want, "{table} row {} column {}", r + 1, h.set.columns[c].name);
+            }
+        }
+        assert_eq!(by_column[&h.set.columns[0].name].len(), h.want.len(), "{table}: no row more");
+    }
+}
+
+#[tokio::test]
+async fn a_quoted_column_and_table_name_reload_from_the_insert_file_with_the_same_values() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let scratch = ExportSchema::new("quoted");
+    let table = r#""t"; drop table decoy; --""#;
+    let hostile = r#""x"; drop table decoy; --""#;
+    let quoted = r#""a""#;
+    psql_script(&format!(
+        "create table {s}.decoy (id int); create table {s}.{t} ({h} text, {q} text, plain text);",
+        s = scratch.0,
+        t = quote_ident(table),
+        h = quote_ident(hostile),
+        q = quote_ident(quoted)
+    ));
+    let text = |v: &str| Cell::Value(v.to_string());
+    let column = |n: &str| Column { name: n.into(), db_type: "text".into(), kind: dbx_tui::core::CellKind::Text };
+    let request = ExportRequest {
+        format: ExportFormat::SqlInsert,
+        columns: vec![column(hostile), column(quoted), column("plain")],
+        rows: vec![vec![text("one"), text("it's"), Cell::Null], vec![text("two"), text("b"), text("c")]],
+        kind: Some(DbKind::Postgres),
+        table: table.into(),
+        schema: scratch.0.clone(),
+        null_empty: false,
+    };
+    let sql = String::from_utf8(core.export_bytes(&request).expect("built")).expect("UTF-8");
+    psql_script(&sql);
+    let queries: Vec<(String, String)> = [hostile, quoted, "plain"]
+        .iter()
+        .map(|c| (c.to_string(), format!("select x.{} from {}.{} as x order by 1", quote_ident(c), scratch.0, quote_ident(table))))
+        .collect();
+    let got = psql::query_all(&queries);
+    assert_eq!(got[hostile], vec![Some("one".to_string()), Some("two".to_string())]);
+    assert_eq!(got[quoted], vec![Some("b".to_string()), Some("it's".to_string())]);
+    assert_eq!(got["plain"].len(), 2);
+    let decoy = psql::query_all(&[("d".to_string(), format!("select count(*) from {}.decoy", scratch.0))]);
+    assert_eq!(decoy["d"], vec![Some("0".to_string())], "the decoy table is still there");
+}
+
+/// The text of one sheet of an Excel export.
+fn sheet1(bytes: &[u8]) -> String {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("an Excel file is a zip");
+    let mut sheet = zip.by_name("xl/worksheets/sheet1.xml").expect("the sheet");
+    let mut text = String::new();
+    sheet.read_to_string(&mut text).expect("UTF-8");
+    text
+}
+
+/// One cell's XML, by reference (`C2`).
+fn cell_xml(sheet: &str, reference: &str) -> String {
+    let start = sheet.find(&format!("<c r=\"{reference}\"")).unwrap_or_else(|| panic!("no cell {reference}"));
+    let rest = &sheet[start..];
+    let open_end = rest.find('>').expect("a tag");
+    if rest[..open_end].ends_with('/') {
+        rest[..=open_end].to_string()
+    } else {
+        rest[..rest.find("</c>").expect("a closed cell") + 4].to_string()
+    }
+}
+
+#[tokio::test]
+async fn excel_holds_null_as_an_empty_cell_the_empty_string_as_empty_text_and_2_to_the_53_plus_1_as_text_with_every_digit() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let tv = held(&core, &id, "text_values").await;
+    let sheet = sheet1(&core.export_bytes(&export_request(&tv, ExportFormat::Excel)).expect("xlsx"));
+    // text_values: id, label, v. Row 1 is the header.
+    let null = cell_xml(&sheet, "C2");
+    assert!(null.ends_with("/>") && !null.contains("<v>") && !null.contains("<is>"), "NULL: a cell with no value: {null}");
+    let empty = cell_xml(&sheet, "C3");
+    assert!(empty.contains("t=\"inlineStr\"") && empty.contains("<t></t>"), "the empty string: a text cell holding nothing: {empty}");
+    let text = cell_xml(&sheet, "C4");
+    assert!(text.contains("<t>NULL</t>"), "the text NULL: itself: {text}");
+    let gi = held(&core, &id, "gt_integers").await;
+    let sheet = sheet1(&core.export_bytes(&export_request(&gi, ExportFormat::Excel)).expect("xlsx"));
+    // gt_integers: id, label, i2, i4, i8, o. 2^53 + 1 is row 9, so sheet row 10.
+    let big = cell_xml(&sheet, "E10");
+    assert!(big.contains("t=\"inlineStr\"") && big.contains("<t>9007199254740993</t>"), "2^53 + 1: text with every digit: {big}");
+    let small = cell_xml(&sheet, "E3");
+    assert!(small.contains("<v>-1</v>") && !big.contains("<v>"), "a short integer is a number: {small}");
+}
+
+#[tokio::test]
+async fn what_dbx_does_to_other_values_in_an_excel_file() {
+    // No server needed: dbx's formats work on values. Observed, and the README
+    // lists each.
+    let s = Scratch::new();
+    let core = s.core();
+    let col = |name: &str, db_type: &str, kind| Column { name: name.into(), db_type: db_type.into(), kind };
+    let long = "x".repeat(40_000);
+    let request = ExportRequest {
+        format: ExportFormat::Excel,
+        columns: vec![
+            col("f", "text", dbx_tui::core::CellKind::Text),
+            col("ts", "timestamp", dbx_tui::core::CellKind::Temporal),
+            col("n", "numeric", dbx_tui::core::CellKind::Decimal),
+            col("big", "numeric", dbx_tui::core::CellKind::Decimal),
+            col("long", "text", dbx_tui::core::CellKind::Text),
+        ],
+        rows: vec![vec![
+            Cell::Value("=1+1".into()),
+            Cell::Value("2024-03-05 13:45:12.123456".into()),
+            Cell::Value("1.50".into()),
+            Cell::Value("12345678901234567890.123456789".into()),
+            Cell::Value(long.clone()),
+        ]],
+        kind: Some(DbKind::Postgres),
+        table: "t".into(),
+        schema: String::new(),
+        null_empty: false,
+    };
+    let sheet = sheet1(&core.export_bytes(&request).expect("xlsx"));
+    let f = cell_xml(&sheet, "A2");
+    assert!(f.contains("t=\"inlineStr\"") && f.contains("<t>=1+1</t>") && !f.contains("<f>"), "no formula guard in Excel files, and no formula: {f}");
+    let ts = cell_xml(&sheet, "B2");
+    eprintln!("OBSERVED a timestamp: {ts}");
+    assert!(!ts.contains("inlineStr") && ts.contains("<v>"), "a timestamp becomes an Excel date: {ts}");
+    let n = cell_xml(&sheet, "C2");
+    eprintln!("OBSERVED numeric 1.50: {n}");
+    assert!(n.contains("<v>1.50</v>") && !n.contains("inlineStr"), "{n}");
+    let big = cell_xml(&sheet, "D2");
+    assert!(big.contains("inlineStr") && big.contains("12345678901234567890.123456789"), "a number past 15 digits stays text: {big}");
+    let long_cell = cell_xml(&sheet, "E2");
+    assert!(long_cell.contains(&long), "a value over Excel's 32,767-character limit is written whole: {} chars", long_cell.len());
+}
+
+#[tokio::test]
+async fn markdown_read_back_differs_from_psql_only_by_the_listed_losses() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let mut lost = std::collections::BTreeSet::new();
+    for table in EXPORTED {
+        let h = held(&core, &id, table).await;
+        let text = String::from_utf8(core.export_bytes(&export_request(&h, ExportFormat::Markdown)).unwrap_or_else(|e| panic!("{table}: {e}"))).expect("UTF-8");
+        let lines: Vec<&str> = text.strip_suffix('\n').expect("ends with a line break").split('\n').collect();
+        assert_eq!(lines.len(), h.want.len() + 2, "{table}: header, separator, a line per row");
+        let cells = |line: &str| -> Vec<String> {
+            line.strip_prefix("| ").and_then(|l| l.strip_suffix(" |")).unwrap_or_else(|| panic!("a table line: {line:?}")).split(" | ").map(str::to_string).collect()
+        };
+        for (r, want_row) in h.want.iter().enumerate() {
+            let got = cells(lines[r + 2]);
+            assert_eq!(got.len(), want_row.len(), "{table} row {}", r + 1);
+            for (c, want) in want_row.iter().enumerate() {
+                let expected = match want {
+                    None => {
+                        lost.insert("NULL is the text NULL");
+                        "NULL".to_string()
+                    }
+                    Some(s) => s.replace('|', "\\|").replace("\r\n", "<br>").replace('\n', "<br>"),
+                };
+                if want.as_deref().is_some_and(|s| s.contains('|')) {
+                    lost.insert("| becomes \\|");
+                }
+                if want.as_deref().is_some_and(|s| s.contains('\n')) {
+                    lost.insert("a line break becomes <br>");
+                }
+                if want.as_deref().is_some_and(|s| s.ends_with(' ')) {
+                    lost.insert("trailing spaces are padding");
+                }
+                // The cell is padded to its column's width, so trailing spaces cannot be told apart.
+                assert_eq!(got[c].trim_end_matches(' '), expected.trim_end_matches(' '), "{table} row {} column {}", r + 1, h.set.columns[c].name);
+            }
+        }
+    }
+    eprintln!("OBSERVED Markdown losses exercised: {lost:?}");
+    assert!(lost.contains("NULL is the text NULL") && lost.contains("a line break becomes <br>") && lost.contains("trailing spaces are padding"));
+}

@@ -34,6 +34,10 @@ impl Syntax for NoSyntax {
     fn table_count_sql(&self, _kind: &DbKind, _table: &crate::core::TablePath) -> String {
         String::new()
     }
+
+    fn export_bytes(&self, _request: &crate::core::ExportRequest) -> Result<Vec<u8>, String> {
+        Err("no formats are available yet".into())
+    }
 }
 
 /// What every tab's editor shares: the Core's syntax answers, and the type
@@ -79,6 +83,16 @@ impl SyntaxState {
     /// The statement that counts the rows of `table`.
     pub fn table_count_sql(&self, kind: &DbKind, table: &crate::core::TablePath) -> String {
         self.handle.table_count_sql(kind, table)
+    }
+
+    /// A result in one format (see `Syntax::export_bytes`).
+    pub fn export_bytes(&self, request: &crate::core::ExportRequest) -> Result<Vec<u8>, String> {
+        self.handle.export_bytes(request)
+    }
+
+    /// The columns dbx's SQL INSERT leaves out (see `Syntax::export_skipped_columns`).
+    pub fn export_skipped_columns(&self, request: &crate::core::ExportRequest) -> Vec<String> {
+        self.handle.export_skipped_columns(request)
     }
 
     /// The type names of `kind`, asked of the Core the first time.

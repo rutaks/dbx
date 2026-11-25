@@ -106,7 +106,7 @@ async fn land(h: &mut Harness) {
 }
 
 /// `film` opened: its tab active, the first page of `n` rows landed.
-async fn browsing(n: usize) -> Harness {
+pub(super) async fn browsing(n: usize) -> Harness {
     let mut h = film_loaded().await;
     h.fake.script_run(Scripted::ok(page(1, n)));
     h.press("o");

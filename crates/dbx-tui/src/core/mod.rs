@@ -4,6 +4,7 @@
 //! speaks the types defined here. `FakeCore` is the test double.
 
 mod dbx;
+mod export;
 mod fake;
 
 use std::fmt;
@@ -14,6 +15,7 @@ use async_trait::async_trait;
 pub use dbx::{DbxCore, KeySource, StoreOptions};
 #[cfg(feature = "test-support")]
 pub use dbx::check_seed_dir;
+pub use export::{ExportError, ExportFormat, ExportJob, ExportRequest, Exported};
 pub use fake::{Call, Catalogue, FakeCore, Scripted, SyntaxCalls};
 
 // ---- identifiers -----------------------------------------------------------
@@ -830,6 +832,18 @@ pub trait Syntax: Send + Sync {
     /// The statement that counts the rows of `table`; its one cell is the
     /// count.
     fn table_count_sql(&self, kind: &DbKind, table: &TablePath) -> String;
+
+    /// The bytes of a result in one format, built by dbx's formats from the
+    /// exact text the client holds (`ExportRequest`). No I/O, but the work
+    /// grows with the rows: the shell runs it off the event loop, the app only
+    /// for the small text a copy may send.
+    fn export_bytes(&self, request: &ExportRequest) -> Result<Vec<u8>, String>;
+
+    /// The columns of `request` that dbx's SQL INSERT leaves out, by name:
+    /// the overlay lists them before anything is written.
+    fn export_skipped_columns(&self, _request: &ExportRequest) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Everything the client asks of dbx (design sections 2 and 10).

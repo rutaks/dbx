@@ -41,6 +41,11 @@ pub enum Overlay {
     /// Earlier statements, shared with the desktop app: search, preview,
     /// insert or run again (slice 18).
     History(Box<super::history::HistoryOverlay>),
+    /// Write the result to a file: format, path, and what the format loses
+    /// (slice 19).
+    Export(Box<super::export::ExportOverlay>),
+    /// Which text format to copy the result to the clipboard as.
+    CopyAs(super::export::CopyAsOverlay),
 }
 
 /// One thing the chooser offers to run.
@@ -193,6 +198,18 @@ pub enum OverlayAction {
     HistoryRun,
     HistoryScope,
     HistoryPick(usize),
+    /// The export overlay: write the file; replace the file that is there;
+    /// keep it and go back to the overlay; pick a format; focus a row; pick
+    /// the CSV NULL literal (true: an empty field).
+    ExportRun,
+    ExportReplace,
+    ExportKeep,
+    ExportFormat(usize),
+    ExportFocus(super::export::ExportField),
+    ExportNull(bool),
+    /// The copy-as list: copy in the highlighted format, or in the one clicked.
+    CopyAsRun,
+    CopyAsPick(usize),
     /// Close a notice or a question without doing anything.
     Dismiss,
     /// The cell viewer: copy the raw value, and switch between a JSON
@@ -270,6 +287,15 @@ const HELP_BUTTONS: &[ButtonSpec] = &[button("esc", "esc", "close", OverlayActio
 // the live one), and its buttons are drawn with the live key labels.
 const HISTORY_BUTTONS: &[ButtonSpec] = &[];
 const FAILURE_BUTTONS: &[ButtonSpec] = &[button("↵", "enter", "close", OverlayAction::Dismiss)];
+const EXPORT_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "export", OverlayAction::ExportRun), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
+// While the write is out, `enter` would send it again: only `esc` is offered.
+const EXPORT_WRITING_BUTTONS: &[ButtonSpec] = &[button("esc", "esc", "close", OverlayAction::Dismiss)];
+// No `enter`: it is the key that sent the export.
+const EXPORT_REPLACE_BUTTONS: &[ButtonSpec] =
+    &[button("y", "y", "replace", OverlayAction::ExportReplace), button("esc", "esc", "keep the file", OverlayAction::ExportKeep)];
+const COPY_AS_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "copy", OverlayAction::CopyAsRun), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
 
 impl Overlay {
     /// The buttons along the bottom of the overlay, left to right. Their keys
@@ -292,6 +318,12 @@ impl Overlay {
             Overlay::Chooser(_) => CHOOSER_BUTTONS,
             Overlay::Help(_) => HELP_BUTTONS,
             Overlay::History(_) => HISTORY_BUTTONS,
+            Overlay::Export(o) => match &o.stage {
+                super::export::Stage::Writing(_) => EXPORT_WRITING_BUTTONS,
+                super::export::Stage::Replace(_) => EXPORT_REPLACE_BUTTONS,
+                _ => EXPORT_BUTTONS,
+            },
+            Overlay::CopyAs(_) => COPY_AS_BUTTONS,
             Overlay::CellViewer(_) => &[],
         }
     }

@@ -1309,6 +1309,144 @@ impl Syntax for DbxCore {
     fn table_count_sql(&self, kind: &DbKind, table: &TablePath) -> String {
         count_sql_for(kind, table)
     }
+
+    fn export_bytes(&self, request: &ExportRequest) -> Result<Vec<u8>, String> {
+        export_bytes_for(request)
+    }
+
+    fn export_skipped_columns(&self, request: &ExportRequest) -> Vec<String> {
+        export_skipped_columns_for(request)
+    }
+}
+
+/// A result in one format, by dbx's formats (slice 19), from the exact text
+/// the client holds.
+///
+/// dbx's formats take JSON values, so each cell is converted: NULL is `null`;
+/// an integer column's text is a JSON number only when it is the exact text of
+/// an `i64` or `u64`; everything else is a string holding the exact text. A row
+/// longer than the header loses the cells past it (they have no column); a
+/// shorter one stays short, since a missing cell is not NULL. Cell by cell
+/// what each format then does is listed in the README.
+pub(super) fn export_bytes_for(request: &ExportRequest) -> Result<Vec<u8>, String> {
+    use dbx_core::csv_export::{default_csv_null_literal, format_csv_with_options, CsvQuoteMode};
+    use dbx_core::text_export::{format_json, format_markdown, QueryResultTextExportData};
+    use dbx_core::xlsx_export::{build_xlsx_workbook, XlsxWorksheetData};
+
+    let names: Vec<String> = request.columns.iter().map(|c| c.name.clone()).collect();
+    let rows: Vec<Vec<serde_json::Value>> = request
+        .rows
+        .iter()
+        .map(|row| row.iter().take(request.columns.len()).enumerate().map(|(c, cell)| json_cell(&request.columns[c], cell)).collect())
+        .collect();
+    match request.format {
+        ExportFormat::Csv => {
+            let null = default_csv_null_literal();
+            let literal = if request.null_empty { None } else { Some(null.as_str()) };
+            Ok(format_csv_with_options(&names, &rows, CsvQuoteMode::All, literal).into_bytes())
+        }
+        ExportFormat::Json => format_json(&QueryResultTextExportData { title: None, columns: names, rows }).map(String::into_bytes),
+        ExportFormat::Markdown => Ok(format_markdown(&QueryResultTextExportData { title: None, columns: names, rows }).into_bytes()),
+        ExportFormat::Excel => {
+            let mut sheet = XlsxWorksheetData::new(Some("Result".into()), names, rows);
+            sheet.column_types = request.columns.iter().map(|c| c.db_type.clone()).collect();
+            build_xlsx_workbook(&sheet)
+        }
+        ExportFormat::SqlInsert => {
+            if rows.is_empty() {
+                return Err("the result has no rows, so there is nothing to insert".into());
+            }
+            // dbx leaves some columns out (see `export_skipped_columns_for`);
+            // they are dropped here, with their cells, so that what dbx does is
+            // known and told, and its raw-name rules still apply.
+            let skipped = export_skipped_columns_for(request);
+            let kept = ExportRequest {
+                columns: request.columns.iter().filter(|c| !skipped.contains(&c.name)).cloned().collect(),
+                rows: request
+                    .rows
+                    .iter()
+                    .map(|row| row.iter().zip(&request.columns).filter(|(_, c)| !skipped.contains(&c.name)).map(|(cell, _)| cell.clone()).collect())
+                    .collect(),
+                ..request.clone()
+            };
+            if kept.columns.is_empty() {
+                return Err(format!("every column would be left out of the INSERT ({}), so there is nothing to insert", skipped.join(", ")));
+            }
+            insert_statements(&kept, true).map(String::into_bytes)
+        }
+    }
+}
+
+/// The columns dbx's SQL INSERT leaves out, by name, in column order: dbx's
+/// own `is_export_insert_column` decides (Postgres `tsvector`, the synthetic
+/// row id column, SQL Server `timestamp`/`rowversion`). It is private, so each
+/// column is offered alone to the INSERT builder: an empty answer means it was
+/// skipped. A column the builder refuses for another reason is not counted.
+pub(super) fn export_skipped_columns_for(request: &ExportRequest) -> Vec<String> {
+    request
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(c, column)| {
+            let probe = ExportRequest {
+                format: ExportFormat::SqlInsert,
+                columns: vec![(*column).clone()],
+                rows: vec![vec![request.rows.first().and_then(|r| r.get(*c)).cloned().unwrap_or(Cell::Null)]],
+                kind: request.kind.clone(),
+                table: "t".into(),
+                schema: String::new(),
+                null_empty: false,
+            };
+            insert_statements(&probe, false).map(|text| text.is_empty()).unwrap_or(false)
+        })
+        .map(|(_, column)| column.name.clone())
+        .collect()
+}
+
+/// The INSERT text of `request` by dbx's builder. Every name goes through
+/// `guarded_all`/`guarded` here, the one place names reach it. With
+/// `guard_names` off the raw names are used (the skip probe: dbx's rules
+/// match raw names, `__DBX_ROWID` for one).
+fn insert_statements(request: &ExportRequest, guard_names: bool) -> Result<String, String> {
+    use dbx_core::database_export::{build_export_sql_insert, BuildExportInsertStatementsOptions, BuildExportSqlInsertOptions, SqlInsertDialect};
+    let db_type = request.kind.as_ref().and_then(database_type_of);
+    let names: Vec<String> = request.columns.iter().map(|c| c.name.clone()).collect();
+    let rows: Vec<Vec<serde_json::Value>> = request
+        .rows
+        .iter()
+        .map(|row| row.iter().take(request.columns.len()).enumerate().map(|(c, cell)| json_cell(&request.columns[c], cell)).collect())
+        .collect();
+    let insert = BuildExportInsertStatementsOptions {
+        database_type: db_type,
+        identifier_quote: None,
+        schema: Some(guarded_if(guard_names, db_type, &request.schema)).filter(|s| !s.is_empty()),
+        table_name: Some(guarded_if(guard_names, db_type, &request.table)),
+        qualified_table_name: None,
+        columns: guarded_all_if(guard_names, db_type, &names),
+        column_types: request.columns.iter().map(|c| Some(c.db_type.clone()).filter(|t| !t.is_empty())).collect(),
+        column_extras: Vec::new(),
+        spatial_columns: Vec::new(),
+        spatial_values: Vec::new(),
+        rows,
+        batch_size: None,
+        preserve_original_language: false,
+    };
+    build_export_sql_insert(BuildExportSqlInsertOptions { insert, insert_dialect: SqlInsertDialect::Source, exclude_columns: Vec::new() })
+}
+
+/// One cell as a JSON value, for dbx's formats (see `export_bytes_for`).
+fn json_cell(column: &Column, cell: &Cell) -> serde_json::Value {
+    use serde_json::Value;
+    let Cell::Value(text) = cell else { return Value::Null };
+    if column.kind == CellKind::Integer {
+        if let Some(n) = text.parse::<i64>().ok().filter(|n| n.to_string() == *text) {
+            return Value::from(n);
+        }
+        if let Some(n) = text.parse::<u64>().ok().filter(|n| n.to_string() == *text) {
+            return Value::from(n);
+        }
+    }
+    Value::String(text.clone())
 }
 
 /// The select of one page of `table`, built by dbx's table-data select
@@ -1320,12 +1458,12 @@ impl Syntax for DbxCore {
 fn page_sql_for(kind: &DbKind, table: &TablePath, order_by: &[String], limit: usize, offset: usize) -> String {
     use dbx_core::sql_dialect::{build_table_data_select_sql, quote_table_identifier, TableDataSelectSqlOptions};
     let db_type = database_type_of(kind);
-    let order = order_by.iter().map(|c| quote_table_identifier(db_type, &guarded(db_type, c))).collect::<Vec<_>>().join(", ");
+    let order = guarded_all(db_type, order_by).iter().map(|c| quote_table_identifier(db_type, c)).collect::<Vec<_>>().join(", ");
     build_table_data_select_sql(TableDataSelectSqlOptions {
         database_type: db_type,
         schema: Some(guarded(db_type, &table.schema.schema)).filter(|s| !s.is_empty()),
         table_name: guarded(db_type, &table.table),
-        primary_keys: order_by.to_vec(),
+        primary_keys: guarded_all(db_type, order_by),
         order_by: Some(order).filter(|o| !o.is_empty()),
         limit: Some(limit),
         offset: Some(offset),
@@ -1347,6 +1485,25 @@ fn guarded(db_type: Option<DatabaseType>, name: &str) -> String {
         return name.to_string();
     }
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// `guarded` for every name of a list.
+fn guarded_all(db_type: Option<DatabaseType>, names: &[String]) -> Vec<String> {
+    names.iter().map(|n| guarded(db_type, n)).collect()
+}
+
+/// `guarded`, or the raw name when `on` is off: only for building text that is
+/// looked at and never run (the skip probe of `export_skipped_columns_for`).
+fn guarded_if(on: bool, db_type: Option<DatabaseType>, name: &str) -> String {
+    if on {
+        guarded(db_type, name)
+    } else {
+        name.to_string()
+    }
+}
+
+fn guarded_all_if(on: bool, db_type: Option<DatabaseType>, names: &[String]) -> Vec<String> {
+    names.iter().map(|n| guarded_if(on, db_type, n)).collect()
 }
 
 /// dbx's count statement for `table` (`build_data_grid_count_sql`).
@@ -2744,5 +2901,102 @@ mod tests {
         // A stale yes asks again even where no yes would be needed.
         let a = sent(yes(sql), "select 1").expect_err("asks again");
         assert_eq!(a.reasons, [Reason::Changed]);
+    }
+
+    // ---- slice 19 review: names in the SQL INSERT export -------------------------
+
+    fn insert_request(kind: DbKind, columns: &[(&str, &str)], table: &str, schema: &str) -> ExportRequest {
+        ExportRequest {
+            format: ExportFormat::SqlInsert,
+            columns: columns.iter().map(|(n, t)| Column { name: (*n).into(), db_type: (*t).into(), kind: CellKind::Text }).collect(),
+            rows: vec![columns.iter().map(|_| Cell::Value("v".into())).collect()],
+            kind: Some(kind),
+            table: table.into(),
+            schema: schema.into(),
+            null_empty: false,
+        }
+    }
+
+    fn insert_text(request: &ExportRequest) -> String {
+        String::from_utf8(export_bytes_for(request).expect("built")).expect("UTF-8")
+    }
+
+    #[test]
+    fn insert_names_that_start_and_end_with_a_quote_are_quoted_whole_on_the_kinds_dbx_passes_them_through() {
+        let hostile = r#""x"; drop table t; --""#;
+        for kind in [DbKind::Postgres, DbKind::Other("gaussdb".into()), DbKind::Other("opengauss".into())] {
+            let request = insert_request(kind.clone(), &[(hostile, "text"), (r#""a""#, "text")], r#""t"; drop table u; --""#, r#""s""#);
+            let sql = insert_text(&request);
+            assert!(sql.contains(r##"("""x""; drop table t; --""", """a""")"##), "{kind:?}: {sql}");
+            assert!(sql.contains(r##"INSERT INTO """s"""."""t""; drop table u; --""" ("##), "{kind:?}: {sql}");
+            assert!(!sql.contains(r#"("x"; drop"#) && !sql.contains(r#", "a")"#), "{kind:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn insert_names_keep_dbxs_own_quoting_elsewhere_and_other_formats_keep_raw_headers() {
+        let sql = insert_text(&insert_request(DbKind::MySql, &[("a`b", "text")], "t", ""));
+        assert!(sql.contains("(`a``b`)"), "{sql}");
+        let mut csv = insert_request(DbKind::Postgres, &[(r#""a""#, "text")], "t", "");
+        csv.format = ExportFormat::Csv;
+        assert!(String::from_utf8(export_bytes_for(&csv).unwrap()).unwrap().starts_with(r#""""a""""#), "CSV headers stay raw");
+    }
+
+    #[test]
+    fn columns_dbx_will_not_insert_are_found_by_name() {
+        let request = insert_request(DbKind::Postgres, &[("id", "integer"), ("doc", "tsvector"), ("__DBX_ROWID", "text"), ("body", "text")], "t", "");
+        assert_eq!(export_skipped_columns_for(&request), vec!["doc".to_string(), "__DBX_ROWID".to_string()]);
+        let sql = insert_text(&request);
+        assert!(sql.contains(r#"("id", "body")"#) && !sql.contains("doc"), "{sql}");
+        let mysql = insert_request(DbKind::MySql, &[("doc", "tsvector")], "t", "");
+        assert!(export_skipped_columns_for(&mysql).is_empty());
+        let all = insert_request(DbKind::Postgres, &[("doc", "tsvector")], "t", "");
+        assert!(export_bytes_for(&all).is_err(), "nothing to insert is refused, not written empty");
+    }
+
+    /// Every name handed to a dbx SQL builder goes through `guarded` (or
+    /// `guarded_all`). The builders are called once each, from known places,
+    /// and each line that carries a name to one says so.
+    #[test]
+    fn every_name_given_to_a_dbx_sql_builder_goes_through_guarded() {
+        let source = include_str!("dbx.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        for builder in ["build_table_data_select_sql(", "build_data_grid_count_sql(", "build_export_sql_insert("] {
+            let calls = production.lines().filter(|l| !l.trim_start().starts_with("//") && !l.contains("use ") && l.contains(builder)).count();
+            assert_eq!(calls, 1, "{builder} is called from one known place: register a new call here and guard its names");
+        }
+        // The bodies of the three functions that hold the builder calls.
+        let mut bodies = String::new();
+        let mut rest = production.to_string();
+        for name in ["fn page_sql_for(", "fn count_sql_for(", "fn insert_statements("] {
+            let start = production.find(name).unwrap_or_else(|| panic!("{name} is where the builder is called"));
+            let end = start + production[start..].find("\n}\n").expect("end of function");
+            bodies.push_str(&production[start..end]);
+            bodies.push('\n');
+            rest = rest.replace(&production[start..end], "");
+        }
+        // No other code quotes a name for SQL.
+        for line in rest.lines().filter(|l| !l.trim_start().starts_with("//") && !l.contains("use ")) {
+            assert!(!line.contains("quote_table") && !line.contains("quote_ident"), "a name is quoted outside the guarded builders: {line}");
+        }
+        let mut seen = 0;
+        for (n, line) in bodies.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with("use ") {
+                continue;
+            }
+            let carries_name = ["schema:", "table_name:", "order_by:", "primary_keys:", "qualified_table_name:"].iter().any(|f| t.starts_with(f))
+                || (t.starts_with("columns:") && t.contains("names"))
+                || t.contains("quote_table_identifier(")
+                || t.contains("quote_table_data_identifier(")
+                || t.contains("quote_identifier(");
+            // (`schema: String::new()` is our own ExportRequest, not a dbx builder.)
+            if carries_name && !t.starts_with("qualified_table_name: None") && !t.starts_with("schema: String::new()") {
+                seen += 1;
+                // `order` is built on the line above from `guarded_all`.
+                assert!(t.contains("guarded") || t.starts_with("order_by: Some(order)"), "line {}: a name goes to dbx without `guarded`: {t}", n + 1);
+            }
+        }
+        assert!(seen >= 6, "the scan looked at the call sites ({seen})");
     }
 }

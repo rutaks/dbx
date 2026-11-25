@@ -232,6 +232,10 @@ pub enum Action {
     /// Copy the cell (or, in the viewer, its raw value), or the whole row.
     CopyCell,
     CopyRow,
+    /// Write the result to a file (CSV, JSON, Excel, Markdown, SQL INSERTs),
+    /// or copy it to the clipboard as text.
+    Export,
+    CopyAs,
     /// Fetch more rows of a truncated result.
     LoadMore,
     /// In a browse tab: the next page of the table, the previous one, and
@@ -383,6 +387,8 @@ impl Action {
             Action::OpenCell => "view",
             Action::CopyCell => "copy",
             Action::CopyRow => "copy row",
+            Action::Export => "export",
+            Action::CopyAs => "copy as",
             Action::LoadMore => "more",
             Action::NextPage => "next page",
             Action::PrevPage => "prev page",
@@ -514,6 +520,8 @@ impl Action {
             | Action::OpenCell
             | Action::CopyCell
             | Action::CopyRow
+            | Action::Export
+            | Action::CopyAs
             | Action::LoadMore
             | Action::NextPage
             | Action::PrevPage
@@ -702,6 +710,8 @@ impl Default for Keybinds {
                 (key("enter"), Action::OpenCell),
                 (key("y"), Action::CopyCell),
                 (key("Y"), Action::CopyRow),
+                (key("e"), Action::Export),
+                (key("C"), Action::CopyAs),
                 (key("m"), Action::LoadMore),
                 (key("]"), Action::NextPage),
                 (key("["), Action::PrevPage),
@@ -947,9 +957,11 @@ impl Keybinds {
             row("previous page (results)", &[Action::PrevPage]),
             row("count rows (results)", &[Action::CountRows]),
         ];
+        let export = vec![row("export to a file (results)", &[Action::Export]), row("copy as text (results)", &[Action::CopyAs])];
         vec![
             HelpSection { title: "Run", rows: run },
             HelpSection { title: "Browse", rows: browse },
+            HelpSection { title: "Export", rows: export },
             HelpSection { title: "Edit", rows: edit },
             HelpSection { title: "Panes", rows: panes },
             HelpSection { title: "Tabs", rows: tabs },

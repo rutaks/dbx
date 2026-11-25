@@ -180,6 +180,8 @@ impl App {
             }
             Action::CopyCell => return self.copy_cell(fx),
             Action::CopyRow => return self.copy_row(fx),
+            Action::Export => return self.open_export(fx),
+            Action::CopyAs => return self.open_copy_as(fx),
             Action::LoadMore => return self.load_more(_now, fx),
             _ => {}
         }
@@ -475,7 +477,13 @@ impl App {
             return self.refuse_copy("row", size, fx);
         }
         let text = cells.collect::<Vec<_>>().join("\t");
-        self.copy_text(text, "row", fx)
+        let lossy = lossy_row(set, row);
+        self.copy_text(text, "row", fx);
+        // Said after what was sent, in the same notice: the text is exact, but
+        // pasting it may not give the row back.
+        if let (Some(why), Some(notice)) = (lossy, &mut self.ui.notice) {
+            notice.text = format!("{}. Lossy: {why}.", notice.text);
+        }
     }
 
     /// Sends `text` to the clipboard and says what was copied, or why not.
@@ -486,7 +494,7 @@ impl App {
         sent
     }
 
-    fn copy_text(&mut self, text: String, what: &str, fx: &mut Effects) {
+    pub(super) fn copy_text(&mut self, text: String, what: &str, fx: &mut Effects) {
         if text.len() > CLIPBOARD_LIMIT {
             return self.refuse_copy(what, text.len(), fx);
         }
@@ -510,6 +518,24 @@ impl App {
         );
         self.notify(text, true, fx);
     }
+}
+
+/// Why pasting a row's copy may not give the row back, or `None`: NULL and the
+/// empty string both come out as an empty field, and a tab or a line break
+/// inside a cell is read as a separator by whatever it is pasted into.
+fn lossy_row(set: &ResultSet, row: &[Cell]) -> Option<String> {
+    let cells = || (0..set.columns.len()).filter_map(|c| row.get(c));
+    let mut why = Vec::new();
+    if cells().any(|c| matches!(c, Cell::Null)) && cells().any(|c| matches!(c, Cell::Value(v) if v.is_empty())) {
+        why.push("NULL and an empty string both paste as an empty field");
+    }
+    if cells().any(|c| matches!(c, Cell::Value(v) if v.contains('\t'))) {
+        why.push("a tab inside a cell splits it when pasted into a spreadsheet");
+    }
+    if cells().any(|c| matches!(c, Cell::Value(v) if v.contains(['\n', '\r']))) {
+        why.push("a line break inside a cell splits it when pasted into a spreadsheet");
+    }
+    (!why.is_empty()).then(|| why.join("; "))
 }
 
 /// `812 B`, `1.2 kB`, `3.4 MB`.

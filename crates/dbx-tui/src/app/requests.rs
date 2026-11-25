@@ -41,6 +41,8 @@ pub enum Target {
     HistoryMore,
     /// One save of a run to the history, by its serial: each stands alone.
     SaveHistory(u64),
+    /// One export to a file, by its serial: each stands alone.
+    Export(u64),
 }
 
 /// What a reply is, by the table.

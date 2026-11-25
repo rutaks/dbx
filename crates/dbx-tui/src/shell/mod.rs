@@ -3,6 +3,7 @@
 //! `select!` over the terminal's events, the reply channel and the app's
 //! next deadline; it draws only when an update asks for a repaint.
 
+pub mod export;
 pub mod kitty;
 pub mod prefs;
 mod terminal;
@@ -187,6 +188,12 @@ pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>) -> io::
     app.ui.caps.keyboard_protocol = guard.keyboard_protocol;
     let syntax: Arc<dyn crate::core::Syntax> = core.clone();
     app.ui.syntax.set_handle(syntax);
+    // Exports go to the directory the client was started in, stamped with the
+    // local time the overlay was opened at.
+    app.ui.export_env = crate::app::export::ExportEnv {
+        dir: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+        stamp: Arc::new(|| chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()),
+    };
     app.ui.theme = crate::app::theme::Palette::from_setting(std::env::var("DBX_TUI_THEME").ok().as_deref());
     if let Some(path) = &prefs {
         app.set_layout(self::prefs::load(path));
@@ -255,6 +262,21 @@ pub(crate) fn execute(
                 if let Some(path) = &tasks.prefs {
                     let _ = prefs::save(path, &layout);
                 }
+            }
+            Command::Export(id, job) => {
+                let (core, tx) = (core.clone(), tx.clone());
+                // The formats and the file are blocking work: off the event
+                // loop, and waited for when quitting (a moment at most), so a
+                // write is not cut in the middle.
+                let task = tokio::spawn(async move {
+                    let reply = tokio::task::spawn_blocking(move || export::run(core.as_ref(), &job)).await.unwrap_or_else(|e| {
+                        Err(crate::core::ExportError { exists: false, message: format!("Not written: the export stopped before it finished ({e}).") })
+                    });
+                    let _ = tx.send((id, CoreReply::Exported(reply)));
+                });
+                let mut closing = tasks.closing.lock().unwrap_or_else(|p| p.into_inner());
+                closing.retain(|t| !t.is_finished());
+                closing.push(task);
             }
             Command::Cancel(run) => core.cancel(run),
             Command::Abandon(id) => tasks.abandon(id),
@@ -412,6 +434,62 @@ mod tests {
         assert!(!quit);
         assert_eq!(*seen.lock().unwrap(), vec!["a\tb\u{1b}[0m".to_string(), String::new()]);
         assert!(fake.calls().is_empty() && rx.try_recv().is_err());
+    }
+
+    fn csv_job(path: &std::path::Path, replace: bool) -> crate::core::ExportJob {
+        use crate::core::{Cell, CellKind, Column, ExportFormat, ExportJob, ExportRequest};
+        ExportJob {
+            request: ExportRequest {
+                format: ExportFormat::Csv,
+                columns: vec![Column { name: "v".into(), db_type: "text".into(), kind: CellKind::Text }],
+                rows: vec![vec![Cell::Value("a".into())]],
+                kind: None,
+                table: "t".into(),
+                schema: String::new(),
+                null_empty: false,
+            },
+            path: path.to_string_lossy().into_owned(),
+            replace,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_export_command_writes_the_file_and_replies_to_its_request_after_the_write() {
+        use crate::core::Exported;
+        let fake = Arc::new(FakeCore::new());
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        let tasks = Tasks::default();
+        let quit = execute(vec![Command::Export(RequestId(7), csv_job(&path, false))], &core, &tx, &tasks);
+        assert!(!quit);
+        let (id, reply) = rx.recv().await.expect("a reply");
+        assert_eq!(id, RequestId(7));
+        let bytes = std::fs::read(&path).expect("the file is there when the reply is");
+        assert_eq!(reply, CoreReply::Exported(Ok(Exported { path: path.to_string_lossy().into_owned(), rows: 1, bytes: bytes.len() as u64 })));
+        assert!(fake.calls().is_empty(), "no Core call: dbx's formats need no connection");
+
+        // The same job again: the file is there, so it is refused, and untouched.
+        std::fs::write(&path, "mine").unwrap();
+        execute(vec![Command::Export(RequestId(8), csv_job(&path, false))], &core, &tx, &tasks);
+        let (id, reply) = rx.recv().await.expect("a reply");
+        assert_eq!(id, RequestId(8));
+        assert!(matches!(&reply, CoreReply::Exported(Err(e)) if e.exists && e.message.contains("out.csv")), "{reply:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+    }
+
+    #[tokio::test]
+    async fn quitting_waits_for_an_export_in_flight() {
+        let core: Arc<dyn Core> = Arc::new(FakeCore::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        let tasks = Tasks::default();
+        execute(vec![Command::Export(RequestId(1), csv_job(&path, false))], &core, &tx, &tasks);
+        assert!(finish_closing(&tasks, std::time::Duration::from_secs(5)).await);
+        assert!(path.exists(), "the write was waited for");
+        assert!(rx.try_recv().is_ok(), "and its reply was sent");
     }
 
     #[tokio::test]

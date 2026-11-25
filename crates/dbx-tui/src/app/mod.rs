@@ -16,6 +16,7 @@ pub mod complete_popup;
 pub mod complete_scope;
 pub mod edit_ops;
 pub mod editor;
+pub mod export;
 pub mod form;
 pub mod format;
 pub mod grid;
@@ -43,6 +44,8 @@ pub(crate) mod view;
 
 #[cfg(test)]
 mod cancel_tests;
+#[cfg(test)]
+mod export_tests;
 #[cfg(test)]
 mod finish_tests;
 #[cfg(test)]
@@ -268,6 +271,12 @@ pub struct Ui {
     pub drag: Option<Drag>,
     /// The last press, for double-clicks.
     pub clicks: Clicks,
+    /// Where an export goes by default and what time it is stamped with
+    /// (given by the shell; the app does no I/O).
+    pub export_env: export::ExportEnv,
+    /// The serial of the next export's request, so a reply is told from an
+    /// earlier export's.
+    pub next_export: u64,
 }
 
 #[derive(Debug)]
@@ -325,6 +334,8 @@ pub enum CoreReply {
     References(Result<Option<crate::core::References>, CoreError>),
     History(Result<crate::core::HistoryPage, CoreError>),
     HistorySaved(Result<(), CoreError>),
+    /// The write of an export, from the shell (not the Core).
+    Exported(Result<crate::core::Exported, crate::core::ExportError>),
 }
 
 #[derive(Debug)]
@@ -355,6 +366,10 @@ pub enum Command {
     /// cell data: the shell must carry it so the terminal cannot read it as
     /// anything but the clipboard's content (OSC 52 base64).
     CopyToClipboard(String),
+    /// Write a result to a file, off the event loop (slice 19). The answer
+    /// comes back as `CoreReply::Exported` for this request, and only then
+    /// does the app say anything was written.
+    Export(RequestId, crate::core::ExportJob),
     /// Write the layout preferences beside the store. Fire and forget; a
     /// failure leaves the defaults for the next run, nothing more.
     SavePrefs(LayoutPrefs),
@@ -441,6 +456,8 @@ impl App {
                 layout_unsaved: false,
                 drag: None,
                 clicks: Clicks::default(),
+                export_env: export::ExportEnv::default(),
+                next_export: 1,
             },
         }
     }
@@ -867,6 +884,7 @@ impl App {
         }
         match overlay {
             Overlay::Form(form) if !form.confirm_discard => self.on_form_key(&key, fx),
+            Overlay::Export(_) => self.on_export_key(&key, fx),
             // Backing out one level always works, button or not.
             Overlay::Failure(_) if combo.code == KeyCode::Esc => self.overlay_action(OverlayAction::Dismiss, fx),
             _ => {}
@@ -876,6 +894,9 @@ impl App {
     /// The keys of the chooser and the help that are not buttons: moving.
     /// Returns whether it took the key.
     fn on_chooser_or_help_key(&mut self, combo: &KeyCombo, fx: &mut Effects) -> bool {
+        if matches!(self.ui.overlay, Some(Overlay::CopyAs(_))) {
+            return self.on_copy_as_key(combo, fx);
+        }
         let name = combo.to_string();
         let key = |names: &[&str]| names.contains(&name.as_str());
         match &mut self.ui.overlay {
@@ -986,9 +1007,13 @@ impl App {
             return;
         }
         let at = (mouse.column, mouse.row).into();
-        let hit = self.ui.overlay_buttons.iter().find(|b| b.rect.contains(at));
-        if let Some(action) = hit.map(|b| b.action) {
-            return self.overlay_action(action, fx);
+        let hit = self.ui.overlay_buttons.iter().find(|b| b.rect.contains(at)).copied();
+        if let Some(button) = hit {
+            // A click on a text row also puts the cursor where it landed.
+            if let OverlayAction::ExportFocus(field) = button.action {
+                return self.on_export_click(field, mouse.column - button.rect.x, fx);
+            }
+            return self.overlay_action(button.action, fx);
         }
         // Anything else outside the buttons and the form's rows does nothing:
         // not even to the panes behind the overlay.
@@ -1000,6 +1025,9 @@ impl App {
     fn on_overlay_paste(&mut self, text: &str, fx: &mut Effects) {
         if matches!(self.ui.overlay, Some(Overlay::History(_))) {
             return self.on_history_paste(text, fx);
+        }
+        if matches!(self.ui.overlay, Some(Overlay::Export(_))) {
+            return self.on_export_paste(text, fx);
         }
         if let Some(Overlay::Form(form)) = &mut self.ui.overlay {
             if !form.confirm_discard && form.paste(text) {
@@ -1055,6 +1083,13 @@ impl App {
             OverlayAction::HistoryInsert | OverlayAction::HistoryRun | OverlayAction::HistoryScope | OverlayAction::HistoryPick(_) => {
                 self.history_action(action, fx)
             }
+            OverlayAction::ExportRun
+            | OverlayAction::ExportReplace
+            | OverlayAction::ExportKeep
+            | OverlayAction::ExportFormat(_)
+            | OverlayAction::ExportFocus(_)
+            | OverlayAction::ExportNull(_) => self.export_action(action, fx),
+            OverlayAction::CopyAsRun | OverlayAction::CopyAsPick(_) => self.copy_as_action(action, fx),
             OverlayAction::Dismiss => {
                 self.forget_history_if_closing(fx);
                 self.ui.overlay = None;
@@ -1115,6 +1150,7 @@ impl App {
                     return;
                 }
             }
+            (Target::Export(serial), CoreReply::Exported(result)) => return self.on_exported(serial, result, fx),
             (Target::SaveHistory(serial), CoreReply::HistorySaved(result)) => {
                 self.model.requests.forget(&Target::SaveHistory(serial));
                 // Fire and forget: only a failure is worth a word.
