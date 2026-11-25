@@ -182,7 +182,7 @@ pub(super) fn draw_confirm_run(c: &mut ConfirmRun, p: &Painter, buf: &mut Buffer
 
 /// The statement's lines, each cut into pieces of at most `width` cells,
 /// spaces kept: nothing of the text is dropped or reflowed.
-fn statement_lines(text: &str, width: usize) -> Vec<String> {
+pub(super) fn statement_lines(text: &str, width: usize) -> Vec<String> {
     use unicode_segmentation::UnicodeSegmentation;
     let mut out = Vec::new();
     for line in text.split('\n') {

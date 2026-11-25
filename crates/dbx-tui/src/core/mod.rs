@@ -667,17 +667,74 @@ pub fn row_ceiling(columns: usize) -> usize {
     (MAX_CELLS / columns.max(1)).clamp(DEFAULT_ROW_CAP, MAX_ROW_CAP)
 }
 
+/// History is shared with the dbx desktop app (slice 18): one store, written
+/// through dbx's own persistence. Only statements typed as SQL are read here
+/// (source `sql`; the MCP server's are not ours).
+///
+/// One statement this client ran, to be saved. The adapter adds the id and the
+/// time, and the fields this client leaves empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewHistoryEntry {
+    pub connection: ConnectionId,
+    pub connection_name: String,
+    pub database: String,
+    /// The statement that ran, as it was sent.
+    pub sql: String,
+    pub elapsed: Duration,
+    pub success: bool,
+    /// The error text, cleaned, for a run that failed.
+    pub error: Option<String>,
+    /// Rows changed, for a statement that returned no result set.
+    pub affected: Option<u64>,
+}
+
+/// One statement in the store, whoever ran it. Everything in it was written by
+/// another program (the desktop app, another client): it is drawn only through
+/// the painter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub id: String,
+    /// Empty for an entry an old version of the desktop app wrote.
+    pub connection: ConnectionId,
+    pub connection_name: String,
+    pub database: String,
+    pub sql: String,
+    /// When it ran, as the list shows it (local time, `2026-11-25 14:03`).
+    pub when: String,
+    pub elapsed: Duration,
+    pub success: bool,
+    pub error: Option<String>,
+    pub affected: Option<u64>,
+}
+
+/// Where the next page of a search starts: the last entry of this one. Opaque
+/// to the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub executed_at: String,
+    pub id: String,
+}
+
+/// A search of the history, newest first.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HistoryQuery {
-    pub text: Option<String>,
+    /// Matched without regard to case against the statement, the connection's
+    /// name and the database. Empty matches everything.
+    pub search_text: String,
+    /// Only this connection's entries; `None` is every connection.
+    pub connection: Option<ConnectionId>,
+    /// The page after the one this cursor ended.
+    pub cursor: Option<HistoryCursor>,
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryEntry {
-    pub connection: ConnectionId,
-    pub sql: String,
-    pub at_unix: i64,
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistoryPage {
+    pub entries: Vec<HistoryEntry>,
+    /// Where the next page starts; `None` at the end.
+    pub next: Option<HistoryCursor>,
+    /// How many entries match, all pages together.
+    pub total: usize,
 }
 
 // ---- errors ----------------------------------------------------------------
@@ -820,7 +877,11 @@ pub trait Core: Syntax {
     /// Another session of the same tab is not touched.
     async fn close_session(&self, session: SessionId, at: &DatabasePath) -> Result<(), CoreError>;
 
-    async fn history(&self, query: HistoryQuery) -> Result<Vec<HistoryEntry>, CoreError>;
+    /// Saves one run to the history the desktop app shares. The store trims to
+    /// the retention limit, which is the desktop's setting.
+    async fn save_history(&self, entry: &NewHistoryEntry) -> Result<(), CoreError>;
+    /// Searches the history (source `sql` only), newest first.
+    async fn history(&self, query: &HistoryQuery) -> Result<HistoryPage, CoreError>;
 }
 
 #[cfg(test)]

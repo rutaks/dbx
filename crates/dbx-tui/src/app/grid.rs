@@ -306,6 +306,8 @@ impl App {
         let tab = self.model.active_mut(id);
         tab.run = RunState::Running { run, request: request_id, started: now };
         tab.loading_more = Some(LoadMore { cap });
+        // The statement is already in the history from the run that made the result.
+        tab.history = false;
         fx.commands.push(Command::Core(request_id, CoreCall::Run(run, request)));
         fx.repaint = true;
     }

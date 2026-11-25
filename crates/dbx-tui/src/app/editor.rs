@@ -502,7 +502,7 @@ fn widget_takes(key: &KeyEvent) -> bool {
 /// (terminals send either), tabs stay, other control characters become `�`
 /// and bidirectional overrides are dropped, as `display_safe` does for what
 /// is drawn, because the widget draws the buffer as it is.
-fn clean_paste(text: &str) -> String {
+pub(super) fn clean_paste(text: &str) -> String {
     text.replace("\r\n", "\n")
         .replace('\r', "\n")
         .chars()

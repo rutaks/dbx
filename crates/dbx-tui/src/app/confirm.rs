@@ -89,9 +89,17 @@ impl App {
         let tab = self.model.active_mut(id);
         tab.run = RunState::Running { run, request: request_id, started: now };
         match purpose {
-            RunPurpose::Plain => tab.run_mentions_search_path = statement.to_lowercase().contains("search_path"),
-            RunPurpose::LoadMore(m) => tab.loading_more = Some(m),
+            RunPurpose::Plain => {
+                tab.run_mentions_search_path = statement.to_lowercase().contains("search_path");
+                // The statement the user said yes to has an outcome now.
+                tab.history = true;
+            }
+            RunPurpose::LoadMore(m) => {
+                tab.loading_more = Some(m);
+                tab.history = false;
+            }
             RunPurpose::Browse(fetch) => {
+                tab.history = false;
                 if let Some(b) = tab.browse.as_mut() {
                     if fetch == Fetch::Count {
                         b.count = Count::Asking;

@@ -111,7 +111,11 @@ pub struct FakeCore {
     columns: Queue<Vec<ColumnInfo>>,
     run: Queue<ResultSet>,
     close_session: Queue<()>,
-    history: Queue<Vec<HistoryEntry>>,
+    history: Queue<HistoryPage>,
+    save_history: Queue<()>,
+    /// Every search `history` was asked, and every entry `save_history` took.
+    history_queries: Mutex<Vec<HistoryQuery>>,
+    saved_history: Mutex<Vec<NewHistoryEntry>>,
     catalogue: Mutex<Option<Catalogue>>,
     calls: Mutex<Vec<Call>>,
     cancelled: Mutex<HashSet<RunId>>,
@@ -272,8 +276,22 @@ impl FakeCore {
     pub fn script_close_session(&self, r: Scripted<()>) {
         push(&self.close_session, r);
     }
-    pub fn script_history(&self, r: Scripted<Vec<HistoryEntry>>) {
+    pub fn script_history(&self, r: Scripted<HistoryPage>) {
         push(&self.history, r);
+    }
+    /// The next `save_history` answers `r`; with nothing scripted a save
+    /// succeeds (every plain run saves, and most tests do not care).
+    pub fn script_save_history(&self, r: Scripted<()>) {
+        push(&self.save_history, r);
+    }
+    /// The entries `save_history` has taken, in order (a save that was
+    /// scripted to fail is in the list too: it was asked for).
+    pub fn saved_history(&self) -> Vec<NewHistoryEntry> {
+        lock(&self.saved_history).clone()
+    }
+    /// The searches `history` has been asked, in order.
+    pub fn history_queries(&self) -> Vec<HistoryQuery> {
+        lock(&self.history_queries).clone()
     }
 }
 
@@ -526,8 +544,17 @@ impl Core for FakeCore {
         result
     }
 
-    async fn history(&self, _query: HistoryQuery) -> Result<Vec<HistoryEntry>, CoreError> {
+    async fn save_history(&self, entry: &NewHistoryEntry) -> Result<(), CoreError> {
+        lock(&self.saved_history).push(entry.clone());
+        if lock(&self.save_history).is_empty() {
+            return Ok(());
+        }
+        reply(&self.save_history, || unscripted("save_history")).await
+    }
+
+    async fn history(&self, query: &HistoryQuery) -> Result<HistoryPage, CoreError> {
         self.record(Call::History);
+        lock(&self.history_queries).push(query.clone());
         reply(&self.history, || unscripted("history")).await
     }
 }
@@ -624,7 +651,7 @@ mod tests {
             core.current_schema(&db).await.err(),
             core.run(RunId(1), request()).await.err(),
             core.close_session(SessionId { tab: TabId(1), serial: 1 }, &db).await.err(),
-            core.history(HistoryQuery::default()).await.err(),
+            core.history(&HistoryQuery::default()).await.err(),
         ];
         for (i, r) in results.iter().enumerate() {
             let e = r.as_ref().unwrap_or_else(|| panic!("call {i} succeeded unscripted"));

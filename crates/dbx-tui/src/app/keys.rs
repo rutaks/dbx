@@ -286,6 +286,10 @@ pub enum Action {
     FinishStatement,
     /// The key help overlay (after the prefix).
     Help,
+    /// The history overlay (slice 18): after the prefix, and from a direct
+    /// key (IntelliJ's console history, `ctrl+alt+e`).
+    History,
+    HistoryDirect,
     // The editor's own actions (slice 13). Each is bound in the editor's table
     // to IntelliJ's macOS key (Cmd), its Windows/Linux key (Ctrl) and, where
     // one exists, a key every terminal delivers; the prefix has a few more.
@@ -403,6 +407,7 @@ impl Action {
             Action::PrevUnresolved => "prev error",
             Action::FinishStatementDirect | Action::FinishStatement => "finish",
             Action::Help => "help",
+            Action::History | Action::HistoryDirect => "history",
             Action::Duplicate => "duplicate",
             Action::DeleteLine => "delete line",
             Action::MoveLineUp => "move line up",
@@ -468,6 +473,7 @@ impl Action {
             | Action::ResizeMode
             | Action::FinishStatement
             | Action::Help
+            | Action::History
             | Action::NewTab
             | Action::CloseTab
             | Action::NextTab
@@ -482,6 +488,7 @@ impl Action {
             | Action::NextUnresolved
             | Action::PrevUnresolved
             | Action::FinishStatementDirect
+            | Action::HistoryDirect
             | Action::CloseTabDirect
             | Action::NextTabDirect
             | Action::PrevTabDirect => Scope::Direct,
@@ -597,6 +604,7 @@ impl Default for Keybinds {
                 (plain('R'), Action::ResizeMode),
                 (plain(';'), Action::FinishStatement),
                 (plain('?'), Action::Help),
+                (plain('e'), Action::History),
                 (plain('t'), Action::NewTab),
                 (plain('T'), Action::CloseTab),
                 (plain(']'), Action::NextTab),
@@ -628,6 +636,10 @@ impl Default for Keybinds {
                 (key("alt+enter"), Action::ExpandStar),
                 (key("f2"), Action::NextUnresolved),
                 (key("shift+f2"), Action::PrevUnresolved),
+                // IntelliJ's console history. `ctrl+alt+e` first: it reaches
+                // the program in more terminals than Cmd does.
+                (key("ctrl+alt+e"), Action::HistoryDirect),
+                (key("cmd+alt+e"), Action::HistoryDirect),
                 // Terminals differ in which of the two they can send.
                 (key("cmd+shift+enter"), Action::FinishStatementDirect),
                 (key("ctrl+shift+enter"), Action::FinishStatementDirect),
@@ -905,6 +917,7 @@ impl Keybinds {
             row("cancel", &[Action::CancelDirect, Action::Cancel]),
             row("complete statement", &[Action::FinishStatementDirect, Action::FinishStatement]),
             row("complete", &[Action::CompleteOpen]),
+            row("history", &[Action::HistoryDirect, Action::History]),
             row("expand *", &[Action::ExpandStar]),
             row("next error", &[Action::NextUnresolved]),
             row("previous error", &[Action::PrevUnresolved]),

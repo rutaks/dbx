@@ -332,6 +332,69 @@ take the `ANALYSE` spelling, so it also calls that form dangerous.
 was already under way when the reply arrived cannot confirm by accident. Nothing
 is shown; `esc` and everything else work at once.
 
+## History (slice 18)
+
+**Shared with the desktop app.** The history is one table in dbx's store. A
+statement this client runs is written with dbx's own `save_history_entry` (the
+call the desktop uses), in the desktop's shape: a UTC time with milliseconds
+(`2026-11-25T10:00:00.000Z`), source `sql`, and the activity kind its history
+panel files it under (`query`, `data_change`, `schema_change`, from the same
+rule as `historyActivityKind.ts`). So it shows in the desktop's history, and the
+desktop's show here. Retention is the desktop's setting: the store trims on each
+save, and this client has no limit of its own. Entries with source `mcp` (the MCP
+server's) are never listed. Nothing is deleted from here.
+
+**Which runs are saved.** A statement of the user's that reached the database and
+has an outcome: it returned rows or changed some (rows affected are kept), failed
+in the database (`success = false`, with the error text, cleaned) or timed out
+(saved as a failure, naming the limit). The statement saved is `ResultSet.ran`
+or the error's `statement`. The desktop records every finished execution, with
+its error when it failed (`useSqlExecution.ts:645`); this client matches that
+except where it cannot claim the statement ran:
+
+- **Not saved:** a run that stops at a confirmation (nothing ran; the run after
+  the `y` is saved), "load more" (the statement is already there), browse pages
+  and counts (the client's own statements), the cancel probe and the catalog
+  queries (they never go through a run), a run the Core refused before sending
+  anything or could not deliver (no statement in the error, or a connection
+  error), and a run the user cancelled that then stopped (nothing finished).
+- **Cancelled but finished first:** saved, since it ran and what it changed
+  stands. How the desktop records a cancelled run is not verified (its result
+  carries the cancellation as an error); this client does not claim a statement
+  that never finished.
+
+After each such run the app issues one `SaveHistory` command, fire and forget. A
+failed save shows one notice ("The statement ran, but it was not saved to the
+history: ...") and blocks nothing. Quitting waits a moment for a save in flight.
+
+**The overlay** (`ctrl+alt+e` or `cmd+alt+e`, IntelliJ's console history; or
+prefix `e`; it works from any pane, and the same key closes it): a search field,
+the entries newest first (`when  connection / database  ✓|✗  first line`), and the
+highlighted statement in full below, with its time, duration, rows affected and,
+for a failure, its error. `↑`/`↓`/`ctrl+n`/`ctrl+p`/`pgup`/`pgdn` and the wheel
+move the highlight (`shift+↑↓` scrolls a long statement); a click on a row
+highlights it. Typing searches after a 200 ms pause (the app's `next_deadline`;
+more typing moves it), matching the statement, the connection's name and the
+database without regard to case; a reply to an older search is dropped. The
+highlight reaching the last entry loaded fetches the next page of 50 with dbx's
+cursor. `tab` flips between this tab's connection (the default) and every
+connection (the default when the tab has no database yet).
+
+- `enter` puts the statement in the editor at the caret, on lines of its own
+  (a line break before it when text precedes the caret on the line, and after it
+  when text follows), as one undo step, and closes the overlay.
+- `f5` (or `ctrl+enter`, `cmd+enter`: the run keys) runs it in the active tab on
+  that tab's target, through the normal run path: the editor is left alone and
+  slice 17's gate in `DbxCore::run` applies, so a statement that needs
+  confirming opens the confirmation. A row that ran somewhere other than this
+  tab's target is drawn in `peach`, and the preview says where it ran and where
+  `f5` will run it. The run is itself saved.
+
+Everything read from the store was written by another program, so it is drawn
+through the painter (control characters become `�`); an inserted statement goes
+through the editor's paste cleaning. A failed search says why and that typing
+searches again; an empty history says to run a statement with the run key.
+
 ## Editor keys (slice 13)
 
 Every editing action is a named action in the live bindings (`Keybinds`), with
@@ -757,7 +820,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `first-query`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `first-query`, `history`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live

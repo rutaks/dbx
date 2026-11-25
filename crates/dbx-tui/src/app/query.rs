@@ -52,6 +52,10 @@ pub struct QueryTab {
     /// Set while the tab pages through one table (opened from the sidebar);
     /// editing the text and running it clears it.
     pub browse: Option<Browse>,
+    /// The run in flight is a statement of the user's (typed, chosen, or run
+    /// from the history), whose outcome goes to the history. Load more and
+    /// the browse pages and counts are not.
+    pub history: bool,
 }
 
 /// A tab that pages through one table: the select it holds is generated, one
@@ -135,6 +139,7 @@ impl QueryTab {
             loading_more: None,
             run_mentions_search_path: false,
             browse: None,
+            history: false,
         }
     }
 
@@ -442,6 +447,19 @@ impl App {
 
     /// Whether a run can start now; when it cannot, the notice says why.
     pub(super) fn can_run(&mut self, fx: &mut Effects) -> bool {
+        if !self.can_start(fx) {
+            return false;
+        }
+        if self.ui.tab.editor.text().trim().is_empty() {
+            self.notify("Nothing to run: type a statement first.".into(), false, fx);
+            return false;
+        }
+        true
+    }
+
+    /// `can_run` for text that is not the editor's (a statement from the
+    /// history): everything but the editor needing text.
+    fn can_start(&mut self, fx: &mut Effects) -> bool {
         let use_key = self.ui.keys.key_for(Action::UseTarget).unwrap_or_default();
         if self.tab().target.is_none() {
             let text = format!("This tab has no database yet: in the sidebar, press {use_key} on one.");
@@ -468,10 +486,6 @@ impl App {
             }
             _ => {}
         }
-        if self.ui.tab.editor.text().trim().is_empty() {
-            self.notify("Nothing to run: type a statement first.".into(), false, fx);
-            return false;
-        }
         true
     }
 
@@ -483,25 +497,50 @@ impl App {
         }
         // Text that was edited, or a part of it, is a query of the user's now.
         self.leave_browse_if_edited(range.is_none() && self.ui.tab.editor.selection().is_none());
+        let buffer = self.ui.tab.editor.text();
+        let (cursor, selection) = (self.ui.tab.editor.cursor(), range.or_else(|| self.ui.tab.editor.selection()));
+        self.begin_run(buffer, cursor, selection, now, fx);
+    }
+
+    /// Runs `sql`, all of it and only it, in the active tab: a statement from
+    /// the history. The editor is left as it is. The same path as any run,
+    /// so the Core's confirmation gate applies.
+    pub(super) fn run_sql(&mut self, sql: &str, now: Instant, fx: &mut Effects) {
+        if !self.can_start(fx) {
+            return;
+        }
+        // Not the table the tab was paging any more.
+        self.leave_browse_if_edited(false);
+        let lines: Vec<&str> = sql.split('\n').collect();
+        let end = crate::core::Cursor { row: lines.len() - 1, col: lines.last().map_or(0, |l| l.chars().count()) };
+        self.begin_run(sql.to_string(), crate::core::Cursor::default(), Some((crate::core::Cursor::default(), end)), now, fx);
+    }
+
+    /// Sends the run of `selection` (or the statement at `cursor`) of
+    /// `buffer`, which `can_run` has found possible.
+    fn begin_run(&mut self, buffer: String, cursor: crate::core::Cursor, selection: Option<(crate::core::Cursor, crate::core::Cursor)>, now: Instant, fx: &mut Effects) {
         let Some(target) = self.tab().target.clone() else { return };
         let tab = self.tab().id;
         let run = crate::core::RunId(self.model.next_run);
         self.model.next_run += 1;
         let id = self.model.requests.begin(Target::Run(tab));
-        self.tab_mut().run_mentions_search_path = self.ui.tab.editor.text().to_lowercase().contains("search_path");
+        let mentions = buffer.to_lowercase().contains("search_path");
         let request = RunRequest {
             connection: target.connection,
             database: Some(target.database),
             session: self.tab().session(),
-            buffer: self.ui.tab.editor.text(),
-            cursor: self.ui.tab.editor.cursor(),
-            selection: range.or_else(|| self.ui.tab.editor.selection()),
+            buffer,
+            cursor,
+            selection,
             row_cap: self.model.row_cap,
             confirm_dangerous: self.model.settings.confirm_dangerous,
             confirmation: None,
         };
-        self.tab_mut().run = RunState::Running { run, request: id, started: now };
-        if let Some(b) = self.tab_mut().browse.as_mut() {
+        let t = self.tab_mut();
+        t.run_mentions_search_path = mentions;
+        t.run = RunState::Running { run, request: id, started: now };
+        t.history = true;
+        if let Some(b) = t.browse.as_mut() {
             b.failed = None;
             b.count_cancelled = false;
         }
@@ -597,6 +636,10 @@ impl App {
             return;
         }
         let after = now.map_or(Duration::ZERO, |now| now.saturating_duration_since(started));
+        // A statement that finished before the cancel landed ran, and what it
+        // changed stands: it is saved. One the cancel stopped is not (it
+        // never finished, and whether the server ran any of it is unknown).
+        let saved = if std::mem::take(&mut t.history) { super::history::saved_of(&result, after) } else { None };
         let (statement, how) = match result {
             Ok(set) => (Some(set.ran), CancelEnd::FinishedFirst),
             // Nothing ran (it waited for a yes): it is as stopped as can be.
@@ -611,6 +654,9 @@ impl App {
             }
         };
         t.run = RunState::Cancelled { after, statement, how };
+        if let Some(saved) = saved {
+            self.save_run(tab, saved, fx);
+        }
         if !active {
             return;
         }
@@ -645,6 +691,9 @@ impl App {
         };
         let more = t.loading_more.take();
         t.run = RunState::Idle;
+        // A statement of the user's that has an outcome goes to the history
+        // (below, once the tab's own state is settled).
+        let saved = if std::mem::take(&mut t.history) { super::history::saved_of(&result, elapsed) } else { None };
         // Nothing ran: it waits for a yes, and the tab is as it was.
         if matches!(&result, Err(e) if e.kind == CoreErrorKind::NeedsConfirmation) {
             let fetch = t.browse.as_mut().and_then(|b| b.fetch.take());
@@ -698,6 +747,9 @@ impl App {
                     self.ui.clicks.forget();
                 }
             }
+        }
+        if let Some(saved) = saved {
+            self.save_run(tab, saved, fx);
         }
     }
 

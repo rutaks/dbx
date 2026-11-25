@@ -309,6 +309,9 @@ pub(crate) fn execute(
                         .collect(),
                     _ => Vec::new(),
                 };
+                // A save to the history is waited for when quitting (a moment
+                // at most), so the last statement of a session is not lost.
+                let is_save = matches!(call, CoreCall::SaveHistory(_));
                 // Held while spawning, so a call that finishes at once cannot
                 // forget itself before it has been remembered.
                 let mut running = tasks.lock();
@@ -326,6 +329,8 @@ pub(crate) fn execute(
                         CoreCall::TableColumns(at) => CoreReply::TableColumns(core.columns(&at).await),
                         CoreCall::ForeignKeys(at) => CoreReply::ForeignKeys(core.foreign_keys(&at).await),
                         CoreCall::AnalyzeReferences(kind, sql) => CoreReply::References(core.analyze_references(&kind, &sql).await),
+                        CoreCall::History(query) => CoreReply::History(core.history(&query).await),
+                        CoreCall::SaveHistory(entry) => CoreReply::HistorySaved(core.save_history(&entry).await),
                     };
                     done.lock().remove(&id);
                     if let Some(ended) = ended {
@@ -334,6 +339,11 @@ pub(crate) fn execute(
                     let _ = tx.send((id, reply));
                 });
                 running.insert(id, task.abort_handle());
+                if is_save {
+                    let mut closing = tasks.closing.lock().unwrap_or_else(|p| p.into_inner());
+                    closing.retain(|t| !t.is_finished());
+                    closing.push(task);
+                }
             }
         }
     }

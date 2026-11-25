@@ -38,6 +38,9 @@ pub enum Overlay {
     Chooser(Chooser),
     /// Every action with all its keys.
     Help(HelpOverlay),
+    /// Earlier statements, shared with the desktop app: search, preview,
+    /// insert or run again (slice 18).
+    History(Box<super::history::HistoryOverlay>),
 }
 
 /// One thing the chooser offers to run.
@@ -183,6 +186,13 @@ pub enum OverlayAction {
     /// The statement chooser: run the highlighted entry, or one that was clicked.
     ChooserRun,
     ChooserPick(usize),
+    /// The history: put the highlighted statement in the editor, run it, flip
+    /// between this connection and all of them, or highlight the entry that
+    /// was clicked.
+    HistoryInsert,
+    HistoryRun,
+    HistoryScope,
+    HistoryPick(usize),
     /// Close a notice or a question without doing anything.
     Dismiss,
     /// The cell viewer: copy the raw value, and switch between a JSON
@@ -256,6 +266,9 @@ const CHOOSER_BUTTONS: &[ButtonSpec] =
 const CONFIRM_RUN_BUTTONS: &[ButtonSpec] =
     &[button("y", "y", "run", OverlayAction::ConfirmRunYes), button("esc", "esc", "cancel", OverlayAction::ConfirmRunNo)];
 const HELP_BUTTONS: &[ButtonSpec] = &[button("esc", "esc", "close", OverlayAction::Dismiss)];
+// The history's own keys are read by `App::on_history_key` (the run key is
+// the live one), and its buttons are drawn with the live key labels.
+const HISTORY_BUTTONS: &[ButtonSpec] = &[];
 const FAILURE_BUTTONS: &[ButtonSpec] = &[button("↵", "enter", "close", OverlayAction::Dismiss)];
 
 impl Overlay {
@@ -278,6 +291,7 @@ impl Overlay {
             // Drawn with the live keys, not from this table.
             Overlay::Chooser(_) => CHOOSER_BUTTONS,
             Overlay::Help(_) => HELP_BUTTONS,
+            Overlay::History(_) => HISTORY_BUTTONS,
             Overlay::CellViewer(_) => &[],
         }
     }

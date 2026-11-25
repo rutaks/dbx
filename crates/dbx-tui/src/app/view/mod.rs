@@ -3,6 +3,7 @@
 
 mod editor;
 mod form;
+mod history;
 mod overlays;
 mod panel;
 mod popup;
@@ -60,6 +61,15 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
         draw_notice(app, &p, buf);
     }
     // The overlay comes last, over everything else dimmed.
+    // Where the active tab runs, for the history to say where an entry ran
+    // somewhere else.
+    let here = match (&app.ui.overlay, app.tab().target.clone()) {
+        (Some(Overlay::History(_)), Some(path)) => {
+            let name = app.connection(&path.connection).map(|c| c.name.clone()).unwrap_or_else(|| path.connection.0.clone());
+            Some(history::Here { path, name })
+        }
+        _ => None,
+    };
     let drawn = match &mut app.ui.overlay {
         Some(overlay) => {
             panel::dim(buf, buf.area);
@@ -68,7 +78,7 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
                 Overlay::ConfirmCloseTab(ask) => app.model.tab(ask.tab).is_some_and(|t| t.run.in_flight().is_some()),
                 _ => false,
             };
-            draw_overlay(overlay, running, &app.ui.keys, app.ui.caps, app.ui.notice.as_ref(), &p, buf)
+            draw_overlay(overlay, running, &app.ui.keys, app.ui.caps, app.ui.notice.as_ref(), here.as_ref(), &p, buf)
         }
         None => Drawn::default(),
     };
@@ -83,7 +93,17 @@ pub(super) struct Drawn {
     pub fields: Vec<FieldHit>,
 }
 
-fn draw_overlay(overlay: &mut Overlay, closing_tab_running: bool, keys: &super::keys::Keybinds, caps: super::Capabilities, notice: Option<&super::query::Notice>, p: &Painter, buf: &mut Buffer) -> Drawn {
+#[allow(clippy::too_many_arguments)]
+fn draw_overlay(
+    overlay: &mut Overlay,
+    closing_tab_running: bool,
+    keys: &super::keys::Keybinds,
+    caps: super::Capabilities,
+    notice: Option<&super::query::Notice>,
+    here: Option<&history::Here>,
+    p: &Painter,
+    buf: &mut Buffer,
+) -> Drawn {
     let buttons = overlay.buttons();
     match overlay {
         Overlay::Error(e) => {
@@ -142,6 +162,7 @@ fn draw_overlay(overlay: &mut Overlay, closing_tab_running: bool, keys: &super::
         Overlay::Chooser(c) => overlays::draw_chooser(c, p, buf),
         Overlay::ConfirmRun(c) => overlays::draw_confirm_run(c, p, buf),
         Overlay::Help(h) => overlays::draw_help(h, keys, caps, p, buf),
+        Overlay::History(h) => history::draw(h, keys, here, p, buf),
     }
 }
 
@@ -600,6 +621,7 @@ fn normal_hints(app: &App) -> Vec<Hint> {
         }
         hints.extend(one(Action::RunDirect, "run"));
         hints.extend(one(Action::CompleteOpen, "complete"));
+        hints.extend(one(Action::HistoryDirect, "history"));
         hints.push(prefix);
         // Only while there is a name to go to.
         if app.ui.tab.marks.unresolved_count() > 0 {

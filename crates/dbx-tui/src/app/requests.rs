@@ -35,6 +35,12 @@ pub enum Target {
     /// The columns of a table `o` was pressed on before the tree had them: the
     /// primary key is read from them, then the table opens.
     OpenTable(crate::core::TablePath),
+    /// The history overlay's search: the latest wins.
+    History,
+    /// The next page of the search on screen; a new search makes it stale.
+    HistoryMore,
+    /// One save of a run to the history, by its serial: each stands alone.
+    SaveHistory(u64),
 }
 
 /// What a reply is, by the table.

@@ -802,10 +802,6 @@ fn metadata_error(raw: &str, secret: &str) -> CoreError {
     CoreError::new(kind, scrub(raw, &[secret]))
 }
 
-fn not_yet<T>(slice: &str) -> Result<T, CoreError> {
-    Err(CoreError::new(CoreErrorKind::Other, format!("not available yet (slice {slice})")))
-}
-
 // ---- runs ------------------------------------------------------------------------
 
 /// The query timeout a run asks dbx for, in seconds, or `None` for no limit.
@@ -1809,8 +1805,114 @@ impl Core for DbxCore {
             .map(|_| ())
             .map_err(|raw| CoreError::new(CoreErrorKind::Other, scrub(&raw, &[])))
     }
-    async fn history(&self, _query: HistoryQuery) -> Result<Vec<HistoryEntry>, CoreError> {
-        not_yet("18")
+    /// Saved through the call the desktop app uses (`save_history_entry`), in
+    /// the shape it writes: an RFC 3339 UTC time with milliseconds, the
+    /// activity kind its history panel filters by, source `sql`.
+    async fn save_history(&self, entry: &NewHistoryEntry) -> Result<(), CoreError> {
+        let state = self.state().await?;
+        let saved = dbx_core::history::HistoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            connection_id: entry.connection.0.clone(),
+            connection_name: entry.connection_name.clone(),
+            database: entry.database.clone(),
+            sql: entry.sql.clone(),
+            executed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            execution_time_ms: entry.elapsed.as_millis(),
+            success: entry.success,
+            error: entry.error.clone(),
+            activity_kind: activity_kind(&entry.sql).to_string(),
+            operation: primary_operation(&entry.sql),
+            target: String::new(),
+            affected_rows: entry.affected.map(|n| i64::try_from(n).unwrap_or(i64::MAX)),
+            rollback_sql: None,
+            details_json: None,
+            source: "sql".to_string(),
+            mcp_tool_name: None,
+            mcp_request_json: None,
+            mcp_response_json: None,
+            mcp_session_id: None,
+        };
+        state.storage.save_history_entry(&saved).await.map_err(|raw| CoreError::new(CoreErrorKind::Store, scrub(&raw, &[])))
+    }
+
+    async fn history(&self, query: &HistoryQuery) -> Result<HistoryPage, CoreError> {
+        let state = self.state().await?;
+        let request = dbx_core::history::HistorySearchRequest {
+            search_text: query.search_text.clone(),
+            connections: query
+                .connection
+                .iter()
+                .map(|c| dbx_core::history::HistoryConnectionFilter { connection_id: c.0.clone(), connection_name: String::new() })
+                .collect(),
+            cursor: query.cursor.as_ref().map(|c| dbx_core::history::HistoryCursor { executed_at: c.executed_at.clone(), id: c.id.clone() }),
+            limit: query.limit,
+            // The MCP server's statements are not ours to show.
+            source: Some("sql".to_string()),
+            ..Default::default()
+        };
+        let found = state.storage.search_history_entries(request).await.map_err(|raw| CoreError::new(CoreErrorKind::Store, scrub(&raw, &[])))?;
+        Ok(HistoryPage {
+            entries: found.entries.into_iter().map(history_entry).collect(),
+            next: found.next_cursor.map(|c| HistoryCursor { executed_at: c.executed_at, id: c.id }),
+            total: found.total,
+        })
+    }
+}
+
+/// The store's entry as ours. Text another program wrote is kept whole (the
+/// statement is what a user may insert); the painter replaces control
+/// characters when it is drawn.
+fn history_entry(e: dbx_core::history::HistoryEntry) -> HistoryEntry {
+    HistoryEntry {
+        id: e.id,
+        connection: ConnectionId(e.connection_id),
+        connection_name: e.connection_name,
+        database: e.database,
+        sql: e.sql,
+        when: local_time(&e.executed_at),
+        elapsed: Duration::from_millis(u64::try_from(e.execution_time_ms).unwrap_or(u64::MAX)),
+        success: e.success,
+        error: e.error.filter(|m| !m.trim().is_empty()),
+        affected: e.affected_rows.and_then(|n| u64::try_from(n).ok()),
+    }
+}
+
+/// An RFC 3339 time as local `2026-11-25 14:03`; text that is not one is
+/// shown as it is (cut to the length of one), never hidden.
+fn local_time(rfc3339: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        Ok(at) => at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(),
+        Err(_) => rfc3339.chars().take(16).collect(),
+    }
+}
+
+/// The desktop's `primarySqlOperation`: the first keyword of the first
+/// statement once comments are gone, upper-cased, else `SQL`.
+fn primary_operation(sql: &str) -> String {
+    let first = statements_of(sql).into_iter().next().unwrap_or_default();
+    let word: String = first.chars().take_while(char::is_ascii_alphabetic).collect();
+    if word.is_empty() {
+        "SQL".to_string()
+    } else {
+        word.to_ascii_uppercase()
+    }
+}
+
+/// What the desktop's history panel files a statement under: its
+/// `classifySqlActivityKind` (`apps/desktop/src/lib/history/historyActivityKind.ts`),
+/// on the statements with comments removed.
+fn activity_kind(sql: &str) -> &'static str {
+    let statements = statements_of(sql);
+    let starts = |s: &str, words: &[&str]| {
+        let first = s.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+        words.iter().any(|w| first.eq_ignore_ascii_case(w))
+    };
+    if statements.iter().any(|s| starts(s, &["create", "alter", "drop", "rename"])) {
+        "schema_change"
+    } else if statements.iter().any(|s| starts(s, &["insert", "update", "delete", "merge", "replace", "truncate"])) {
+        "data_change"
+    } else {
+        "query"
     }
 }
 

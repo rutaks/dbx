@@ -2872,6 +2872,7 @@ name = "dbx-tui"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "chrono",
  "crossterm",
  "dbx-core",
  "dbx-tui",

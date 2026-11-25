@@ -151,7 +151,7 @@ fn status_lines(status: &FormStatus, width: usize) -> Vec<String> {
 
 /// A text input: a filled box, the field's visible part, and the cursor as a
 /// reversed cell when focused.
-fn draw_input(p: &Painter, buf: &mut Buffer, rect: Rect, field: &mut TextField, focused: bool, placeholder: Option<&str>) {
+pub(super) fn draw_input(p: &Painter, buf: &mut Buffer, rect: Rect, field: &mut TextField, focused: bool, placeholder: Option<&str>) {
     let rect = rect.intersection(p.bounds);
     if rect.is_empty() {
         return;

@@ -622,3 +622,231 @@ async fn a_connection_that_is_not_postgres_says_it_cannot_be_browsed_yet_and_dbx
         core.release(&at).await.expect("releasing nothing is fine");
     }
 }
+
+// ---- history (slice 18) ----------------------------------------------------------
+//
+// The history is the desktop app's: one table in the shared store, written and
+// searched through dbx's own persistence. Scratch stores only.
+
+use dbx_tui::core::{ConnectionId, HistoryCursor, HistoryQuery, NewHistoryEntry};
+use std::time::Duration;
+
+fn new_entry(connection: &str, name: &str, sql: &str) -> NewHistoryEntry {
+    NewHistoryEntry {
+        connection: ConnectionId(connection.into()),
+        connection_name: name.into(),
+        database: "pagila".into(),
+        sql: sql.into(),
+        elapsed: Duration::from_millis(42),
+        success: true,
+        error: None,
+        affected: None,
+    }
+}
+
+fn search(text: &str, connection: Option<&str>) -> HistoryQuery {
+    HistoryQuery { search_text: text.into(), connection: connection.map(|c| ConnectionId(c.into())), cursor: None, limit: 50 }
+}
+
+/// dbx's own handle on the same store, as the desktop app has it (opened after
+/// `core` has created and migrated the store).
+async fn desktop_storage(s: &Scratch) -> dbx_core::storage::Storage {
+    dbx_core::storage::Storage::open(&s.data_dir().join("dbx.db")).await.expect("open the scratch store as the desktop would")
+}
+
+async fn pause() {
+    // Entries are ordered by a time with millisecond resolution.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+}
+
+#[tokio::test]
+async fn an_entry_the_client_saves_is_found_again_by_a_substring_and_by_connection_newest_first() {
+    let s = Scratch::new();
+    let core = s.core();
+    core.connections().await.expect("open");
+    core.save_history(&new_entry("conn-a", "local pg", "select * from Film where id = 1")).await.expect("save a");
+    pause().await;
+    core.save_history(&new_entry("conn-b", "other pg", "select count(*) from film")).await.expect("save b");
+    pause().await;
+    let failed = NewHistoryEntry { success: false, error: Some("relation \"nope\" does not exist".into()), ..new_entry("conn-a", "local pg", "select * from nope") };
+    core.save_history(&failed).await.expect("save c");
+    pause().await;
+    let write = NewHistoryEntry { affected: Some(3), ..new_entry("conn-a", "local pg", "-- fix\nupdate film set title = 'x'") };
+    core.save_history(&write).await.expect("save d");
+
+    // A substring, without regard to case, over both connections: newest first.
+    let found = core.history(&search("FILM", None)).await.expect("search");
+    let sqls: Vec<&str> = found.entries.iter().map(|e| e.sql.as_str()).collect();
+    assert_eq!(sqls, ["-- fix\nupdate film set title = 'x'", "select count(*) from film", "select * from Film where id = 1"]);
+    assert_eq!(found.total, 3);
+    assert_eq!(found.next, None);
+
+    // This connection only.
+    let mine = core.history(&search("film", Some("conn-a"))).await.expect("search a");
+    assert_eq!(mine.entries.len(), 2);
+    assert!(mine.entries.iter().all(|e| e.connection == ConnectionId("conn-a".into()) && e.connection_name == "local pg"));
+
+    // The connection's name is searched too, and the database.
+    assert_eq!(core.history(&search("other", None)).await.unwrap().entries.len(), 1);
+    assert_eq!(core.history(&search("pagila", None)).await.unwrap().total, 4);
+    assert_eq!(core.history(&search("zzz-nothing", None)).await.unwrap().entries.len(), 0);
+    // `%` and `_` are text, not wildcards.
+    assert_eq!(core.history(&search("%", None)).await.unwrap().entries.len(), 0);
+
+    // What was saved: the failure with its error, the write with its rows.
+    let all = core.history(&search("", None)).await.expect("all");
+    let by = |sql: &str| all.entries.iter().find(|e| e.sql.contains(sql)).unwrap_or_else(|| panic!("{sql}")).clone();
+    let f = by("from nope");
+    assert!(!f.success && f.error.as_deref() == Some("relation \"nope\" does not exist"), "{f:?}");
+    assert_eq!(by("update film").affected, Some(3));
+    assert_eq!(by("count(*)").elapsed, Duration::from_millis(42));
+    assert!(by("count(*)").success && by("count(*)").error.is_none() && by("count(*)").affected.is_none());
+    assert!(!f.id.is_empty() && !f.when.is_empty());
+}
+
+#[tokio::test]
+async fn what_the_client_saves_has_the_shape_the_desktop_writes() {
+    let s = Scratch::new();
+    let core = s.core();
+    core.connections().await.expect("open");
+    core.save_history(&new_entry("conn-a", "local pg", "select 1")).await.unwrap();
+    core.save_history(&new_entry("conn-a", "local pg", "-- c\ndelete from t where id = 1")).await.unwrap();
+    core.save_history(&new_entry("conn-a", "local pg", "create table x (a int)")).await.unwrap();
+    let storage = desktop_storage(&s).await;
+    let found = storage
+        .search_history_entries(dbx_core::history::HistorySearchRequest { limit: 50, ..Default::default() })
+        .await
+        .expect("the desktop's own search");
+    assert_eq!(found.entries.len(), 3);
+    for e in &found.entries {
+        assert_eq!(e.source, "sql");
+        assert_eq!(e.connection_id, "conn-a");
+        // JavaScript's `toISOString`: `2026-11-25T10:00:00.000Z`.
+        let t = &e.executed_at;
+        assert!(t.len() == 24 && t.ends_with('Z') && t.as_bytes()[10] == b'T' && t.as_bytes()[19] == b'.', "{t}");
+        assert!(!e.id.is_empty());
+        assert_eq!(e.execution_time_ms, 42);
+        assert!(e.mcp_tool_name.is_none() && e.rollback_sql.is_none());
+    }
+    let kind = |sql: &str| found.entries.iter().find(|e| e.sql.contains(sql)).unwrap().activity_kind.clone();
+    assert_eq!(kind("select 1"), "query");
+    assert_eq!(kind("delete from"), "data_change", "the desktop's panel files it by this");
+    assert_eq!(kind("create table"), "schema_change");
+}
+
+#[tokio::test]
+async fn an_entry_written_the_desktops_way_is_read_back_and_shown_correctly() {
+    let s = Scratch::new();
+    let core = s.core();
+    core.connections().await.expect("open");
+    let storage = desktop_storage(&s).await;
+    let desktop = |id: &str, connection_id: &str, name: &str, sql: &str, at: &str, source: &str| dbx_core::history::HistoryEntry {
+        id: id.into(),
+        connection_id: connection_id.into(),
+        connection_name: name.into(),
+        database: "pagila".into(),
+        sql: sql.into(),
+        executed_at: at.into(),
+        execution_time_ms: 1234,
+        success: false,
+        error: Some("duplicate key value violates unique constraint".into()),
+        activity_kind: "data_change".into(),
+        operation: "UPDATE".into(),
+        target: String::new(),
+        affected_rows: Some(4),
+        rollback_sql: None,
+        details_json: None,
+        source: source.into(),
+        mcp_tool_name: None,
+        mcp_request_json: None,
+        mcp_response_json: None,
+        mcp_session_id: None,
+    };
+    let stamp = "2026-11-24T08:30:15.123Z";
+    storage.save_history_entry(&desktop("d-1", "conn-a", "local pg", "update film\n  set title = 'x'\n where id = 1", stamp, "sql")).await.unwrap();
+    // An entry an old desktop wrote has no connection id.
+    storage.save_history_entry(&desktop("d-2", "", "legacy pg", "select 'legacy'", "2026-11-23T08:30:15.000Z", "sql")).await.unwrap();
+    // The MCP server's entries are not ours.
+    storage.save_history_entry(&desktop("d-3", "conn-a", "local pg", "select 'from mcp'", "2026-11-25T08:30:15.000Z", "mcp")).await.unwrap();
+    // Text another program wrote can hold anything.
+    storage.save_history_entry(&desktop("d-4", "conn-a", "local pg", "select '\u{1b}[2J'", "not a time at all, really", "sql")).await.unwrap();
+
+    let found = core.history(&search("", None)).await.expect("search");
+    let ids: Vec<&str> = found.entries.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, ["d-4", "d-1", "d-2"], "newest first by the stored time; the MCP entry is not shown");
+    assert_eq!(found.total, 3);
+
+    let e = &found.entries[1];
+    assert_eq!((e.connection.0.as_str(), e.connection_name.as_str(), e.database.as_str()), ("conn-a", "local pg", "pagila"));
+    assert_eq!(e.sql, "update film\n  set title = 'x'\n where id = 1", "the statement is exactly as stored");
+    assert!(!e.success);
+    assert_eq!(e.error.as_deref(), Some("duplicate key value violates unique constraint"));
+    assert_eq!((e.elapsed, e.affected), (Duration::from_millis(1234), Some(4)));
+    let local = chrono::DateTime::parse_from_rfc3339(stamp).unwrap().with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string();
+    assert_eq!(e.when, local, "shown in local time, to the minute");
+
+    let legacy = &found.entries[2];
+    assert_eq!((legacy.connection.0.as_str(), legacy.connection_name.as_str()), ("", "legacy pg"));
+    // A time that is not one is shown cut, not hidden; the text is kept whole for the painter.
+    assert_eq!(found.entries[0].when, "not a time at al");
+    assert!(found.entries[0].sql.contains('\u{1b}'));
+
+    // This connection's id does not match the legacy entry (it has none).
+    let mine = core.history(&search("", Some("conn-a"))).await.unwrap();
+    assert_eq!(mine.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["d-4", "d-1"]);
+}
+
+#[tokio::test]
+async fn pages_follow_the_cursor_and_the_total_counts_every_page() {
+    let s = Scratch::new();
+    let core = s.core();
+    core.connections().await.expect("open");
+    for i in 0..5 {
+        core.save_history(&new_entry("conn-a", "local pg", &format!("select {i}"))).await.unwrap();
+        pause().await;
+    }
+    let first = core.history(&HistoryQuery { limit: 2, ..search("", None) }).await.unwrap();
+    assert_eq!(first.entries.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["select 4", "select 3"]);
+    assert_eq!(first.total, 5, "the total counts every page");
+    let cursor: HistoryCursor = first.next.clone().expect("more");
+    let second = core.history(&HistoryQuery { limit: 2, cursor: Some(cursor), ..search("", None) }).await.unwrap();
+    assert_eq!(second.entries.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["select 2", "select 1"]);
+    let third = core.history(&HistoryQuery { limit: 2, cursor: second.next.clone(), ..search("", None) }).await.unwrap();
+    assert_eq!(third.entries.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["select 0"]);
+    assert_eq!(third.next, None);
+}
+
+#[tokio::test]
+async fn the_store_trims_to_the_desktops_retention_setting_when_a_save_lands() {
+    let s = Scratch::new();
+    let core = s.core();
+    core.connections().await.expect("open");
+    desktop_storage(&s).await.save_history_retention_limit(200).await.expect("the desktop's setting");
+    for i in 0..203 {
+        core.save_history(&new_entry("conn-a", "local pg", &format!("select {i}"))).await.unwrap();
+    }
+    assert_eq!(core.history(&search("", None)).await.unwrap().total, 200, "the client set no limit of its own");
+}
+
+#[tokio::test]
+async fn the_operation_is_the_first_keyword_after_comments_like_the_desktops_and_the_error_keeps_its_lines() {
+    let s = Scratch::new();
+    let core = s.core();
+    core.connections().await.expect("open");
+    for sql in ["select 1", "-- c\n  delete from t", "/* x */ ; Update t set a = 1", "(select 1)", "-- only a comment"] {
+        core.save_history(&new_entry("conn-a", "local pg", sql)).await.unwrap();
+    }
+    let failed = NewHistoryEntry { success: false, error: Some("line one\nline two".into()), ..new_entry("conn-a", "local pg", "insert into t values (1)") };
+    core.save_history(&failed).await.unwrap();
+    let storage = desktop_storage(&s).await;
+    let found = storage.search_history_entries(dbx_core::history::HistorySearchRequest { limit: 50, ..Default::default() }).await.unwrap();
+    let op = |sql: &str| found.entries.iter().find(|e| e.sql == sql).unwrap().operation.clone();
+    assert_eq!(op("select 1"), "SELECT");
+    assert_eq!(op("-- c\n  delete from t"), "DELETE");
+    assert_eq!(op("/* x */ ; Update t set a = 1"), "UPDATE");
+    assert_eq!(op("(select 1)"), "SQL");
+    assert_eq!(op("-- only a comment"), "SQL");
+    assert_eq!(op("insert into t values (1)"), "INSERT");
+    let e = found.entries.iter().find(|e| e.sql.starts_with("insert")).unwrap();
+    assert_eq!(e.error.as_deref(), Some("line one\nline two"));
+}

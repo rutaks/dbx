@@ -153,6 +153,8 @@ impl App {
         let tab = self.model.active_mut(id);
         tab.run = RunState::Running { run, request: request_id, started: now };
         tab.run_mentions_search_path = false;
+        // A page or a count is the client's own statement, not the user's.
+        tab.history = false;
         if let Some(b) = &mut tab.browse {
             b.fetch = Some(fetch);
             b.failed = None;

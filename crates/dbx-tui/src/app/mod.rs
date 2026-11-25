@@ -20,6 +20,7 @@ pub mod form;
 pub mod format;
 pub mod grid;
 pub mod highlight;
+pub mod history;
 pub mod keys;
 pub mod layout;
 pub mod marks;
@@ -44,6 +45,8 @@ pub(crate) mod view;
 mod cancel_tests;
 #[cfg(test)]
 mod finish_tests;
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 mod editor_keys_tests;
 #[cfg(test)]
@@ -164,6 +167,8 @@ pub struct Model {
     pub next_tab: u32,
     /// The most rows a run fetches.
     pub row_cap: usize,
+    /// The serial of the next save to the history.
+    pub next_save: u64,
 }
 
 impl Model {
@@ -297,6 +302,10 @@ pub enum CoreCall {
     ForeignKeys(crate::core::TablePath),
     /// What dbx's analysis says a statement refers to.
     AnalyzeReferences(crate::core::DbKind, String),
+    /// Search the history (the overlay's search, or its next page).
+    History(crate::core::HistoryQuery),
+    /// Save one run to the history. Nothing waits for it.
+    SaveHistory(crate::core::NewHistoryEntry),
 }
 
 /// The reply to a `CoreCall`.
@@ -314,6 +323,8 @@ pub enum CoreReply {
     ForeignKeys(Result<Vec<crate::core::ForeignKey>, CoreError>),
     /// `None`: the statement does not parse.
     References(Result<Option<crate::core::References>, CoreError>),
+    History(Result<crate::core::HistoryPage, CoreError>),
+    HistorySaved(Result<(), CoreError>),
 }
 
 #[derive(Debug)]
@@ -401,6 +412,7 @@ impl App {
                 next_run: 1,
                 next_tab: 2,
                 row_cap: DEFAULT_ROW_CAP,
+                next_save: 1,
             },
             ui: Ui {
                 caps: Capabilities::default(),
@@ -481,6 +493,7 @@ impl App {
         self.completion_housekeeping(&mut fx);
         self.template_housekeeping(&mut fx);
         self.refresh_marks(&mut fx);
+        self.history_housekeeping(now, &mut fx);
         self.ensure_rows();
         fx
     }
@@ -498,7 +511,7 @@ impl App {
             Mode::Prefix { expires } => Some(expires),
             Mode::Normal | Mode::Resize => None,
         };
-        [prefix, self.query_deadline(), self.ui.tab.marks.deadline()].into_iter().flatten().min()
+        [prefix, self.query_deadline(), self.ui.tab.marks.deadline(), self.history_deadline()].into_iter().flatten().min()
     }
 
     pub fn view(&mut self, frame: &mut Frame) {
@@ -606,6 +619,10 @@ impl App {
             }
             (Action::Help, _) => {
                 self.open_help(fx);
+                None
+            }
+            (Action::History | Action::HistoryDirect, _) => {
+                self.open_history(fx);
                 None
             }
             (Action::NewTab, _) => {
@@ -837,6 +854,9 @@ impl App {
         if matches!(self.ui.overlay, Some(Overlay::CellViewer(_))) {
             return self.on_viewer_key(combo, fx);
         }
+        if matches!(self.ui.overlay, Some(Overlay::History(_))) {
+            return self.on_history_key(&key, combo, fx);
+        }
         if self.on_chooser_or_help_key(&combo, fx) {
             return;
         }
@@ -950,6 +970,13 @@ impl App {
                 _ => {}
             }
         }
+        if matches!(self.ui.overlay, Some(Overlay::History(_))) {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => return self.on_history_wheel(true, fx),
+                MouseEventKind::ScrollUp => return self.on_history_wheel(false, fx),
+                _ => {}
+            }
+        }
         match mouse.kind {
             MouseEventKind::ScrollDown => return self.scroll_viewer(WHEEL_ROWS, fx),
             MouseEventKind::ScrollUp => return self.scroll_viewer(-WHEEL_ROWS, fx),
@@ -971,6 +998,9 @@ impl App {
     }
 
     fn on_overlay_paste(&mut self, text: &str, fx: &mut Effects) {
+        if matches!(self.ui.overlay, Some(Overlay::History(_))) {
+            return self.on_history_paste(text, fx);
+        }
         if let Some(Overlay::Form(form)) = &mut self.ui.overlay {
             if !form.confirm_discard && form.paste(text) {
                 self.form_edited(fx);
@@ -1022,7 +1052,11 @@ impl App {
                 self.confirm_run(now, fx)
             }
             OverlayAction::ConfirmRunNo => self.decline_run(fx),
+            OverlayAction::HistoryInsert | OverlayAction::HistoryRun | OverlayAction::HistoryScope | OverlayAction::HistoryPick(_) => {
+                self.history_action(action, fx)
+            }
             OverlayAction::Dismiss => {
+                self.forget_history_if_closing(fx);
                 self.ui.overlay = None;
                 fx.repaint = true;
             }
@@ -1071,6 +1105,21 @@ impl App {
                 return;
             }
             (Target::OpenTable(path), CoreReply::TableColumns(result)) => self.on_open_table_columns(path, result, fx),
+            (Target::History, CoreReply::History(result)) => {
+                if !self.on_history_reply(result, false) {
+                    return;
+                }
+            }
+            (Target::HistoryMore, CoreReply::History(result)) => {
+                if !self.on_history_reply(result, true) {
+                    return;
+                }
+            }
+            (Target::SaveHistory(serial), CoreReply::HistorySaved(result)) => {
+                self.model.requests.forget(&Target::SaveHistory(serial));
+                // Fire and forget: only a failure is worth a word.
+                return self.on_history_saved(serial, result, fx);
+            }
             (Target::Children(node), CoreReply::Listed(result)) => {
                 if !self.on_listed(node, result, fx) {
                     return;
