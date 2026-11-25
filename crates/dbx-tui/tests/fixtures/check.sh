@@ -3,7 +3,10 @@
 # Needs Docker. Usage: tests/fixtures/up.sh && tests/fixtures/check.sh
 set -euo pipefail
 cd "$(dirname "$0")"
-q() { docker compose -f compose.yaml exec -T postgres psql -U postgres -d "$1" -tAX -F '|' -c "$2"; }
+# `docker exec` on the compose project's container, not `docker compose exec`:
+# the live tests run this with a scratch HOME, where the compose plugin is not
+# found.
+q() { docker exec -i dbxtui-fixtures-postgres-1 psql -U postgres -d "$1" -tAX -F '|' -c "$2"; }
 n=0
 check() { # check DB SQL EXPECTED
   local got; got="$(q "$1" "$2")"

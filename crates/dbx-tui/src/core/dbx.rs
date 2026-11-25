@@ -645,6 +645,7 @@ fn capabilities_of(db_type: DatabaseType) -> Capabilities {
             _ => Dialect::Generic,
         },
         single_connection: entry.single_connection_pool,
+        dump_loses: matches!(db_type, DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss),
     }
 }
 
@@ -2014,6 +2015,170 @@ impl Core for DbxCore {
             total: found.total,
         })
     }
+
+    /// The desktop app's sequence (`src-tauri/src/commands/database_export.rs`):
+    /// dbx's export on `spawn_export_task` (the blocking pool, driven by this
+    /// 16 MiB-stack runtime), then the export's own session closed, then its
+    /// cancel flag cleared. All three happen inside the task, so they happen
+    /// even if nobody waits for the answer any more.
+    ///
+    /// dbx records the destination directory's filesystem identity in the store
+    /// (`ensure_export_destination_dir`), and makes a missing directory; the
+    /// shell refuses a missing one before this is called.
+    async fn dump(&self, id: DumpId, request: DumpRequest, progress: DumpSink) -> Result<DumpEnd, CoreError> {
+        let state = self.state().await?;
+        let config = state.configs.read().await.get(&request.at.connection.0).cloned();
+        let Some(config) = config else {
+            return Err(CoreError::new(CoreErrorKind::Other, "That connection is no longer saved."));
+        };
+        let database = self.database_name(&request.at.connection, &request.at.database).await;
+        // dbx quotes the column names it reads from its own catalog with a
+        // function that passes a name through unescaped when it starts and
+        // ends with a quote (Postgres, GaussDB, openGauss), in its read query
+        // and its INSERT column list. We cannot guard names we do not hand to
+        // it, so a dump with such a column is refused, naming them.
+        if matches!(config.db_type, DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss) {
+            let found = quoted_columns(&state, &request.at.connection.0, &database, &request.schema, &config).await?;
+            if !found.is_empty() {
+                return Err(CoreError::new(CoreErrorKind::Refused, refusal_for_quoted_columns(&found, &request.schema)));
+            }
+        }
+        let export_id = dump_key(id);
+        let export = dump_request(&export_id, &request, &database)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dbx_core::export_runtime::spawn_export_task(async move {
+            let last = std::sync::Mutex::new(None::<DumpProgress>);
+            let sent = std::sync::Mutex::new(None::<std::time::Instant>);
+            let result = dbx_core::database_export::export_database_sql_core(&state, &export, |p| {
+                let ours = dump_progress(p, &config.password);
+                if matches!(ours.status, DumpStatus::Done | DumpStatus::Cancelled) {
+                    *last.lock().unwrap_or_else(|p| p.into_inner()) = Some(ours.clone());
+                } else {
+                    // dbx reports every page: a few a second are enough to
+                    // watch, and the app redraws for each one it gets.
+                    let mut at = sent.lock().unwrap_or_else(|p| p.into_inner());
+                    let now = std::time::Instant::now();
+                    if at.is_some_and(|t| now.duration_since(t) < DUMP_PROGRESS_EVERY) && ours.status == DumpStatus::Running {
+                        return;
+                    }
+                    *at = Some(now);
+                }
+                progress(ours);
+            })
+            .await;
+            let database = Some(export.database.as_str()).filter(|d| !d.is_empty());
+            let session = dbx_core::database_export::database_export_client_session_id(&export_id);
+            let _ = state.close_client_session_pool_with_completion(&export.connection_id, database, &session).await;
+            dbx_core::database_export::clear_export_cancelled(&export_id).await;
+            let end = result.map(|()| DumpEnd { last: last.into_inner().unwrap_or_else(|p| p.into_inner()) });
+            let _ = tx.send(end.map_err(|raw| {
+                let kind = if dbx_core::query::is_connection_error(&raw) { CoreErrorKind::Connect } else { CoreErrorKind::Other };
+                CoreError::new(kind, scrub(&raw, &[&config.password]))
+            }));
+        });
+        rx.await.unwrap_or_else(|_| Err(CoreError::new(CoreErrorKind::Other, "The dump stopped before it finished.")))
+    }
+
+    fn cancel_dump(&self, id: DumpId) {
+        // dbx's flag is a set behind a lock; the async function never waits.
+        futures::executor::block_on(dbx_core::database_export::set_export_cancelled(&dump_key(id)));
+    }
+}
+
+/// How often running progress is passed on, at most.
+const DUMP_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// dbx's export id for one dump: its own per process.
+fn dump_key(id: DumpId) -> String {
+    format!("dbx-tui-dump-{}-{}", std::process::id(), id.0)
+}
+
+/// The columns (`schema.table.column`) in the dump's scope whose names dbx's
+/// quoting would pass through unescaped: a name of two or more characters that
+/// starts and ends with `"`, a backtick, or `[` and `]`. At most 6 are
+/// listed. System schemas are left out. The schema is a literal made safe
+/// here; the statement is a plain select, which the gate lets through.
+async fn quoted_columns(state: &Arc<AppState>, connection: &str, database: &str, schema: &str, config: &ConnectionConfig) -> Result<Vec<String>, CoreError> {
+    let scope = if schema.is_empty() { String::new() } else { format!(" and n.nspname = '{}'", schema.replace('\'', "''")) };
+    let sql = format!(
+        "select n.nspname || '.' || c.relname || '.' || a.attname \
+         from pg_catalog.pg_attribute a \
+         join pg_catalog.pg_class c on c.oid = a.attrelid \
+         join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+         where a.attnum > 0 and not a.attisdropped and c.relkind in ('r', 'p', 'v', 'm', 'f') \
+         and length(a.attname) >= 2 \
+         and ((left(a.attname, 1) = '\"' and right(a.attname, 1) = '\"') \
+           or (left(a.attname, 1) = '`' and right(a.attname, 1) = '`') \
+           or (left(a.attname, 1) = '[' and right(a.attname, 1) = ']')) \
+         and n.nspname not in ('pg_catalog', 'information_schema') \
+         and n.nspname not like 'pg\\_toast%' and n.nspname not like 'pg\\_temp\\_%'{scope} \
+         order by 1 limit 7"
+    );
+    let options = QueryExecutionOptions { max_rows: Some(7), timeout_secs: Some(0), ..Default::default() };
+    let result = execute_sql_statement_with_options_typed(state, connection, database, &sql, None, None, options)
+        .await
+        .map_err(|e| run_error(e, &sql, &config.password, None))?;
+    let set = result_set(result, sql, config.db_type);
+    Ok(set.rows.into_iter().filter_map(|row| match row.into_iter().next() {
+        Some(Cell::Value(name)) => Some(name),
+        _ => None,
+    }).collect())
+}
+
+/// The refusal's words: which columns, and what to do.
+fn refusal_for_quoted_columns(found: &[String], schema: &str) -> String {
+    let shown: Vec<String> = found.iter().take(6).map(|n| display_safe(n)).collect();
+    let more = if found.len() > 6 { " and more" } else { "" };
+    let scope = if schema.is_empty() { "In the whole database" } else { "In that schema" };
+    format!(
+        "Not dumped: {scope} a column is named with quotes around it ({}{more}), and dbx's dump would write its name unescaped, which can break or change the statements. Rename the column, or dump a schema without it.",
+        shown.join(", ")
+    )
+}
+
+/// dbx's request for a dump: structure, data and the objects (views,
+/// functions, sequences) that go with structure; `fail_on_error` off, as the
+/// desktop's dialog has it; plain SQL, never compressed or split. Built as
+/// JSON so every option this client does not set keeps dbx's own default.
+fn dump_request(export_id: &str, request: &DumpRequest, database: &str) -> Result<dbx_core::database_export::DatabaseExportRequest, CoreError> {
+    let value = serde_json::json!({
+        "exportId": export_id,
+        "connectionId": request.at.connection.0,
+        "database": database,
+        "schema": request.schema,
+        "filePath": request.path,
+        "includeStructure": request.content.structure(),
+        "includeData": request.content.data(),
+        "includeObjects": request.content.structure(),
+        "dropTableIfExists": request.drop_tables,
+        "failOnError": false,
+        "preventOverwrite": request.prevent_overwrite,
+        "batchSize": dbx_core::database_export::DATABASE_EXPORT_INSERT_BATCH_SIZE,
+    });
+    serde_json::from_value(value).map_err(|e| CoreError::new(CoreErrorKind::Other, format!("dbx rejected the dump request: {e}")))
+}
+
+fn dump_progress(p: dbx_core::database_export::ExportProgress, secret: &str) -> DumpProgress {
+    use dbx_core::database_export::ExportStatus as S;
+    let status = match p.status {
+        S::PreparingSnapshot => DumpStatus::Preparing,
+        S::Running if p.preparing => DumpStatus::Preparing,
+        S::Writing => DumpStatus::Writing,
+        S::Done => DumpStatus::Done,
+        S::Cancelled => DumpStatus::Cancelled,
+        // dbx's export never sends `Error` itself (a failure is its return
+        // value); a head that relays one would.
+        S::Running | S::Error => DumpStatus::Running,
+    };
+    DumpProgress {
+        status,
+        object: p.current_object,
+        index: p.object_index,
+        total: p.total_objects,
+        rows: p.rows_exported,
+        errors: p.error_count,
+        first_error: p.error_summary.map(|e| scrub(&e, &[secret])),
+    }
 }
 
 /// The store's entry as ours. Text another program wrote is kept whole (the
@@ -2998,5 +3163,20 @@ mod tests {
             }
         }
         assert!(seen >= 6, "the scan looked at the call sites ({seen})");
+
+        // `dump_request` is registered here with no guard, on purpose: it hands
+        // dbx the database, the schema and the file path as values, and dbx's
+        // dump builds every table and column statement from its own catalog,
+        // with its own `quote_table_identifier`, so there is no name of ours
+        // to guard. The gap that leaves (a column named like an already-quoted
+        // identifier passes through unescaped) is closed by refusing the
+        // dump: `dump` asks the catalog (`quoted_columns`) before it builds the
+        // request.
+        let calls = production.lines().filter(|l| !l.trim_start().starts_with("//") && l.contains("dump_request(") && !l.contains("fn dump_request(")).count();
+        assert_eq!(calls, 1, "dump_request is called from one known place (the dump), after the catalog scan");
+        let dump = production.find("async fn dump(").expect("the dump");
+        let scan = production[dump..].find("quoted_columns(").expect("the dump scans the catalog for quoted column names");
+        let build = production[dump..].find("dump_request(&export_id").expect("and then builds the request");
+        assert!(scan < build, "the scan comes before the request is built");
     }
 }

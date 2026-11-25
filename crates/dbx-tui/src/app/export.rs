@@ -30,6 +30,9 @@ const EXCEL_CELL_LIMIT: usize = 32_767;
 pub struct ExportEnv {
     pub dir: PathBuf,
     pub stamp: Arc<dyn Fn() -> String + Send + Sync>,
+    /// The system temporary folder, where dbx's whole-database dump keeps its
+    /// own copies while it works (the quit question names it).
+    pub temp_dir: PathBuf,
 }
 
 impl std::fmt::Debug for ExportEnv {
@@ -48,7 +51,7 @@ impl ExportEnv {
     /// A directory and a stamp that never change: what tests use.
     pub fn fixed(dir: &str, stamp: &str) -> Self {
         let stamp = stamp.to_string();
-        ExportEnv { dir: PathBuf::from(dir), stamp: Arc::new(move || stamp.clone()) }
+        ExportEnv { dir: PathBuf::from(dir), stamp: Arc::new(move || stamp.clone()), temp_dir: std::env::temp_dir() }
     }
 }
 
@@ -132,7 +135,7 @@ pub struct ExportOverlay {
 
 /// A file name's stem made of a table or `result`: nothing that would put the
 /// file in another directory.
-fn stem_of(name: &str) -> String {
+pub(super) fn stem_of(name: &str) -> String {
     let stem: String = name.chars().map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
     if stem.trim().is_empty() {
         "result".into()
@@ -141,7 +144,7 @@ fn stem_of(name: &str) -> String {
     }
 }
 
-fn rows_word(n: usize) -> String {
+pub(super) fn rows_word(n: usize) -> String {
     format!("{} {}", thousands(n), if n == 1 { "row" } else { "rows" })
 }
 

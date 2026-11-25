@@ -216,6 +216,9 @@ pub enum Action {
     UseTarget,
     /// Open the table or view under the cursor in a tab of its own, paged.
     OpenTable,
+    /// Dump the database or schema under the cursor to a `.sql` file; while
+    /// a dump runs, show its progress.
+    Dump,
     // The results pane's own keys (and the cell viewer's).
     GridLeft,
     GridRight,
@@ -378,6 +381,7 @@ impl Action {
             Action::RemoveConnection => "remove",
             Action::UseTarget => "use",
             Action::OpenTable => "browse",
+            Action::Dump => "dump",
             Action::GridLeft | Action::GridRight | Action::GridUp | Action::GridDown => "move",
             Action::GridPageUp | Action::GridPageDown => "page",
             Action::GridFirstCol => "first col",
@@ -687,6 +691,7 @@ impl Default for Keybinds {
                 (key("u"), Action::UseTarget),
                 (key("o"), Action::OpenTable),
                 (key("f4"), Action::OpenTable),
+                (key("D"), Action::Dump),
             ],
             results: vec![
                 (key("h"), Action::GridLeft),
@@ -957,7 +962,11 @@ impl Keybinds {
             row("previous page (results)", &[Action::PrevPage]),
             row("count rows (results)", &[Action::CountRows]),
         ];
-        let export = vec![row("export to a file (results)", &[Action::Export]), row("copy as text (results)", &[Action::CopyAs])];
+        let export = vec![
+            row("export to a file (results)", &[Action::Export]),
+            row("copy as text (results)", &[Action::CopyAs]),
+            row("dump a database or schema (sidebar)", &[Action::Dump]),
+        ];
         vec![
             HelpSection { title: "Run", rows: run },
             HelpSection { title: "Browse", rows: browse },

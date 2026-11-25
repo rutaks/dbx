@@ -183,6 +183,7 @@ impl App {
             Action::RemoveConnection => self.open_remove_confirm(fx),
             Action::UseTarget => self.use_target(fx),
             Action::OpenTable => self.open_table_at_cursor(fx),
+            Action::Dump => self.open_dump(fx),
             _ => {}
         }
     }
@@ -508,6 +509,8 @@ impl App {
                 self.ui.mode = Mode::Prefix { expires: now + self.ui.prefix_timeout };
                 fx.repaint = true;
             }
+            // The mode bar's dump status: the dump's progress.
+            Action::Dump if self.model.dump.is_some() => self.open_dump_progress(fx),
             a if a.scope() == super::keys::Scope::Results => self.perform_results(a, now, fx),
             a if a.scope() == super::keys::Scope::Resize => self.perform_resize(a, fx),
             a if a.scope() == super::keys::Scope::Complete => self.perform_complete(a, fx),

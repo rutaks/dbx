@@ -43,6 +43,8 @@ pub enum Target {
     SaveHistory(u64),
     /// One export to a file, by its serial: each stands alone.
     Export(u64),
+    /// The dump (one at a time): a new one makes an earlier one's replies stale.
+    Dump,
 }
 
 /// What a reply is, by the table.
@@ -127,6 +129,13 @@ impl Requests {
         } else {
             Settled::Stale(target)
         }
+    }
+
+    /// Whether `id` is the latest request for its target, without taking it
+    /// off the table: for replies that come many times for one request (a
+    /// dump's progress).
+    pub fn is_current(&self, id: RequestId) -> bool {
+        self.pending.get(&id).is_some_and(|(target, generation)| self.generations.get(target) == Some(generation))
     }
 
     fn bump(&mut self, target: &Target) -> u64 {

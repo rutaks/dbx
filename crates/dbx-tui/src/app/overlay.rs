@@ -46,6 +46,15 @@ pub enum Overlay {
     Export(Box<super::export::ExportOverlay>),
     /// Which text format to copy the result to the clipboard as.
     CopyAs(super::export::CopyAsOverlay),
+    /// Dump a database or a schema to a file: what, the scope, drop tables,
+    /// the path (slice 20).
+    Dump(Box<super::dump::DumpOverlay>),
+    /// The dump in flight (or the one that just ended): its progress, and
+    /// the key that cancels it, offered while true (the app keeps it in step
+    /// with the dump).
+    DumpProgress(bool),
+    /// Quitting while a dump runs: cancel it and quit? Names the file.
+    ConfirmQuitDump,
 }
 
 /// One thing the chooser offers to run.
@@ -210,6 +219,20 @@ pub enum OverlayAction {
     /// The copy-as list: copy in the highlighted format, or in the one clicked.
     CopyAsRun,
     CopyAsPick(usize),
+    /// The dump overlay: start it; replace the file that is there; keep it;
+    /// pick what goes in, the scope (true: the whole database), drop tables;
+    /// focus a row.
+    DumpRun,
+    DumpReplace,
+    DumpKeep,
+    DumpContent(usize),
+    DumpScope(bool),
+    DumpDrop(bool),
+    DumpFocus(super::dump::DumpField),
+    /// The progress overlay: cancel the dump.
+    DumpCancel,
+    /// The quit question while a dump runs: cancel it and quit.
+    QuitDumpYes,
     /// Close a notice or a question without doing anything.
     Dismiss,
     /// The cell viewer: copy the raw value, and switch between a JSON
@@ -296,6 +319,19 @@ const EXPORT_REPLACE_BUTTONS: &[ButtonSpec] =
     &[button("y", "y", "replace", OverlayAction::ExportReplace), button("esc", "esc", "keep the file", OverlayAction::ExportKeep)];
 const COPY_AS_BUTTONS: &[ButtonSpec] =
     &[button("↵", "enter", "copy", OverlayAction::CopyAsRun), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
+const DUMP_BUTTONS: &[ButtonSpec] =
+    &[button("↵", "enter", "export", OverlayAction::DumpRun), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
+// Sent and waiting for the shell's check: `enter` would send it again.
+const DUMP_SENT_BUTTONS: &[ButtonSpec] = &[button("esc", "esc", "close", OverlayAction::Dismiss)];
+// No `enter`: it is the key that sent the dump.
+const DUMP_REPLACE_BUTTONS: &[ButtonSpec] =
+    &[button("y", "y", "replace", OverlayAction::DumpReplace), button("esc", "esc", "keep the file", OverlayAction::DumpKeep)];
+const DUMP_PROGRESS_BUTTONS: &[ButtonSpec] =
+    &[button("c", "c", "cancel dump", OverlayAction::DumpCancel), button("esc", "esc", "close", OverlayAction::Dismiss)];
+const DUMP_PROGRESS_CLOSE_BUTTONS: &[ButtonSpec] = &[button("esc", "esc", "close", OverlayAction::Dismiss)];
+// No `enter`: a quit is not undone, and the dump with it.
+const QUIT_DUMP_BUTTONS: &[ButtonSpec] =
+    &[button("y", "y", "cancel it and quit", OverlayAction::QuitDumpYes), button("esc", "esc", "keep dumping", OverlayAction::Dismiss)];
 
 impl Overlay {
     /// The buttons along the bottom of the overlay, left to right. Their keys
@@ -324,6 +360,14 @@ impl Overlay {
                 _ => EXPORT_BUTTONS,
             },
             Overlay::CopyAs(_) => COPY_AS_BUTTONS,
+            Overlay::Dump(o) => match &o.stage {
+                super::dump::DumpStage::Sent(_) => DUMP_SENT_BUTTONS,
+                super::dump::DumpStage::Replace(_) => DUMP_REPLACE_BUTTONS,
+                _ => DUMP_BUTTONS,
+            },
+            Overlay::DumpProgress(true) => DUMP_PROGRESS_BUTTONS,
+            Overlay::DumpProgress(false) => DUMP_PROGRESS_CLOSE_BUTTONS,
+            Overlay::ConfirmQuitDump => QUIT_DUMP_BUTTONS,
             Overlay::CellViewer(_) => &[],
         }
     }

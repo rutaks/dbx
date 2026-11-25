@@ -449,6 +449,113 @@ infinities are NULL, for one).
 
 **Names given to dbx's SQL builders** (design section 31): dbx's quoting passes a name that starts and ends with a quote through unescaped on Postgres, GaussDB and openGauss. Every name handed to a builder in `core/dbx.rs` goes through `guarded()` (`guarded_all`, `guarded_if` for the skip probe whose text is never run): the page select (schema, table, order columns, primary keys), the count select (schema, table) and the INSERT export (schema, table, columns). The unit test `every_name_given_to_a_dbx_sql_builder_goes_through_guarded` fails on a builder call or a name that skips it.
 
+## Dump (slice 20)
+
+`D` on a database or a schema in the sidebar (of a connection the client can
+query and browse) opens the dump overlay: what goes in (structure and data,
+structure only, data only), the scope (the whole database, or the schema the
+cursor was on), drop tables if they exist (off), and the path (default
+`<cwd>/<database>-<YYYYMMDD-HHMMSS>.sql`). `enter` dumps; `esc` closes.
+
+- **dbx does the work:** `database_export::export_database_sql_core` on
+  `export_runtime::spawn_export_task` (driven by the client's 16 MiB-stack
+  runtime), then the export's own session is closed
+  (`close_client_session_pool_with_completion`) and its cancel flag cleared,
+  the desktop app's sequence. Structure includes dbx's objects (views,
+  functions, sequences, triggers); `fail_on_error` is off, as in the desktop's
+  dialog, so a failing object becomes a `-- ERROR` comment and is counted.
+- **dbx records the destination directory in the store it runs with.**
+  `ensure_export_destination_dir` saves the directory's filesystem identity
+  under `database_export_destination:<dir>` (`storage.save_state`), on every
+  dump, and would make a directory that is not there. So every test and
+  journey runs on a scratch store, and the client refuses a missing directory
+  by name before dbx is called (the shell's check, the export's rules).
+- **dbx never gets the target path** (design section 34). The shell makes a
+  hidden temporary file beside the target (`.<name>.<pid>.<n>.<nanos>.tmp`,
+  `create_new`, mode 0600) and dbx writes into that, told it may write over it
+  (dbx truncates and follows symlinks; the target must not suffer either).
+  Only when dbx's final progress is `Done` is the file put in place: **linked
+  without replacing** for a new name (a name taken meanwhile fails, and the
+  dump is not kept), or **renamed over the target** after the user's `y` to a
+  red question naming it (a symlink at the target is replaced itself, never
+  written through; the replaced regular file's mode is kept, a new file is
+  0600). A cancel, a failure, or a return with no final `Done` removes the
+  temporary file, so the earlier file is byte for byte as it was and the
+  client says so. The shell checks the path first, so dbx is not called for a
+  file that is there and not confirmed.
+- **Columns named like a quoted identifier refuse the dump.** dbx reads column
+  names from its own catalog and quotes them with `quote_table_identifier`,
+  which on Postgres, GaussDB and openGauss passes a name that starts and ends
+  with `"`, a backtick, or `[` and `]` through unescaped, in its read query
+  and its `INSERT` column list. The client cannot guard names it does not
+  hand to dbx (`dump_request` is registered in the guard scan test as
+  unguarded for that reason), so before such a dump it asks the catalog for
+  those columns in the scope (a schema, or every non-system schema) and
+  refuses, naming up to six as `schema.table.column`. Table and schema names
+  are not checked.
+- **Progress** comes as events for the dump's request (stale ones change
+  nothing); the adapter passes running reports on at most every 100 ms. The
+  mode bar shows `dumping pagila: public: film (7/22) 12,340 rows 14s` in
+  every pane (dbx counts a whole database's objects per schema, and names them
+  `schema: object`); a click on it, or `D`, shows the progress with `c cancel
+  dump`. One dump at a time: `D` on another database says so.
+- **Cancel** shows `cancelling…` until dbx's final `Cancelled` progress (dbx
+  checks its flag between pages and objects, every 50 ms while it waits), then
+  says what is at the path. **What a cancel leaves behind** (dbx's own
+  behaviour, measured on `million_rows`, `a_dump_cancelled_midway...` in
+  `tests/live.rs`): one schema is written straight to the file it is given and
+  a partial file is left (141 kB in the test); a whole database goes schema by
+  schema into dbx's own temporary directory, removed when it ends, and the file
+  is opened only after the last schema. dbx is given our temporary file, which
+  is removed, so **at the path there is nothing, or the earlier file untouched**
+  (a partial file at the path cannot happen). A failure is the same. The client
+  says which, from the file system (the shell compares the file with what was
+  there before).
+- **Ending:** the end says "Dumped" only when dbx's last progress is `Done` and
+  a new file is at the path. Then it gives the path, the size on disk, the
+  schemas (whole database) or objects (one schema), the rows and the time. On
+  **Postgres, GaussDB and openGauss** it does not stop at that: it says `dbx
+  reported no errors; its dump is known not to restore whole:` and lists the
+  losses below, and the setup overlay shows the same line before the dump
+  starts (other kinds say nothing they do not know). Done with errors says
+  `finished with N errors`, the first, and that the file has `-- ERROR`
+  comments. When dbx returns without a final `Done` the end says dbx ended
+  without reporting that it was done, and what is at the path (nothing is put
+  there); `Done` with no new file says so. A failure gives dbx's error,
+  cleaned.
+- **Quit while dumping** asks first, naming the file, and says what may be
+  left: the shell's hidden temporary file beside the target and, for a whole
+  database, dbx's own temporary copy (`schema-N.sql` files, in a folder dbx
+  makes with `tempfile::tempdir()`) in the system temporary folder, which the
+  question names (the folder's own name is dbx's). `y` cancels the dump and
+  quits once its final progress has come, or after 2 s; quitting also waits
+  (bounded) for the dump's task, which closes its session. A signal cancels it
+  the same way without asking.
+- **Read only:** without `snapshot_session_id` dbx opens no transaction (the
+  scheduled backups' `BEGIN ... READ ONLY` snapshot is not used); the live
+  tests run `tests/fixtures/check.sh` after every dump.
+
+### What dbx's dump loses (checked 2026-11-25, Postgres 16 fixtures)
+
+dbx reports these dumps as done with 0 errors, but the files do not restore
+whole. The live tests pin each loss, and fail when dbx changes.
+
+| Loss | Seen with |
+|---|---|
+| Domains are not written: a table using one (`film.release_year year`, `gt_types`) cannot be created, and its rows are lost. | pagila `film`; edge `gt_types` (`gt_posint`) |
+| A composite type used as an array (`gt_pair[]`) is not written. | edge `gt_arrays_more` |
+| A partition's DDL is written as `PARTITION OF "public"."payment" (` + newline + `) FOR VALUES ...`, which does not parse (six of pagila's seven partitions). | pagila `payment_p2022_01`..`06` |
+| A partitioned table's rows are written through the parent right after it is created, before any partition exists (and again for each partition). | pagila `payment` |
+| `NaN`, `Infinity` and `-Infinity` in a float column are written as `NULL` (dbx reads values on the binary path; see `KNOWN_DIFFERENCES.md`). | edge `numbers.approx` |
+| Values dbx reads only as binary are written as their wire bytes (`'0x3ff0…'`, `E'\x00\x00…'`): geometric types, `tsquery`. Postgres refuses the NUL bytes, and the rows of the batch are lost; a `tsvector` column is left out of the `INSERT`. | edge `gt_geometric`, `gt_documents` |
+| A table with several inheritance parents is created twice (`relation "inherit_child" already exists`). | edge `inherit_child` |
+
+With `ON_ERROR_STOP=1` pagila's dump stops at the first of these. Loaded past
+its errors, every other pagila table, and edge's `text_values`, `gt_text`,
+`gt_json`, `"Mixed Case"` and `other.things`, come back with the same rows
+(count and md5 of the ordered rows). A structure-only dump has no `INSERT`
+and restores every table dbx can make, empty.
+
 ## Editor keys (slice 13)
 
 Every editing action is a named action in the live bindings (`Keybinds`), with
@@ -874,7 +981,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `export` (writes files in a scratch directory only), `first-query`, `history`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `export` (writes files in a scratch directory only), `dump` (dumps `pagila` into a scratch directory, cancels a dump of `edge`), `first-query`, `history`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live

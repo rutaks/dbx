@@ -9,6 +9,7 @@ mod edit_keys;
 pub mod finish;
 mod resize;
 pub mod complete;
+pub mod dump;
 pub mod complete_context;
 pub mod complete_insert;
 pub mod complete_match;
@@ -44,6 +45,8 @@ pub(crate) mod view;
 
 #[cfg(test)]
 mod cancel_tests;
+#[cfg(test)]
+mod dump_tests;
 #[cfg(test)]
 mod export_tests;
 #[cfg(test)]
@@ -172,6 +175,12 @@ pub struct Model {
     pub row_cap: usize,
     /// The serial of the next save to the history.
     pub next_save: u64,
+    /// The dump in flight (slice 20): one at a time.
+    pub dump: Option<dump::Dumping>,
+    /// The id the next dump gets.
+    pub next_dump: u64,
+    /// Quitting waits for the cancelled dump's final progress until then.
+    pub quit_after_dump: Option<Instant>,
 }
 
 impl Model {
@@ -277,6 +286,9 @@ pub struct Ui {
     /// The serial of the next export's request, so a reply is told from an
     /// earlier export's.
     pub next_export: u64,
+    /// How the last dump ended (its words, and whether it failed), for the
+    /// progress overlay once it is over.
+    pub dump_ended: Option<(String, bool)>,
 }
 
 #[derive(Debug)]
@@ -336,6 +348,12 @@ pub enum CoreReply {
     HistorySaved(Result<(), CoreError>),
     /// The write of an export, from the shell (not the Core).
     Exported(Result<crate::core::Exported, crate::core::ExportError>),
+    /// One report of a dump's progress. Many come for one request; they do
+    /// not settle it.
+    DumpProgress(crate::core::DumpProgress),
+    /// A dump has ended (or was refused), with what the shell found at the
+    /// path. This one settles the request.
+    Dumped(Result<crate::core::Dumped, crate::core::DumpFailure>),
 }
 
 #[derive(Debug)]
@@ -370,6 +388,13 @@ pub enum Command {
     /// comes back as `CoreReply::Exported` for this request, and only then
     /// does the app say anything was written.
     Export(RequestId, crate::core::ExportJob),
+    /// Dump a database or a schema to a file (slice 20). The shell checks the
+    /// path before dbx is called, sends progress back as
+    /// `CoreReply::DumpProgress` for this request, and the end as
+    /// `CoreReply::Dumped`.
+    Dump(RequestId, crate::core::DumpId, crate::core::DumpRequest),
+    /// Ask a dump to stop. Fire and forget: its final progress says it did.
+    CancelDump(crate::core::DumpId),
     /// Write the layout preferences beside the store. Fire and forget; a
     /// failure leaves the defaults for the next run, nothing more.
     SavePrefs(LayoutPrefs),
@@ -428,6 +453,9 @@ impl App {
                 next_tab: 2,
                 row_cap: DEFAULT_ROW_CAP,
                 next_save: 1,
+                dump: None,
+                next_dump: 1,
+                quit_after_dump: None,
             },
             ui: Ui {
                 caps: Capabilities::default(),
@@ -458,6 +486,7 @@ impl App {
                 clicks: Clicks::default(),
                 export_env: export::ExportEnv::default(),
                 next_export: 1,
+                dump_ended: None,
             },
         }
     }
@@ -482,7 +511,9 @@ impl App {
         let mut fx = Effects::default();
         self.ensure_rows();
         self.expire_prefix(now, &mut fx);
+        let last = self.ui.now;
         self.on_time(now, &mut fx);
+        self.dump_on_time(last, now, &mut fx);
         // Anything but a key press ends prefix mode, so a click or a paste
         // cannot be followed by a stray command key. Plain pointer movement
         // does not count: terminals report it constantly.
@@ -511,6 +542,7 @@ impl App {
         self.template_housekeeping(&mut fx);
         self.refresh_marks(&mut fx);
         self.history_housekeeping(now, &mut fx);
+        self.sync_dump_overlay();
         self.ensure_rows();
         fx
     }
@@ -528,7 +560,7 @@ impl App {
             Mode::Prefix { expires } => Some(expires),
             Mode::Normal | Mode::Resize => None,
         };
-        [prefix, self.query_deadline(), self.ui.tab.marks.deadline(), self.history_deadline()].into_iter().flatten().min()
+        [prefix, self.query_deadline(), self.ui.tab.marks.deadline(), self.history_deadline(), self.dump_deadline()].into_iter().flatten().min()
     }
 
     pub fn view(&mut self, frame: &mut Frame) {
@@ -627,7 +659,7 @@ impl App {
                 None
             }
             (Action::Quit, _) => {
-                self.quit(fx);
+                self.request_quit(fx);
                 None
             }
             (Action::Run | Action::RunDirect, _) => {
@@ -885,6 +917,7 @@ impl App {
         match overlay {
             Overlay::Form(form) if !form.confirm_discard => self.on_form_key(&key, fx),
             Overlay::Export(_) => self.on_export_key(&key, fx),
+            Overlay::Dump(_) => self.on_dump_key(&key, fx),
             // Backing out one level always works, button or not.
             Overlay::Failure(_) if combo.code == KeyCode::Esc => self.overlay_action(OverlayAction::Dismiss, fx),
             _ => {}
@@ -1013,6 +1046,9 @@ impl App {
             if let OverlayAction::ExportFocus(field) = button.action {
                 return self.on_export_click(field, mouse.column - button.rect.x, fx);
             }
+            if let OverlayAction::DumpFocus(field) = button.action {
+                return self.on_dump_click(field, mouse.column - button.rect.x, fx);
+            }
             return self.overlay_action(button.action, fx);
         }
         // Anything else outside the buttons and the form's rows does nothing:
@@ -1028,6 +1064,9 @@ impl App {
         }
         if matches!(self.ui.overlay, Some(Overlay::Export(_))) {
             return self.on_export_paste(text, fx);
+        }
+        if matches!(self.ui.overlay, Some(Overlay::Dump(_))) {
+            return self.on_dump_paste(text, fx);
         }
         if let Some(Overlay::Form(form)) = &mut self.ui.overlay {
             if !form.confirm_discard && form.paste(text) {
@@ -1090,6 +1129,15 @@ impl App {
             | OverlayAction::ExportFocus(_)
             | OverlayAction::ExportNull(_) => self.export_action(action, fx),
             OverlayAction::CopyAsRun | OverlayAction::CopyAsPick(_) => self.copy_as_action(action, fx),
+            OverlayAction::DumpRun
+            | OverlayAction::DumpReplace
+            | OverlayAction::DumpKeep
+            | OverlayAction::DumpContent(_)
+            | OverlayAction::DumpScope(_)
+            | OverlayAction::DumpDrop(_)
+            | OverlayAction::DumpFocus(_)
+            | OverlayAction::DumpCancel
+            | OverlayAction::QuitDumpYes => self.dump_action(action, fx),
             OverlayAction::Dismiss => {
                 self.forget_history_if_closing(fx);
                 self.ui.overlay = None;
@@ -1099,6 +1147,12 @@ impl App {
     }
 
     fn on_reply(&mut self, id: RequestId, reply: CoreReply, fx: &mut Effects) {
+        // A dump's progress comes many times for one request: it is looked
+        // up, not taken off the table. Stale, it changes nothing.
+        let reply = match reply {
+            CoreReply::DumpProgress(progress) => return self.on_dump_progress(id, progress, fx),
+            reply => reply,
+        };
         // A stale reply is dropped without touching state or repainting,
         // except that a cancelled run's last word says it has ended.
         let target = match self.model.requests.settle(id) {
@@ -1151,6 +1205,7 @@ impl App {
                 }
             }
             (Target::Export(serial), CoreReply::Exported(result)) => return self.on_exported(serial, result, fx),
+            (Target::Dump, CoreReply::Dumped(result)) => return self.on_dumped(id, result, fx),
             (Target::SaveHistory(serial), CoreReply::HistorySaved(result)) => {
                 self.model.requests.forget(&Target::SaveHistory(serial));
                 // Fire and forget: only a failure is worth a word.

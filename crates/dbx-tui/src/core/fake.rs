@@ -76,6 +76,56 @@ pub enum Call {
     Cancel(RunId),
     CloseSession(SessionId, DatabasePath),
     History,
+    Dump(DumpId, DumpRequest),
+    CancelDump(DumpId),
+}
+
+/// One scripted dump: the progress it sends, each after a delay (tokio
+/// time), and how it ends when nobody cancels it.
+#[derive(Debug, Clone)]
+pub struct ScriptedDump {
+    steps: Vec<(Duration, DumpProgress)>,
+    end: Result<DumpEnd, CoreError>,
+    lag: usize,
+    /// What the fake writes to the request's path as it starts, truncating
+    /// what is there: dbx opening the file it was given.
+    writes: Option<Vec<u8>>,
+}
+
+impl ScriptedDump {
+    /// Sends `steps`, then ends with the last of them.
+    pub fn steps(steps: Vec<(Duration, DumpProgress)>) -> Self {
+        let last = steps.last().map(|(_, p)| p.clone());
+        ScriptedDump { steps, end: Ok(DumpEnd { last }), lag: 0, writes: None }
+    }
+
+    /// Sends `steps`, then fails with `message`.
+    pub fn failing(steps: Vec<(Duration, DumpProgress)>, message: &str) -> Self {
+        ScriptedDump { steps, end: Err(CoreError::new(CoreErrorKind::Other, message)), lag: 0, writes: None }
+    }
+
+    /// Sends `steps`, then returns `Ok` with no final progress at all.
+    pub fn ending_without_a_report(steps: Vec<(Duration, DumpProgress)>) -> Self {
+        ScriptedDump { steps, end: Ok(DumpEnd { last: None }), lag: 0, writes: None }
+    }
+
+    /// Fails as `error`, whatever it is (a refusal, say).
+    pub fn failing_with(error: CoreError) -> Self {
+        ScriptedDump { steps: Vec::new(), end: Err(error), lag: 0, writes: None }
+    }
+
+    /// Writes `bytes` to the request's path as the dump starts, replacing what
+    /// is there, as dbx does with the file it is given.
+    pub fn writing(mut self, bytes: &[u8]) -> Self {
+        self.writes = Some(bytes.to_vec());
+        self
+    }
+
+    /// After a cancel, `n` more steps are still sent before `Cancelled`.
+    pub fn lag(mut self, n: usize) -> Self {
+        self.lag = n;
+        self
+    }
 }
 
 /// What the fake database holds, for completion: answered by content (the
@@ -120,6 +170,8 @@ pub struct FakeCore {
     calls: Mutex<Vec<Call>>,
     cancelled: Mutex<HashSet<RunId>>,
     cancel_signal: Notify,
+    dumps: Mutex<VecDeque<ScriptedDump>>,
+    dump_cancels: Mutex<HashSet<DumpId>>,
     /// The sessions open: opened by a run, forgotten by a close.
     sessions: Mutex<HashSet<(SessionId, DatabasePath)>>,
     default_connections_empty: std::sync::atomic::AtomicBool,
@@ -144,12 +196,13 @@ impl Capabilities {
             default_port: Some(5432),
             dialect: Dialect::PostgreSql,
             single_connection: false,
+            dump_loses: true,
         }
     }
 
     /// A MySQL-shaped connection: databases and then tables, no schemas.
     pub fn mysql() -> Self {
-        Capabilities { schemas: false, edit_in_form: false, default_port: Some(3306), dialect: Dialect::MySql, ..Self::postgres() }
+        Capabilities { schemas: false, edit_in_form: false, default_port: Some(3306), dialect: Dialect::MySql, dump_loses: false, ..Self::postgres() }
     }
 
     /// A SQLite-shaped connection: a file with tables, no databases and no
@@ -163,6 +216,7 @@ impl Capabilities {
             default_port: None,
             dialect: Dialect::Sqlite,
             single_connection: true,
+            dump_loses: false,
             ..Self::postgres()
         }
     }
@@ -229,6 +283,10 @@ impl FakeCore {
 
     fn record(&self, call: Call) {
         lock(&self.calls).push(call);
+    }
+
+    pub fn script_dump(&self, d: ScriptedDump) {
+        lock(&self.dumps).push_back(d);
     }
 
     pub fn script_connections(&self, r: Scripted<Vec<Connection>>) {
@@ -542,6 +600,69 @@ impl Core for FakeCore {
     fn cancel(&self, run: RunId) {
         self.record(Call::Cancel(run));
         lock(&self.cancelled).insert(run);
+        self.cancel_signal.notify_waiters();
+    }
+
+    /// Plays the next scripted dump: each step's progress after its delay. A
+    /// cancel cuts the wait short; then `lag` more of the steps are sent at
+    /// once (dbx noticing late), then `Cancelled`, and it ends `Ok`.
+    async fn dump(&self, id: DumpId, request: DumpRequest, progress: DumpSink) -> Result<DumpEnd, CoreError> {
+        let path = request.path.clone();
+        self.record(Call::Dump(id, request));
+        let Some(script) = lock(&self.dumps).pop_front() else { return unscripted("dump") };
+        if let Some(bytes) = &script.writes {
+            let _ = std::fs::write(&path, bytes);
+        }
+        let is_cancelled = || lock(&self.dump_cancels).contains(&id);
+        let mut steps = script.steps.into_iter();
+        let mut last = DumpProgress::new(DumpStatus::Running);
+        let mut cancelled = is_cancelled();
+        while !cancelled {
+            let Some((delay, step)) = steps.next() else { break };
+            if delay.is_zero() {
+                last = step.clone();
+                progress(step);
+                cancelled = is_cancelled();
+                continue;
+            }
+            let wait = tokio::time::sleep(delay);
+            tokio::pin!(wait);
+            loop {
+                let signalled = self.cancel_signal.notified();
+                tokio::pin!(signalled);
+                signalled.as_mut().enable();
+                if is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut wait => break,
+                    _ = signalled => {}
+                }
+            }
+            if cancelled {
+                // The step dbx was in the middle of is still reported.
+                steps = std::iter::once((Duration::ZERO, step)).chain(steps).collect::<Vec<_>>().into_iter();
+                break;
+            }
+            last = step.clone();
+            progress(step);
+        }
+        if !cancelled {
+            return script.end;
+        }
+        for (_, step) in steps.take(script.lag) {
+            last = step.clone();
+            progress(step);
+        }
+        let end = DumpProgress { status: DumpStatus::Cancelled, ..last };
+        progress(end.clone());
+        Ok(DumpEnd { last: Some(end) })
+    }
+
+    fn cancel_dump(&self, id: DumpId) {
+        self.record(Call::CancelDump(id));
+        lock(&self.dump_cancels).insert(id);
         self.cancel_signal.notify_waiters();
     }
 

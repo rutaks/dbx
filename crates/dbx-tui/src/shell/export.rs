@@ -43,7 +43,7 @@ fn directory_of(path: &Path) -> &Path {
 
 /// What can be told before writing: no name, a directory that is not there, a
 /// target that is a directory, a file that must not be replaced.
-fn check_target(path: &Path, replace: bool) -> Result<(), ExportError> {
+pub(crate) fn check_target(path: &Path, replace: bool) -> Result<(), ExportError> {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         return Err(failed(path, "give a file name"));
     }
@@ -65,7 +65,7 @@ fn check_target(path: &Path, replace: bool) -> Result<(), ExportError> {
 
 /// The temporary file's path: hidden, beside the target, and its own for this
 /// export (process, a counter and the clock), so two exports never share one.
-fn temporary_beside(path: &Path) -> PathBuf {
+pub(crate) fn temporary_beside(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -75,7 +75,7 @@ fn temporary_beside(path: &Path) -> PathBuf {
 
 /// `~/...` as the user's home (`HOME`, as given); anything else as typed, and
 /// so is `~/...` when there is no home to put it in.
-fn expand_home(typed: &str, home: Option<&std::ffi::OsStr>) -> PathBuf {
+pub(crate) fn expand_home(typed: &str, home: Option<&std::ffi::OsStr>) -> PathBuf {
     match (typed.strip_prefix("~/"), home) {
         (Some(rest), Some(home)) if !home.is_empty() => Path::new(home).join(rest),
         _ => PathBuf::from(typed),
@@ -90,7 +90,7 @@ fn write(path: &Path, bytes: &[u8], replace: bool) -> Result<(), ExportError> {
 
 /// A file opened for writing that must not be there already: private to its
 /// owner on Unix.
-fn create_new(path: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn create_new(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

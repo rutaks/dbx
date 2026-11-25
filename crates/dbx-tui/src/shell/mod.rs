@@ -3,6 +3,7 @@
 //! `select!` over the terminal's events, the reply channel and the app's
 //! next deadline; it draws only when an update asks for a repaint.
 
+pub mod dump;
 pub mod export;
 pub mod kitty;
 pub mod prefs;
@@ -193,6 +194,7 @@ pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>) -> io::
     app.ui.export_env = crate::app::export::ExportEnv {
         dir: std::env::current_dir().unwrap_or_else(|_| ".".into()),
         stamp: Arc::new(|| chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()),
+        temp_dir: std::env::temp_dir(),
     };
     app.ui.theme = crate::app::theme::Palette::from_setting(std::env::var("DBX_TUI_THEME").ok().as_deref());
     if let Some(path) = &prefs {
@@ -278,6 +280,15 @@ pub(crate) fn execute(
                 closing.retain(|t| !t.is_finished());
                 closing.push(task);
             }
+            Command::Dump(id, dump, request) => {
+                // Waited for when quitting (bounded): the app has cancelled it
+                // by then, and dbx closes the dump's session as it ends.
+                let task = tokio::spawn(dump::run(core.clone(), id, dump, request, tx.clone()));
+                let mut closing = tasks.closing.lock().unwrap_or_else(|p| p.into_inner());
+                closing.retain(|t| !t.is_finished());
+                closing.push(task);
+            }
+            Command::CancelDump(dump) => core.cancel_dump(dump),
             Command::Cancel(run) => core.cancel(run),
             Command::Abandon(id) => tasks.abandon(id),
             Command::Release(at) => {
@@ -490,6 +501,127 @@ mod tests {
         assert!(finish_closing(&tasks, std::time::Duration::from_secs(5)).await);
         assert!(path.exists(), "the write was waited for");
         assert!(rx.try_recv().is_ok(), "and its reply was sent");
+    }
+
+    // ---- slice 20: dumps ----------------------------------------------------------
+
+    fn dump_request(path: &std::path::Path, prevent_overwrite: bool) -> crate::core::DumpRequest {
+        crate::core::DumpRequest {
+            at: edge(),
+            schema: String::new(),
+            content: crate::core::DumpContent::StructureAndData,
+            drop_tables: false,
+            path: path.to_string_lossy().into_owned(),
+            prevent_overwrite,
+        }
+    }
+
+    fn step(rows: u64) -> (std::time::Duration, crate::core::DumpProgress) {
+        let p = crate::core::DumpProgress { object: "film".into(), index: 1, total: 3, rows, ..crate::core::DumpProgress::new(crate::core::DumpStatus::Running) };
+        (std::time::Duration::ZERO, p)
+    }
+
+    /// Every reply that has come, in order.
+    async fn replies(rx: &mut mpsc::UnboundedReceiver<(RequestId, CoreReply)>, tasks: &Tasks) -> Vec<(RequestId, CoreReply)> {
+        assert!(finish_closing(tasks, std::time::Duration::from_secs(5)).await, "the dump ended");
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            out.push(r);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_dump_into_a_directory_that_is_not_there_is_refused_by_name_and_dbx_is_never_called() {
+        use crate::core::DumpId;
+        let fake = Arc::new(FakeCore::new());
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tasks = Tasks::default();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        execute(vec![Command::Dump(RequestId(3), DumpId(1), dump_request(&missing.join("p.sql"), true))], &core, &tx, &tasks);
+        let got = replies(&mut rx, &tasks).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (id, CoreReply::Dumped(Err(failure))) = &got[0] else { panic!("{got:?}") };
+        assert_eq!(*id, RequestId(3));
+        assert!(failure.refused && !failure.exists, "{failure:?}");
+        assert!(failure.message.contains(&*missing.to_string_lossy()) && failure.message.contains("does not exist"), "{}", failure.message);
+        assert!(fake.calls().is_empty(), "dbx was not called: {:?}", fake.calls());
+        assert!(!missing.exists(), "and nothing was made");
+    }
+
+    #[tokio::test]
+    async fn a_dump_onto_a_file_that_is_there_asks_unless_replacing_was_confirmed() {
+        use crate::core::{Call, DumpId, ScriptedDump};
+        let fake = Arc::new(FakeCore::new());
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tasks = Tasks::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sql");
+        std::fs::write(&path, "mine").unwrap();
+        execute(vec![Command::Dump(RequestId(1), DumpId(1), dump_request(&path, true))], &core, &tx, &tasks);
+        let got = replies(&mut rx, &tasks).await;
+        assert!(matches!(&got[..], [(_, CoreReply::Dumped(Err(f)))] if f.exists && f.message.contains("p.sql")), "{got:?}");
+        assert!(fake.calls().is_empty());
+        // Confirmed: dbx is called, with a temporary file beside the target
+        // (never the target itself), and the earlier file stays until done.
+        fake.script_dump(ScriptedDump::steps(vec![step(5)]));
+        execute(vec![Command::Dump(RequestId(2), DumpId(2), dump_request(&path, false))], &core, &tx, &tasks);
+        replies(&mut rx, &tasks).await;
+        let calls = fake.calls();
+        let [Call::Dump(DumpId(2), given)] = &calls[..] else { panic!("{calls:?}") };
+        assert_ne!(std::path::Path::new(&given.path), path, "dbx is not handed the target");
+        assert_eq!(std::path::Path::new(&given.path).parent(), path.parent(), "its file is beside the target");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine", "no done was reported: the earlier file stays");
+    }
+
+    #[tokio::test]
+    async fn a_dumps_progress_comes_back_for_its_request_and_then_its_end_with_what_is_at_the_path() {
+        use crate::core::{DumpId, DumpStatus, FileLeft, ScriptedDump};
+        let fake = Arc::new(FakeCore::new());
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tasks = Tasks::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sql");
+        let done = crate::core::DumpProgress { status: DumpStatus::Done, ..step(9).1 };
+        fake.script_dump(ScriptedDump::steps(vec![step(4), step(9), (std::time::Duration::ZERO, done.clone())]));
+        execute(vec![Command::Dump(RequestId(5), DumpId(1), dump_request(&path, true))], &core, &tx, &tasks);
+        let got = replies(&mut rx, &tasks).await;
+        assert!(got.iter().all(|(id, _)| *id == RequestId(5)));
+        let rows: Vec<u64> = got.iter().filter_map(|(_, r)| if let CoreReply::DumpProgress(p) = r { Some(p.rows) } else { None }).collect();
+        assert_eq!(rows, vec![4, 9, 9]);
+        let Some((_, CoreReply::Dumped(Ok(dumped)))) = got.last() else { panic!("{got:?}") };
+        assert_eq!(dumped.end.last.as_ref(), Some(&done));
+        // The fake writes nothing, so the file the shell made for dbx is
+        // empty; it was reported done, so it is the file.
+        assert_eq!(dumped.file, FileLeft::Written(0));
+        assert_eq!(dumped.path, path.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reaches_the_dump_and_quitting_waits_for_its_end() {
+        use crate::core::{Call, DumpId, DumpStatus, ScriptedDump};
+        let fake = Arc::new(FakeCore::new());
+        let core: Arc<dyn Core> = fake.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tasks = Tasks::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sql");
+        let slow = (std::time::Duration::from_secs(600), step(2).1);
+        fake.script_dump(ScriptedDump::steps(vec![step(1), slow]));
+        execute(vec![Command::Dump(RequestId(5), DumpId(7), dump_request(&path, true))], &core, &tx, &tasks);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let quit = execute(vec![Command::CancelDump(DumpId(7)), Command::Quit], &core, &tx, &tasks);
+        assert!(quit);
+        let got = replies(&mut rx, &tasks).await;
+        assert!(fake.calls().contains(&Call::CancelDump(DumpId(7))));
+        let Some((_, CoreReply::Dumped(Ok(dumped)))) = got.last() else { panic!("{got:?}") };
+        assert_eq!(dumped.end.last.as_ref().map(|p| p.status), Some(DumpStatus::Cancelled));
     }
 
     #[tokio::test]

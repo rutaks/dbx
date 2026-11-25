@@ -2051,3 +2051,418 @@ async fn markdown_read_back_differs_from_psql_only_by_the_listed_losses() {
     eprintln!("OBSERVED Markdown losses exercised: {lost:?}");
     assert!(lost.contains("NULL is the text NULL") && lost.contains("a line break becomes <br>") && lost.contains("trailing spaces are padding"));
 }
+
+// ---- slice 20: database dump -------------------------------------------------------
+//
+// Every dump runs on a scratch store (dbx records the destination directory in
+// the store it runs with) and writes under a temporary directory. The fixture
+// databases are only read; a restore goes into a scratch database created for
+// the test and dropped afterwards, a failed test included.
+
+use dbx_tui::core::{DumpContent, DumpEnd, DumpId, DumpProgress, DumpRequest, DumpStatus};
+
+const CONTAINER: &str = "dbxtui-fixtures-postgres-1";
+
+/// `psql` on database `db`: a script on stdin, stopping at the first error.
+/// Its output, rows on lines.
+fn psql_on(db: &str, script: &[u8]) -> Result<String, String> {
+    psql_with(db, script, true)
+}
+
+/// `psql_on`, going on past errors when `stop` is false: then `Ok` carries
+/// the errors psql printed, one per line, without their line numbers.
+fn psql_with(db: &str, script: &[u8], stop: bool) -> Result<String, String> {
+    use std::io::Write;
+    let on_error = if stop { "ON_ERROR_STOP=1" } else { "ON_ERROR_STOP=0" };
+    let mut child = std::process::Command::new("docker")
+        .args(["exec", "-i", CONTAINER, "env", "PGCLIENTENCODING=UTF8", "psql", "-U", "postgres", "-d", db, "--no-psqlrc", "-q", "-tA", "-v", on_error, "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("docker exec psql");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let script = script.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&script));
+    let out = child.wait_with_output().expect("psql output");
+    let _ = writer.join();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        return Err(stderr);
+    }
+    if stop {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    // `psql:<stdin>:123: ERROR:  ...` -> `ERROR:  ...`
+    let errors: Vec<String> = stderr
+        .lines()
+        .filter_map(|l| l.find("ERROR:").map(|at| l[at..].to_string()))
+        .collect();
+    Ok(errors.join("\n"))
+}
+
+/// The scratch database a dump is restored into: `dbxtui_restore_<pid>_<n>`
+/// (a counter, so tests running side by side never drop each other's), made
+/// empty for the test and dropped when it goes.
+struct RestoreDb(String);
+
+impl RestoreDb {
+    fn new() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!("dbxtui_restore_{}_{}", std::process::id(), COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        assert!(name.starts_with("dbxtui_restore_"), "never a fixture database");
+        psql_on("postgres", format!("drop database if exists {name} with (force);\ncreate database {name};\n").as_bytes()).expect("create the scratch database");
+        RestoreDb(name)
+    }
+
+    /// Loads a dump file with `ON_ERROR_STOP`.
+    fn load(&self, file: &std::path::Path) -> Result<String, String> {
+        psql_on(&self.0, &std::fs::read(file).expect("the dump file"))
+    }
+
+    /// Loads a dump file going on past errors; returns the distinct errors.
+    fn load_past_errors(&self, file: &std::path::Path) -> std::collections::BTreeSet<String> {
+        let errors = psql_with(&self.0, &std::fs::read(file).expect("the dump file"), false).expect("psql ran");
+        errors.lines().map(str::to_string).collect()
+    }
+
+    /// Starts again from an empty database.
+    fn recreate(&self) {
+        psql_on("postgres", format!("drop database if exists {0} with (force);\ncreate database {0};\n", self.0).as_bytes()).expect("recreate the scratch database");
+    }
+}
+
+impl Drop for RestoreDb {
+    fn drop(&mut self) {
+        let _ = psql_on("postgres", format!("drop database if exists {} with (force);\n", self.0).as_bytes());
+    }
+}
+
+#[test]
+fn two_restore_databases_alive_together_do_not_drop_each_other() {
+    let a = RestoreDb::new();
+    let b = RestoreDb::new();
+    assert_ne!(a.0, b.0, "each has its own name");
+    psql_on(&a.0, b"create table keep (x integer); insert into keep values (1);").expect("a is usable");
+    drop(b);
+    assert_eq!(psql_on(&a.0, b"select count(*) from keep;").expect("a is still there").trim(), "1");
+}
+
+/// `schema.table|rows|md5 of the rows in order` for every table of `db`
+/// outside the system schemas, `only` (when given) limiting it to those.
+fn fingerprint(db: &str, only: Option<&[&str]>) -> Vec<String> {
+    let filter = match only {
+        Some(names) => format!(" and n.nspname || '.' || c.relname in ({})", names.iter().map(|n| format!("'{}'", n.replace('\'', "''"))).collect::<Vec<_>>().join(", ")),
+        None => String::new(),
+    };
+    let script = format!(
+        "select format('select %L || ''|'' || count(*) || ''|'' || coalesce(md5(string_agg(t::text, E''\\n'' order by t::text)), '''') from %I.%I t', \
+         n.nspname || '.' || c.relname, n.nspname, c.relname) \
+         from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+         where c.relkind in ('r', 'p') and n.nspname not in ('pg_catalog', 'information_schema') and left(n.nspname, 3) <> 'pg_'{filter} \
+         order by 1 \\gexec\n"
+    );
+    let mut lines: Vec<String> = psql_on(db, script.as_bytes()).expect("fingerprint").lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    lines.sort();
+    lines
+}
+
+/// Runs a dump to the end, collecting its progress.
+async fn dump_to(core: &DbxCore, id: &ConnectionId, db: &str, schema: &str, content: DumpContent, path: &std::path::Path, prevent_overwrite: bool) -> (Vec<DumpProgress>, Result<DumpEnd, dbx_tui::core::CoreError>) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let request = DumpRequest {
+        at: database(id, db),
+        schema: schema.into(),
+        content,
+        drop_tables: false,
+        path: path.to_string_lossy().into_owned(),
+        prevent_overwrite,
+    };
+    let end = core.dump(DumpId(rand_id()), request, std::sync::Arc::new(move |p| sink.lock().unwrap().push(p))).await;
+    let seen = seen.lock().unwrap().clone();
+    (seen, end)
+}
+
+#[tokio::test]
+async fn a_whole_pagila_dump_restores_into_an_empty_database_with_every_tables_rows() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pagila.sql");
+    let started = std::time::Instant::now();
+    let (seen, end) = dump_to(&core, &id, "pagila", "", DumpContent::StructureAndData, &path, true).await;
+    let end = end.expect("the dump ends");
+    eprintln!("OBSERVED pagila dump: {:?}, {} progress reports, {} bytes, last {:?}", started.elapsed(), seen.len(), std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), end.last);
+    assert_eq!(end.last.as_ref().map(|p| p.status), Some(DumpStatus::Done), "{end:?}");
+    assert_eq!(end.last.as_ref().map(|p| p.errors), Some(0), "{end:?}");
+    assert!(seen.iter().any(|p| p.status == DumpStatus::Running && p.rows > 0), "progress came while it ran");
+    // dbx reports success, but the file does not load whole (README "Dump",
+    // what dbx's dump loses): the first failure is the partitioned table.
+    let restore = RestoreDb::new();
+    let stopped = restore.load(&path).expect_err("KNOWN (dbx): pagila's dump does not load with ON_ERROR_STOP");
+    assert!(stopped.contains("no partition of relation \"payment\" found for row"), "the first failure: {stopped}");
+    // Loaded past its errors, every table but `film` and the payment
+    // partitions comes back with the same rows.
+    restore.recreate();
+    let errors = restore.load_past_errors(&path);
+    eprintln!("OBSERVED errors loading pagila's dump: {errors:#?}");
+    let known = [
+        "type \"year\" does not exist",
+        "syntax error at or near \")\"",
+        "no partition of relation \"payment\" found for row",
+        "relation \"public.film\" does not exist",
+    ];
+    for k in known {
+        assert!(errors.iter().any(|e| e.contains(k)), "KNOWN (dbx) error {k:?} not seen: {errors:#?}");
+    }
+    let lost = |line: &String| dbx_cannot_restore(line.split('|').next().unwrap_or(""));
+    let want = fingerprint("pagila", None);
+    assert!(want.len() >= 22, "{want:?}");
+    let got = fingerprint(&restore.0, None);
+    let (want_kept, want_lost): (Vec<_>, Vec<_>) = want.iter().cloned().partition(|l| !lost(l));
+    assert_eq!(got.iter().filter(|l| !lost(l)).cloned().collect::<Vec<_>>(), want_kept, "every other table's rows, counted and hashed in order");
+    for line in &want_lost {
+        assert!(!got.contains(line), "KNOWN (dbx) loss now restores: {line} (update the README and this test)");
+    }
+    // Only read: the fixtures are as they were.
+    check_fixtures();
+}
+
+/// The pagila tables dbx's dump does not give back (KNOWN, dbx): `film` (its
+/// domain `year` is not written), six of the seven payment partitions (their
+/// DDL is `PARTITION OF "public"."payment" (\n) FOR VALUES ...`, which does
+/// not parse) and so the partitioned `payment` itself, whose rows dbx also
+/// writes through the parent before any partition exists.
+fn dbx_cannot_restore(table: &str) -> bool {
+    table == "public.film" || table == "public.payment" || (table.starts_with("public.payment_p2022_0") && table != "public.payment_p2022_07")
+}
+
+/// `tests/fixtures/check.sh`: the fixture databases hold exactly what they
+/// should, so a dump wrote nothing to them.
+fn check_fixtures() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/check.sh");
+    let out = std::process::Command::new("bash").arg(&script).stdin(std::process::Stdio::null()).output().expect("check.sh");
+    assert!(out.status.success(), "check.sh: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}
+
+#[tokio::test]
+async fn edges_exact_values_and_quoted_names_survive_a_dump_and_restore_but_nan_and_infinity_become_null() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edge.sql");
+    let started = std::time::Instant::now();
+    let (_, end) = dump_to(&core, &id, "edge", "", DumpContent::StructureAndData, &path, true).await;
+    let end = end.expect("the dump ends");
+    eprintln!("OBSERVED edge dump: {:?}, {} bytes, last {:?}", started.elapsed(), std::fs::metadata(&path).unwrap().len(), end.last);
+    assert_eq!(end.last.as_ref().map(|p| (p.status, p.errors)), Some((DumpStatus::Done, 0)), "{end:?}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(r#"CREATE TABLE "public"."Mixed Case""#), "the quoted name is written quoted");
+    let restore = RestoreDb::new();
+    let errors = restore.load_past_errors(&path);
+    eprintln!("OBSERVED errors loading edge's dump: {errors:#?}");
+    let exact = ["public.text_values", "public.gt_text", "public.gt_json", "public.Mixed Case", "other.things"];
+    assert_eq!(fingerprint(&restore.0, Some(&exact)), fingerprint("edge", Some(&exact)), "exact values and quoted names");
+    assert_eq!(fingerprint(&restore.0, Some(&exact)).len(), exact.len());
+    // KNOWN (dbx): its dump writes NaN and the infinities of a float column as
+    // NULL (`numbers.approx`, ids 3 and 4); everything else in the table is exact.
+    let approx = |db: &str| psql_on(db, b"select id || '|' || coalesce(approx::text, 'NULL') from numbers order by id;").unwrap();
+    assert_eq!(approx("edge").lines().collect::<Vec<_>>(), ["1|0.1", "2|0.30000000000000004", "3|NaN", "4|Infinity", "5|NULL"]);
+    assert_eq!(approx(&restore.0).lines().collect::<Vec<_>>(), ["1|0.1", "2|0.30000000000000004", "3|NULL", "4|NULL", "5|NULL"]);
+    let rest = |db: &str| psql_on(db, b"select string_agg(id || '|' || label || '|' || coalesce(big::text, 'NULL') || '|' || coalesce(exact::text, 'NULL'), ',' order by id) from numbers;").unwrap();
+    assert_eq!(rest(&restore.0), rest("edge"));
+    check_fixtures();
+}
+
+#[tokio::test]
+async fn a_structure_only_dump_restores_the_tables_with_no_rows() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pagila-structure.sql");
+    let (_, end) = dump_to(&core, &id, "pagila", "", DumpContent::StructureOnly, &path, true).await;
+    assert_eq!(end.expect("ends").last.map(|p| p.status), Some(DumpStatus::Done));
+    assert!(!std::fs::read_to_string(&path).unwrap().lines().any(|l| l.starts_with("INSERT INTO")), "no rows in the file");
+    let restore = RestoreDb::new();
+    restore.load_past_errors(&path);
+    let got = fingerprint(&restore.0, None);
+    let tables = |lines: &[String]| lines.iter().map(|l| l.split('|').next().unwrap().to_string()).collect::<Vec<_>>();
+    // The same tables, but for those dbx's DDL cannot make (KNOWN: `film`'s
+    // domain is not written; the partitions' DDL does not parse).
+    // (`payment` itself is made; only its rows were lost above.)
+    let want: Vec<String> = tables(&fingerprint("pagila", None)).into_iter().filter(|t| t == "public.payment" || !dbx_cannot_restore(t)).collect();
+    assert_eq!(tables(&got), want);
+    assert!(got.iter().all(|l| l.ends_with("|0|")), "every table is empty: {got:?}");
+    check_fixtures();
+}
+
+#[tokio::test]
+async fn a_file_that_is_there_is_refused_with_prevent_overwrite_and_left_byte_for_byte() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let dir = tempfile::tempdir().unwrap();
+    for (db, schema) in [("edge", "other"), ("pagila", "")] {
+        let path = dir.path().join(format!("{db}-taken.sql"));
+        let mine: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        std::fs::write(&path, &mine).unwrap();
+        let (_, end) = dump_to(&core, &id, db, schema, DumpContent::StructureAndData, &path, true).await;
+        let err = end.expect_err("refused");
+        assert!(err.message.contains("already exists") && err.message.contains(&*path.to_string_lossy()), "{err:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), mine, "{db}: the file is unchanged byte for byte");
+    }
+}
+
+/// A scratch schema in `edge` with one table whose columns are named like
+/// dbx's pass-through check (`"a"`, `` `b` ``, `[c]`), dropped when it goes.
+struct QuotedColumns(String);
+
+impl QuotedColumns {
+    fn new() -> Self {
+        let name = format!("dbxtui_quotecols_{}", std::process::id());
+        let sql = format!(
+            "drop schema if exists {name} cascade;\ncreate schema {name};\ncreate table {name}.t (id integer, \"\"\"a\"\"\" integer, \"`b`\" integer, \"[c]\" integer, \"say \"\"hi\"\"\" integer);\n"
+        );
+        psql_on("edge", sql.as_bytes()).expect("create the scratch schema");
+        QuotedColumns(name)
+    }
+}
+
+impl Drop for QuotedColumns {
+    fn drop(&mut self) {
+        let _ = psql_on("edge", format!("drop schema if exists {} cascade;\n", self.0).as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn a_dump_is_refused_naming_the_columns_whose_names_dbx_would_not_quote() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let scratch = QuotedColumns::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quoted.sql");
+    // One schema, and the whole database it is in: both refused, before dbx
+    // is called, so nothing is written.
+    for schema in [scratch.0.as_str(), ""] {
+        let (seen, end) = dump_to(&core, &id, "edge", schema, DumpContent::StructureAndData, &path, true).await;
+        let err = end.expect_err("refused");
+        assert_eq!(err.kind, CoreErrorKind::Refused, "{err:?}");
+        for want in [r#"t."a""#, "t.`b`", "t.[c]"] {
+            assert!(err.message.contains(want), "{want} in {}", err.message);
+        }
+        assert!(err.message.contains(&scratch.0), "the schema is named: {}", err.message);
+        assert!(!err.message.contains("say"), "a name that only has quotes inside is fine: {}", err.message);
+        assert!(seen.is_empty(), "dbx was not called: {seen:?}");
+        assert!(!path.exists(), "nothing was written");
+    }
+    // Another schema of the same database is not refused (the scan is for
+    // the scope, not the whole database).
+    let (_, end) = dump_to(&core, &id, "edge", "other", DumpContent::StructureOnly, &path, true).await;
+    assert_eq!(end.expect("the other schema dumps").last.map(|p| p.status), Some(DumpStatus::Done));
+    drop(scratch);
+    check_fixtures();
+}
+
+/// The server sessions on `edge` running a statement on `million_rows`.
+fn million_rows_readers() -> Vec<String> {
+    psql_on("postgres", b"select pid from pg_stat_activity where datname = 'edge' and query ilike '%million_rows%' and pid <> pg_backend_pid();")
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether any of `pids` is still a session on the server.
+fn still_there(pids: &[String]) -> Vec<String> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let sql = format!("select pid from pg_stat_activity where pid in ({});", pids.join(", "));
+    psql_on("postgres", sql.as_bytes()).unwrap().lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+}
+
+/// Dumps `edge` (`schema`, empty for all), cancels once `million_rows` is half
+/// way, and returns the progress, the end and the export's server sessions.
+async fn cancel_million_rows(core: &DbxCore, id: &ConnectionId, schema: &str, path: &std::path::Path) -> (Vec<DumpProgress>, DumpEnd, Vec<String>) {
+    use std::sync::{Arc, Mutex};
+    let seen = Arc::new(Mutex::new(Vec::<DumpProgress>::new()));
+    let sink = seen.clone();
+    let dump = DumpId(rand_id());
+    let request = DumpRequest { at: database(id, "edge"), schema: schema.into(), content: DumpContent::StructureAndData, drop_tables: false, path: path.to_string_lossy().into_owned(), prevent_overwrite: true };
+    let run = core.dump(dump, request, Arc::new(move |p| sink.lock().unwrap().push(p)));
+    tokio::pin!(run);
+    let (mut readers, mut asked, mut looks) = (Vec::new(), false, 0);
+    let end = loop {
+        tokio::select! {
+            end = &mut run => break end,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                let midway = seen.lock().unwrap().iter().any(|p| p.object.contains("million_rows") && p.rows > 0);
+                if midway && !asked {
+                    // The export's session, seen reading the table (a few
+                    // looks: between two pages it may be idle for a moment).
+                    readers = million_rows_readers();
+                    looks += 1;
+                    if !readers.is_empty() || looks > 20 {
+                        core.cancel_dump(dump);
+                        asked = true;
+                    }
+                }
+            }
+        }
+    };
+    let seen = seen.lock().unwrap().clone();
+    (seen, end.expect("a cancelled dump ends Ok"), readers)
+}
+
+#[tokio::test]
+async fn a_dump_cancelled_midway_through_million_rows_ends_cancelled_and_leaves_no_session_of_its_own() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let dir = tempfile::tempdir().unwrap();
+    for schema in ["", "public"] {
+        let path = dir.path().join(format!("edge-{}.sql", if schema.is_empty() { "all" } else { schema }));
+        let started = std::time::Instant::now();
+        let (seen, end, readers) = cancel_million_rows(&core, &id, schema, &path).await;
+        assert!(end.cancelled(), "{end:?}");
+        assert_eq!(seen.last().map(|p| p.status), Some(DumpStatus::Cancelled), "the last progress is Cancelled");
+        assert!(!seen.iter().any(|p| p.status == DumpStatus::Done), "never Done");
+        assert!(!readers.is_empty(), "the export was seen reading million_rows");
+        // The export's session is closed before `dump` returns.
+        let mut left = still_there(&readers);
+        for _ in 0..20 {
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            left = still_there(&readers);
+        }
+        assert!(left.is_empty(), "the export's sessions are gone: {left:?}");
+        let at_path = std::fs::metadata(&path).map(|m| m.len()).ok();
+        let others: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        eprintln!("OBSERVED cancel of edge schema {schema:?} after {:?}: at the path {at_path:?}, in the directory {others:?}", started.elapsed());
+        if schema.is_empty() {
+            // The whole database goes schema by schema to temporary files,
+            // and the file is opened only after the last: nothing is there.
+            assert_eq!(at_path, None, "nothing at the path after a cancel of the whole database");
+        } else {
+            // One schema is written straight to the file: a partial file stays.
+            let len = at_path.expect("a partial file");
+            assert!(len > 0 && std::fs::read_to_string(&path).unwrap().contains("million_rows"), "{len}");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    check_fixtures();
+}

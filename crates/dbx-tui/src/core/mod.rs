@@ -4,6 +4,7 @@
 //! speaks the types defined here. `FakeCore` is the test double.
 
 mod dbx;
+mod dump;
 mod export;
 mod fake;
 
@@ -15,8 +16,9 @@ use async_trait::async_trait;
 pub use dbx::{DbxCore, KeySource, StoreOptions};
 #[cfg(feature = "test-support")]
 pub use dbx::check_seed_dir;
+pub use dump::{DumpContent, DumpEnd, DumpFailure, DumpId, DumpProgress, DumpRequest, DumpSink, DumpStatus, Dumped, FileLeft};
 pub use export::{ExportError, ExportFormat, ExportJob, ExportRequest, Exported};
-pub use fake::{Call, Catalogue, FakeCore, Scripted, SyntaxCalls};
+pub use fake::{Call, Catalogue, FakeCore, Scripted, ScriptedDump, SyntaxCalls};
 
 // ---- identifiers -----------------------------------------------------------
 
@@ -134,6 +136,10 @@ pub struct Capabilities {
     /// dbx keeps one server connection for it (a file database), so nothing
     /// is opened per database.
     pub single_connection: bool,
+    /// dbx's dump of this kind is known not to restore whole (checked on
+    /// Postgres; GaussDB and openGauss share its dump code). The dump screen
+    /// and its end say so (README "Dump").
+    pub dump_loses: bool,
 }
 
 /// A saved, named way to reach one database server.
@@ -752,6 +758,9 @@ pub enum CoreErrorKind {
     /// Nothing ran: the statement waits for the user's yes
     /// (`CoreError::assessment` says why).
     NeedsConfirmation,
+    /// Nothing ran: the request was refused, and the message says why and
+    /// what to change.
+    Refused,
     Other,
 }
 
@@ -896,6 +905,15 @@ pub trait Core: Syntax {
     async fn save_history(&self, entry: &NewHistoryEntry) -> Result<(), CoreError>;
     /// Searches the history (source `sql` only), newest first.
     async fn history(&self, query: &HistoryQuery) -> Result<HistoryPage, CoreError>;
+
+    /// Dumps a database, or one schema, to `request.path` through dbx's
+    /// database export, sending its progress to `progress` as it comes. Ends
+    /// when dbx has ended and the dump's own server session is closed. A
+    /// cancelled dump ends with `Ok`, its last progress `Cancelled`.
+    async fn dump(&self, id: DumpId, request: DumpRequest, progress: DumpSink) -> Result<DumpEnd, CoreError>;
+    /// Asks dump `id` to stop. dbx notices at its next check and sends a
+    /// final `Cancelled` progress.
+    fn cancel_dump(&self, id: DumpId);
 }
 
 #[cfg(test)]

@@ -448,22 +448,33 @@ async fn a_search_that_fails_says_why_and_what_to_do_and_typing_goes_on() {
 async fn typing_film_sends_one_search_with_that_text_after_the_pause_and_not_before() {
     let mut h = history_open(vec![here("select 1", "2026-11-25 14:03")]).await;
     h.fake.script_history(Scripted::ok(page_of(vec![here("select * from film", "2026-11-25 14:00")])));
-    h.type_text("film");
+    // Every time the app sees is given here (`update(event, now)`), never read
+    // from the clock: the keys all arrive at `t0`, and the pause is measured
+    // from it, so no real delay can move a deadline.
+    let t0 = h.now();
+    for c in "film".chars() {
+        let fx = h.app.update(Event::Key(KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::NONE)), t0);
+        h.run(fx);
+    }
     h.settle().await;
     assert_eq!(h.fake.history_queries().len(), 1, "nothing sent while typing");
     let due = h.app.next_deadline().expect("the search is due");
-    assert!(due <= h.now() + PAUSE, "within the pause");
-    h.advance(PAUSE - Duration::from_millis(1));
+    assert_eq!(due, t0 + PAUSE, "exactly one pause after the last key");
+    let timer = |h: &mut Harness, at: std::time::Instant| {
+        let fx = h.app.update(Event::Timer, at);
+        h.run(fx);
+    };
+    timer(&mut h, t0 + PAUSE - Duration::from_millis(1));
     h.settle().await;
     assert_eq!(h.fake.history_queries().len(), 1, "not a moment early");
-    h.advance(Duration::from_millis(1));
+    timer(&mut h, t0 + PAUSE);
     h.settle().await;
     let queries = h.fake.history_queries();
     assert_eq!(queries.len(), 2, "{queries:?}");
     assert_eq!(queries[1].search_text, "film");
     assert_eq!(queries[1].connection, Some(cid("local pg")));
     assert!(screen_text(&mut h).contains("select * from film"));
-    assert!(h.app.next_deadline().is_none_or(|d| d > h.now() + Duration::from_secs(1)), "nothing left due");
+    assert!(h.app.next_deadline().is_none_or(|d| d > t0 + PAUSE + Duration::from_secs(1)), "nothing left due");
 }
 
 #[tokio::test]

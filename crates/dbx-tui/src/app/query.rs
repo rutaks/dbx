@@ -411,6 +411,7 @@ impl App {
 
     /// Quit: end every tab's session first.
     pub(super) fn quit(&mut self, fx: &mut Effects) {
+        self.cancel_dump_for_quit(fx);
         let ids: Vec<TabId> = self.model.tabs.iter().map(|t| t.id).collect();
         for id in ids {
             self.end_session_of(id, fx);

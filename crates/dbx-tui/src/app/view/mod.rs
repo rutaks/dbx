@@ -1,6 +1,7 @@
 //! Drawing. Every colour is a palette role; every width counts one column per
 //! character, which holds for everything drawn so far (ASCII and box glyphs).
 
+mod dump;
 mod editor;
 mod export;
 mod form;
@@ -71,7 +72,18 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
         }
         _ => None,
     };
+    // The dump's overlays say what the model holds.
+    let dump_view = match &app.ui.overlay {
+        Some(Overlay::DumpProgress(_)) => Some(app.dump_progress_lines()),
+        Some(Overlay::ConfirmQuitDump) => Some(("Quit while dumping?".to_string(), vec![app.quit_dump_message()], true)),
+        _ => None,
+    };
     let drawn = match &mut app.ui.overlay {
+        Some(overlay @ (Overlay::DumpProgress(_) | Overlay::ConfirmQuitDump)) => {
+            panel::dim(buf, buf.area);
+            let (title, lines, red) = dump_view.unwrap_or_default();
+            dump::draw_progress(&title, &lines, red, matches!(overlay, Overlay::ConfirmQuitDump), overlay.buttons(), &p, buf)
+        }
         Some(overlay) => {
             panel::dim(buf, buf.area);
             // The close-tab question says what is true now, not when it opened.
@@ -166,6 +178,9 @@ fn draw_overlay(
         Overlay::History(h) => history::draw(h, keys, here, p, buf),
         Overlay::Export(o) => export::draw(o, buttons, keys.key_for(Action::LoadMore).as_deref(), p, buf),
         Overlay::CopyAs(c) => export::draw_copy_as(c, buttons, p, buf),
+        Overlay::Dump(o) => dump::draw(o, buttons, p, buf),
+        // Drawn by `draw`, which has the model.
+        Overlay::DumpProgress(_) | Overlay::ConfirmQuitDump => Drawn::default(),
     }
 }
 
@@ -660,6 +675,9 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     if app.cursor_can_be_used() {
         hints.extend(one(Action::UseTarget, "use"));
     }
+    if app.cursor_can_dump() {
+        hints.extend(one(Action::Dump, "dump"));
+    }
     if app.cursor_on_editable() {
         hints.extend(one(Action::EditConnection, "edit"));
     }
@@ -790,6 +808,14 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
         right_edge = at.saturating_sub(1);
     }
     let mut hit_rects = Vec::new();
+    // A dump's status, in every pane, left of the run state: a click shows
+    // its progress (and the key that cancels it).
+    if let Some((text, working)) = app.dump_status() {
+        let at = right_edge.saturating_sub(width_of(&text) + 1).max(x);
+        let end = p.put(buf, at, r.y, &text, p.fg(if working { Role::Teal } else { Role::Yellow }));
+        hit_rects.push(HintHit { rect: Rect::new(at, r.y, end.saturating_sub(at), 1).intersection(r), action: Action::Dump });
+        right_edge = at.saturating_sub(1);
+    }
     for hint in hints {
         let start = x + 2;
         // A hint that does not fit whole is left out, not cut in half.
