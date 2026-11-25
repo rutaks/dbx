@@ -1025,6 +1025,7 @@ Run every command from the dbx workspace root.
 | What | Command | Needs |
 |---|---|---|
 | Fast: app, view, keys, FakeCore (layer 2) | `cargo test -p dbx-tui --lib --test no_colour_literals` | nothing |
+| Docs are true (slice 24b): every key in `docs/README.md` and `docs/getting-started.md` is bound in the pane its table names | `cargo test -p dbx-tui --test docs_keys` | nothing; also checks the staged `.dbpane-repo` copies match (`scripts/stage-docs.sh` copies them) |
 | Store: `DbxCore` on scratch stores (layer 1) | `cargo test -p dbx-tui --test store -- --test-threads=1` | nothing external; temp dirs, key files, a local TCP port |
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |

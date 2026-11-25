@@ -111,3 +111,6 @@ dbx-devtest-connections.json
 # Real database integration credentials (see docs/TEST_ENVIRONMENTS.md)
 /docs/TEST_ENVIRONMENTS.md
 .wrangler/
+
+# dbpane release repo, staged for rutaks/dbpane (slice 24b); has its own git history
+/.dbpane-repo/
