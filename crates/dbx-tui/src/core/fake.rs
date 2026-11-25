@@ -325,6 +325,26 @@ impl Syntax for FakeCore {
             start = end + 1;
         }
     }
+
+    /// `select * from schema.table order by a, b limit n offset m`, in the
+    /// fake's own plain spelling (what the real adapter builds is tested in
+    /// `dbx.rs`).
+    fn table_page_sql(&self, _kind: &DbKind, table: &TablePath, order_by: &[String], limit: usize, offset: usize) -> String {
+        let order = if order_by.is_empty() { String::new() } else { format!(" order by {}", order_by.join(", ")) };
+        format!("select * from {}{order} limit {limit} offset {offset}", fake_table_name(table))
+    }
+
+    fn table_count_sql(&self, _kind: &DbKind, table: &TablePath) -> String {
+        format!("select count(*) from {}", fake_table_name(table))
+    }
+}
+
+fn fake_table_name(table: &TablePath) -> String {
+    if table.schema.schema.is_empty() {
+        table.table.clone()
+    } else {
+        format!("{}.{}", table.schema.schema, table.table)
+    }
 }
 
 #[async_trait]

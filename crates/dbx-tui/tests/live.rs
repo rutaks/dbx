@@ -1239,3 +1239,172 @@ async fn an_empty_database_name_is_the_connections_own_database() {
     assert!(core.schemas(&database(&id, "")).await.expect("schemas").contains(&"public".to_string()));
     assert_eq!(core.current_schema(&database(&id, "")).await.expect("current"), Some("public".into()));
 }
+
+// ---- slice 16: browsing a table ----------------------------------------------
+
+#[allow(dead_code)]
+#[path = "ground_truth/psql.rs"]
+mod psql;
+
+/// The columns of `path` that are its primary key, as the tree reads them.
+async fn key_of(core: &DbxCore, path: &TablePath) -> Vec<String> {
+    core.columns(path).await.expect("columns").into_iter().filter(|c| c.primary_key).map(|c| c.name).collect()
+}
+
+/// The page of `path` the client asks for (`offset` rows in, `limit` rows long)
+/// and what it returns, run as a browse tab runs it: the whole generated text
+/// as the selection, the row cap the page size.
+async fn page_of(core: &DbxCore, id: &ConnectionId, path: &TablePath, limit: usize, offset: usize) -> (String, dbx_tui::core::ResultSet) {
+    let key = key_of(core, path).await;
+    let sql = core.table_page_sql(&dbx_tui::core::DbKind::Postgres, path, &key, limit, offset);
+    let lines: Vec<&str> = sql.split('\n').collect();
+    let end = Cursor { row: lines.len() - 1, col: lines.last().unwrap().chars().count() };
+    let request = RunRequest {
+        selection: Some((Cursor { row: 0, col: 0 }, end)),
+        row_cap: limit,
+        ..run_request(id, &path.schema.database.database, 1, &sql)
+    };
+    let set = core.run(RunId(rand_id()), request).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    (sql, set)
+}
+
+/// What `psql` says `sql` returns on `edge`, every value in row order.
+fn psql_values(sql: &str) -> Vec<Option<String>> {
+    let sql = sql.trim_end().trim_end_matches(';').to_string();
+    psql::query_all(&[("page".to_string(), sql)]).remove("page").expect("answered")
+}
+
+fn flat(rows: &[Vec<Cell>]) -> Vec<Option<String>> {
+    rows.iter()
+        .flat_map(|r| r.iter().map(|c| match c { Cell::Null => None, Cell::Value(v) => Some(v.clone()) }))
+        .collect()
+}
+
+#[tokio::test]
+async fn million_rows_pages_one_two_and_the_one_holding_999999_match_psql_cell_for_cell() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let path = table(&id, "edge", "public", "million_rows");
+    assert_eq!(key_of(&core, &path).await, vec!["id".to_string()]);
+    let mut seen_999_999 = false;
+    for offset in [0, 1000, 999_000] {
+        let (sql, set) = page_of(&core, &id, &path, 1000, offset).await;
+        assert_eq!(set.rows.len(), 1000, "{sql}");
+        assert!(sql.contains(r#"ORDER BY "id""#), "the page is in the key's order: {sql}");
+        assert!(!set.truncated, "a page of exactly the row cap is not cut: {sql}");
+        let ours = flat(&set.rows);
+        let theirs = psql_values(&sql);
+        assert_eq!(ours.len(), 3000);
+        assert_eq!(ours, theirs, "offset {offset}: {sql}");
+        let first: Vec<_> = set.rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(first[0], Cell::Value((offset + 1).to_string()), "stable order: pages run on from one another");
+        seen_999_999 |= first.contains(&Cell::Value("999999".into()));
+    }
+    assert!(seen_999_999, "the page at 999,000 holds id 999,999");
+    // The last page is the end of the table, and there is nothing after it.
+    let (_, last) = page_of(&core, &id, &path, 1000, 999_000).await;
+    assert_eq!(last.rows.last().map(|r| r[0].clone()), Some(Cell::Value("1000000".into())));
+    let (_, past) = page_of(&core, &id, &path, 1000, 1_000_000).await;
+    assert!(past.rows.is_empty(), "past the end is empty, not an error");
+}
+
+#[tokio::test]
+async fn the_count_statement_gives_the_number_of_rows() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let path = table(&id, "edge", "public", "million_rows");
+    let sql = core.table_count_sql(&dbx_tui::core::DbKind::Postgres, &path);
+    let request = RunRequest { row_cap: 1, ..run_request(&id, "edge", 1, &sql) };
+    let set = core.run(RunId(rand_id()), request).await.expect("count");
+    assert_eq!(set.rows, vec![vec![Cell::Value("1000000".into())]], "{sql}");
+}
+
+#[tokio::test]
+async fn a_hundred_kilobyte_value_arrives_whole_and_null_empty_and_the_text_null_stay_distinct() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let gt = table(&id, "edge", "public", "gt_text");
+    let (sql, set) = page_of(&core, &id, &gt, 1000, 0).await;
+    let t = set.columns.iter().position(|c| c.name == "t").expect("column t");
+    let big = set.rows.iter().find(|r| r[0] == Cell::Value("21".into())).expect("row 21");
+    let Cell::Value(text) = &big[t] else { panic!("NULL: {sql}") };
+    assert_eq!(text.len(), 102_400, "nothing is cut for preview: {sql}");
+    assert_eq!(text, &"0123456789abcdef".repeat(6400));
+
+    let tv = table(&id, "edge", "public", "text_values");
+    let (_, set) = page_of(&core, &id, &tv, 1000, 0).await;
+    let v = set.columns.iter().position(|c| c.name == "v").unwrap();
+    let cell = |id: &str| set.rows.iter().find(|r| r[0] == Cell::Value(id.into())).map(|r| r[v].clone()).expect("row");
+    assert_eq!(cell("1"), Cell::Null);
+    assert_eq!(cell("2"), Cell::Value(String::new()));
+    assert_eq!(cell("3"), Cell::Value("NULL".into()));
+}
+
+#[tokio::test]
+async fn a_table_without_a_key_mixed_case_names_and_a_second_schema_open_and_page() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+
+    let no_pk = table(&id, "edge", "public", "no_pk");
+    assert!(key_of(&core, &no_pk).await.is_empty());
+    let (sql, set) = page_of(&core, &id, &no_pk, 1000, 0).await;
+    assert!(!sql.to_lowercase().contains("order by"), "nothing to order by: {sql}");
+    assert_eq!(set.rows.len(), 3, "{sql}");
+
+    let mixed = table(&id, "edge", "public", "Mixed Case");
+    assert_eq!(key_of(&core, &mixed).await, vec!["Id".to_string()]);
+    let (sql, set) = page_of(&core, &id, &mixed, 1000, 0).await;
+    assert_eq!(flat(&set.rows), vec![Some("1".into()), Some("reserved".into()), Some("spaced".into())], "{sql}");
+    assert_eq!(flat(&set.rows), psql_values(&sql));
+
+    let things = table(&id, "edge", "other", "things");
+    let (sql, set) = page_of(&core, &id, &things, 1000, 0).await;
+    assert_eq!(flat(&set.rows), vec![Some("1".into()), Some("in the second schema".into())], "{sql}");
+    assert_eq!(flat(&set.rows), psql_values(&sql));
+
+    // A composite key orders by both columns.
+    let composite = table(&id, "edge", "public", "composite_key");
+    let (sql, set) = page_of(&core, &id, &composite, 2, 1).await;
+    assert_eq!(set.rows.len(), 2, "{sql}");
+    assert_eq!(flat(&set.rows), psql_values(&sql));
+    assert_eq!(set.rows[0][1], Cell::Value("y".into()), "second row of (a, b) order: {sql}");
+}
+
+/// True when `sql` holds one statement: outside double-quoted names, the only
+/// `;` allowed is the last character.
+fn is_one_statement(sql: &str) -> bool {
+    let mut quoted = false;
+    let body = sql.trim_end();
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            ';' if !quoted && i + 1 != body.len() => return false,
+            _ => {}
+        }
+    }
+    !quoted
+}
+
+#[tokio::test]
+async fn a_table_named_with_quotes_and_a_second_statement_opens_as_one_statement_and_returns_its_row() {
+    require_fixtures().await;
+    let s = Scratch::new();
+    let core = s.core();
+    let id = saved_fixture(&core).await;
+    let path = table(&id, "edge", "public", "\"x\"; select pg_sleep(0) --\"");
+    let (sql, set) = page_of(&core, &id, &path, 1000, 0).await;
+    assert!(is_one_statement(&sql), "one statement: {sql}");
+    assert_eq!(flat(&set.rows), vec![Some("1".into()), Some("one known row".into())], "{sql}");
+    let count = core.table_count_sql(&dbx_tui::core::DbKind::Postgres, &path);
+    assert!(is_one_statement(&count), "one statement: {count}");
+    let counted = core.run(RunId(rand_id()), run_request(&id, "edge", 2, &count)).await.unwrap_or_else(|e| panic!("{count}: {e}"));
+    assert_eq!(flat(&counted.rows), vec![Some("1".into())], "{count}");
+}

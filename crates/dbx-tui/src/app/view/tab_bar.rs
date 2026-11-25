@@ -100,7 +100,11 @@ pub(super) fn draw(app: &App, p: &Painter, buf: &mut Buffer, row: Rect, editor_f
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let target = app.target_label_of(t.id).unwrap_or_else(|| "no target".to_string());
+            // A tab that pages a table is titled with the table's name.
+            let target = match &t.browse {
+                Some(b) => b.table.table.clone(),
+                None => app.target_label_of(t.id).unwrap_or_else(|| "no target".to_string()),
+            };
             let target = cut(&display_safe(&target), TARGET_MOST);
             Item { id: t.id, label: format!("{} {target}", i + 1), glyph: query::glyph(t), active: t.id == active }
         })

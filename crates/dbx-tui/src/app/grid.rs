@@ -159,6 +159,13 @@ impl App {
 
     /// What a results key (or a click on its hint) does.
     pub(super) fn perform_results(&mut self, action: Action, _now: Instant, fx: &mut Effects) {
+        // The paging keys work on a page with no rows too (the one past the end).
+        match action {
+            Action::NextPage => return self.next_page(_now, fx),
+            Action::PrevPage => return self.prev_page(_now, fx),
+            Action::CountRows => return self.count_rows(_now, fx),
+            _ => {}
+        }
         let Some(set) = shown(&self.model.active(self.ui.tab.id).outcome) else { return };
         let (rows, cols) = (set.rows.len(), set.columns.len());
         let page = self.ui.tab.grid.rows_visible.max(1);
@@ -205,6 +212,10 @@ impl App {
 
     fn load_more_refusal_of(&self, id: TabId) -> Option<String> {
         let tab = self.model.tab(id)?;
+        // A browse tab pages instead.
+        if tab.browse.is_some() {
+            return Some("Load more is not offered while browsing a table: it shows one page at a time.".into());
+        }
         let set = shown(&tab.outcome).filter(|set| set.truncated)?;
         if tab.run.in_flight().is_some() {
             return Some("A statement is still running in this tab: load more once it has ended.".into());
@@ -233,6 +244,9 @@ impl App {
     /// ceiling. A statement that is read-only but that dbx cannot prove
     /// repeatable (it calls a function) is run only after the user says yes.
     pub(super) fn load_more(&mut self, now: Instant, fx: &mut Effects) {
+        if self.is_browsing() {
+            return;
+        }
         let Some(set) = shown(&self.model.active(self.ui.tab.id).outcome).filter(|set| set.truncated) else { return };
         if let Some(text) = self.load_more_refusal() {
             return self.notify(text, true, fx);

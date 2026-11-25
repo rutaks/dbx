@@ -26,6 +26,14 @@ impl Syntax for NoSyntax {
     fn statement_range(&self, _kind: &DbKind, _buffer: &str, _cursor: Cursor) -> Option<(Cursor, Cursor)> {
         None
     }
+
+    fn table_page_sql(&self, _kind: &DbKind, _table: &crate::core::TablePath, _order_by: &[String], _limit: usize, _offset: usize) -> String {
+        String::new()
+    }
+
+    fn table_count_sql(&self, _kind: &DbKind, _table: &crate::core::TablePath) -> String {
+        String::new()
+    }
 }
 
 /// What every tab's editor shares: the Core's syntax answers, and the type
@@ -61,6 +69,16 @@ impl SyntaxState {
     /// now (not cached: the editing actions ask when a key is pressed).
     pub fn statement_at(&self, kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)> {
         self.handle.statement_range(kind, buffer, cursor)
+    }
+
+    /// The select for one page of `table` (see `Syntax::table_page_sql`).
+    pub fn table_page_sql(&self, kind: &DbKind, table: &crate::core::TablePath, order_by: &[String], limit: usize, offset: usize) -> String {
+        self.handle.table_page_sql(kind, table, order_by, limit, offset)
+    }
+
+    /// The statement that counts the rows of `table`.
+    pub fn table_count_sql(&self, kind: &DbKind, table: &crate::core::TablePath) -> String {
+        self.handle.table_count_sql(kind, table)
     }
 
     /// The type names of `kind`, asked of the Core the first time.

@@ -204,6 +204,46 @@ lands in that tab, without a notice (a failure is said when the tab is shown
 again), and repaints only because its glyph in the bar changed. A closed
 tab's late reply changes nothing and repaints nothing.
 
+## Browsing a table (slice 16)
+
+`o` or `f4` on a table or view row in the sidebar (the `o browse` hint is
+there and nowhere else) opens it in a tab titled with the table's name, on its
+database, or goes to the tab that already browses it. It needs a connection
+that browses and runs statements; on one that cannot be queried the key says
+so under the sidebar. The tab's editor holds the select of the first page and
+it runs at once, in the tab's own session; the results pane has the focus.
+Primary keys are read from the columns the tree already loaded; a table the
+tree has not opened is asked for its columns first.
+
+The text is built by dbx's `build_table_data_select_sql` (`SELECT * FROM
+"public"."film" ORDER BY "film_id" LIMIT 1000 OFFSET 1000;`), with the table's
+primary key as the order, and the page size is the row cap (1,000). dbx adds no
+order of its own, whatever `fallback_order_columns` suggests (nothing reads it),
+so a table without a primary key is read unordered, and the header says `no
+primary key: rows may move between pages`. `large_value_preview_size` is never
+set, and `QueryExecutionOptions.table_data_preview` is not set either: without
+a preview size it extracts nothing on Postgres, and on drivers that hand
+large values back deferred it would ask for the placeholder, not the value.
+Every value is exact (a 100 kB text arrives whole, tested against the fixture).
+
+| Key (results pane of a browse tab) | Does |
+|---|---|
+| `]` | the next page; nothing on a page of fewer rows than the page size |
+| `[` | the previous page; nothing on the first |
+| `#` | counts the rows once with dbx's count statement (`SELECT COUNT(*) AS cnt FROM ...`); never automatic, because it is real work for the server on a large table |
+
+The header reads `film · rows 1,001–2,000`, then ` of ?` from the moment `#`
+asks until the answer arrives (never a guess), then ` of 1,000,000`. A page and
+the count are runs: refused with a notice while the tab runs, cancelled by
+`ctrl+c` (a cancelled count is unasked again), stale by the usual rules, and the
+earlier page stays under `earlier run:` while the next one loads. A page that
+fails leaves the earlier one and says so. The editor follows the page that
+landed, unless there is typing in it: then `]` and `[` are refused (`esc` and
+the text are never lost). Load more (`m`) is not offered. Editing the text, or
+running a selection of it, and running makes the tab an ordinary query tab: the
+title returns to its target and the paging keys leave the mode bar; giving the
+tab another target does the same.
+
 ## Editor keys (slice 13)
 
 Every editing action is a named action in the live bindings (`Keybinds`), with
@@ -629,7 +669,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `cancel`, `complete`, `first-query`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `first-query`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live

@@ -2,6 +2,7 @@
 //! `view(frame)`. No tokio, no terminal I/O, no dbx types.
 
 mod bar;
+mod browse;
 mod connection_ui;
 mod edit_keys;
 pub mod finish;
@@ -70,6 +71,8 @@ mod syntax_tests;
 mod tabs_tests;
 #[cfg(test)]
 mod tab_bar_tests;
+#[cfg(test)]
+mod browse_tests;
 #[cfg(test)]
 mod capabilities_tests;
 #[cfg(test)]
@@ -1024,6 +1027,7 @@ impl App {
                 }
                 return;
             }
+            (Target::OpenTable(path), CoreReply::TableColumns(result)) => self.on_open_table_columns(path, result, fx),
             (Target::Children(node), CoreReply::Listed(result)) => {
                 if !self.on_listed(node, result, fx) {
                     return;

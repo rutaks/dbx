@@ -182,6 +182,7 @@ impl App {
             Action::EditConnection => self.open_edit_form(fx),
             Action::RemoveConnection => self.open_remove_confirm(fx),
             Action::UseTarget => self.use_target(fx),
+            Action::OpenTable => self.open_table_at_cursor(fx),
             _ => {}
         }
     }

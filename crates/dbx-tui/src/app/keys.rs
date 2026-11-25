@@ -214,6 +214,8 @@ pub enum Action {
     RemoveConnection,
     /// Make the database under the cursor the one the query tab runs on.
     UseTarget,
+    /// Open the table or view under the cursor in a tab of its own, paged.
+    OpenTable,
     // The results pane's own keys (and the cell viewer's).
     GridLeft,
     GridRight,
@@ -232,6 +234,11 @@ pub enum Action {
     CopyRow,
     /// Fetch more rows of a truncated result.
     LoadMore,
+    /// In a browse tab: the next page of the table, the previous one, and
+    /// the count of its rows.
+    NextPage,
+    PrevPage,
+    CountRows,
     /// In the viewer: JSON as pretty-printed, or as stored.
     ToggleRaw,
     /// Enter the resize mode (after the prefix).
@@ -362,6 +369,7 @@ impl Action {
             Action::EditConnection => "edit",
             Action::RemoveConnection => "remove",
             Action::UseTarget => "use",
+            Action::OpenTable => "browse",
             Action::GridLeft | Action::GridRight | Action::GridUp | Action::GridDown => "move",
             Action::GridPageUp | Action::GridPageDown => "page",
             Action::GridFirstCol => "first col",
@@ -372,6 +380,9 @@ impl Action {
             Action::CopyCell => "copy",
             Action::CopyRow => "copy row",
             Action::LoadMore => "more",
+            Action::NextPage => "next page",
+            Action::PrevPage => "prev page",
+            Action::CountRows => "count",
             Action::ToggleRaw => "raw",
             Action::ResizeMode => "resize",
             Action::ResizeLeft | Action::ResizeRight => "sidebar",
@@ -497,6 +508,9 @@ impl Action {
             | Action::CopyCell
             | Action::CopyRow
             | Action::LoadMore
+            | Action::NextPage
+            | Action::PrevPage
+            | Action::CountRows
             | Action::ToggleRaw => Scope::Results,
             Action::Duplicate
             | Action::DeleteLine
@@ -651,6 +665,8 @@ impl Default for Keybinds {
                 (key("d"), Action::RemoveConnection),
                 (key("delete"), Action::RemoveConnection),
                 (key("u"), Action::UseTarget),
+                (key("o"), Action::OpenTable),
+                (key("f4"), Action::OpenTable),
             ],
             results: vec![
                 (key("h"), Action::GridLeft),
@@ -675,6 +691,9 @@ impl Default for Keybinds {
                 (key("y"), Action::CopyCell),
                 (key("Y"), Action::CopyRow),
                 (key("m"), Action::LoadMore),
+                (key("]"), Action::NextPage),
+                (key("["), Action::PrevPage),
+                (key("#"), Action::CountRows),
                 (key("r"), Action::ToggleRaw),
             ],
             resize: vec![
@@ -909,8 +928,15 @@ impl Keybinds {
             row("previous tab", &[Action::PrevTabDirect, Action::PrevTab]),
             row("go to tab 1-9", &(1..=9).map(Action::GoToTab).collect::<Vec<_>>()),
         ];
+        let browse = vec![
+            row("open table (sidebar)", &[Action::OpenTable]),
+            row("next page (results)", &[Action::NextPage]),
+            row("previous page (results)", &[Action::PrevPage]),
+            row("count rows (results)", &[Action::CountRows]),
+        ];
         vec![
             HelpSection { title: "Run", rows: run },
+            HelpSection { title: "Browse", rows: browse },
             HelpSection { title: "Edit", rows: edit },
             HelpSection { title: "Panes", rows: panes },
             HelpSection { title: "Tabs", rows: tabs },

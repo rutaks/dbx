@@ -650,6 +650,16 @@ pub trait Syntax: Send + Sync {
     /// text more than once and the caret in none of the copies, say): then no
     /// outline is drawn rather than a wrong one.
     fn statement_range(&self, kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)>;
+
+    /// The select that reads one page of `table`: `limit` rows from row
+    /// `offset`, ordered by `order_by` (the primary key's columns, which dbx
+    /// does not order by itself; empty for a table without one). Every
+    /// column, whole: the large-value preview is never asked for.
+    fn table_page_sql(&self, kind: &DbKind, table: &TablePath, order_by: &[String], limit: usize, offset: usize) -> String;
+
+    /// The statement that counts the rows of `table`; its one cell is the
+    /// count.
+    fn table_count_sql(&self, kind: &DbKind, table: &TablePath) -> String;
 }
 
 /// Everything the client asks of dbx (design sections 2 and 10).

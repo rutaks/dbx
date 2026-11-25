@@ -22,7 +22,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::core::{CoreError, CoreErrorKind, DatabasePath, ResultSet, RunId, SessionId, TabId};
+use crate::core::{CoreError, CoreErrorKind, DatabasePath, DbKind, ResultSet, RunId, SessionId, TabId, TablePath};
 
 
 /// One query tab: what the Core said about it. What it shows is `tab::TabUi`.
@@ -49,6 +49,55 @@ pub struct QueryTab {
     pub loading_more: Option<LoadMore>,
     /// The run in flight, or the last one, had `search_path` in its text.
     pub run_mentions_search_path: bool,
+    /// Set while the tab pages through one table (opened from the sidebar);
+    /// editing the text and running it clears it.
+    pub browse: Option<Browse>,
+}
+
+/// A tab that pages through one table: the select it holds is generated, one
+/// page at a time, with a stable order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Browse {
+    pub table: TablePath,
+    /// The kind of database, to build the next page's SQL.
+    pub kind: DbKind,
+    /// The columns the pages are ordered by: the primary key. Empty when the
+    /// table has none, and rows may move between pages.
+    pub order_by: Vec<String>,
+    /// Rows to a page: the row cap the tab opened with.
+    pub page_size: usize,
+    /// How many rows come before the page on screen.
+    pub offset: usize,
+    /// The text of the editor that the page on screen was read with; the tab
+    /// leaves browse mode when it is run changed.
+    pub sql: String,
+    pub count: Count,
+    /// The run in flight, if it is one of the browse's: a page or the count.
+    pub fetch: Option<Fetch>,
+    /// The last page asked for failed or timed out: what to say about it. The
+    /// page on screen is the earlier run's until another run starts.
+    pub failed: Option<String>,
+    /// The run just cancelled was the count: the page on screen is still the
+    /// latest page, not an earlier run's.
+    pub count_cancelled: bool,
+}
+
+/// What is known of the number of rows in the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Count {
+    /// Not asked: it costs the server a `count(*)`, so it is on request.
+    NotAsked,
+    /// Asked, no answer yet.
+    Asking,
+    Known(u64),
+}
+
+/// A browse run in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetch {
+    /// A page, starting at row `offset`, with the select that reads it.
+    Page { offset: usize, sql: String },
+    Count,
 }
 
 /// A "load more" run in flight: the result it replaces stays on screen,
@@ -75,7 +124,31 @@ impl QueryTab {
     }
 
     pub fn new(id: TabId) -> Self {
-        QueryTab { id, target: None, session: 1, run: RunState::Idle, outcome: None, abandoned: Vec::new(), result_session: 1, loading_more: None, run_mentions_search_path: false }
+        QueryTab {
+            id,
+            target: None,
+            session: 1,
+            run: RunState::Idle,
+            outcome: None,
+            abandoned: Vec::new(),
+            result_session: 1,
+            loading_more: None,
+            run_mentions_search_path: false,
+            browse: None,
+        }
+    }
+
+    /// The run in flight is no longer the tab's to wait for (cancelled, let
+    /// go of, or the tab moved): nothing it was loading is pending.
+    pub fn drop_pending(&mut self) {
+        self.loading_more = None;
+        if let Some(b) = &mut self.browse {
+            let counting = b.fetch.take() == Some(Fetch::Count);
+            b.count_cancelled = counting;
+            if counting {
+                b.count = Count::NotAsked;
+            }
+        }
     }
 }
 
@@ -277,7 +350,9 @@ impl App {
         }
         tab.target = to;
         tab.outcome = None;
-        tab.loading_more = None;
+        tab.drop_pending();
+        // The new target has not got the table the tab was paging.
+        tab.browse = None;
         // Nothing of the old target's runs is shown for the new one.
         tab.run = RunState::Idle;
         fx.repaint = true;
@@ -293,7 +368,7 @@ impl App {
         self.remember_abandoned(id, request);
         if let Some(tab) = self.model.tab_mut(id) {
             tab.run = RunState::Idle;
-            tab.loading_more = None;
+            tab.drop_pending();
         }
         if self.is_active(id) {
             if matches!(self.ui.overlay, Some(Overlay::ConfirmDropSession(_))) {
@@ -354,7 +429,8 @@ impl App {
                 t.run = RunState::Idle;
                 t.target = None;
                 t.outcome = None;
-                t.loading_more = None;
+                t.drop_pending();
+                t.browse = None;
             }
         }
     }
@@ -405,6 +481,8 @@ impl App {
         if !self.can_run(fx) {
             return;
         }
+        // Text that was edited, or a part of it, is a query of the user's now.
+        self.leave_browse_if_edited(range.is_none() && self.ui.tab.editor.selection().is_none());
         let Some(target) = self.tab().target.clone() else { return };
         let tab = self.tab().id;
         let run = crate::core::RunId(self.model.next_run);
@@ -421,6 +499,10 @@ impl App {
             row_cap: self.model.row_cap,
         };
         self.tab_mut().run = RunState::Running { run, request: id, started: now };
+        if let Some(b) = self.tab_mut().browse.as_mut() {
+            b.failed = None;
+            b.count_cancelled = false;
+        }
         fx.commands.push(Command::Core(id, CoreCall::Run(run, request)));
         fx.repaint = true;
     }
@@ -437,7 +519,7 @@ impl App {
                 self.model.requests.supersede(Target::Run(tab));
                 self.tab_mut().run = RunState::Cancelling { run, request, started, asked: now, stuck: false };
                 // The rows on screen are the old result; there is no more coming.
-                self.tab_mut().loading_more = None;
+                self.tab_mut().drop_pending();
                 fx.repaint = true;
             }
             RunState::Cancelling { .. } => {
@@ -560,6 +642,10 @@ impl App {
         };
         let more = t.loading_more.take();
         t.run = RunState::Idle;
+        // A page or the count of a browse tab lands by its own rules.
+        if let Some(fetch) = t.browse.as_mut().and_then(|b| b.fetch.take()) {
+            return self.browse_landed(tab, fetch, result, elapsed, fx);
+        }
         match (result, more) {
             // "Load more" landed: the cursor stays on its row and column.
             (Ok(set), Some(_)) => self.more_landed(tab, set, fx),

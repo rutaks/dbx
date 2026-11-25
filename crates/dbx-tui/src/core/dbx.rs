@@ -1038,6 +1038,68 @@ impl Syntax for DbxCore {
     fn statement_range(&self, kind: &DbKind, buffer: &str, cursor: Cursor) -> Option<(Cursor, Cursor)> {
         statement_range_for(kind, buffer, cursor)
     }
+
+    fn table_page_sql(&self, kind: &DbKind, table: &TablePath, order_by: &[String], limit: usize, offset: usize) -> String {
+        page_sql_for(kind, table, order_by, limit, offset)
+    }
+
+    fn table_count_sql(&self, kind: &DbKind, table: &TablePath) -> String {
+        count_sql_for(kind, table)
+    }
+}
+
+/// The select of one page of `table`, built by dbx's table-data select
+/// (`build_table_data_select_sql`). dbx orders by nothing of its own:
+/// `fallback_order_columns` is never read, and `primary_keys` only decides
+/// whether Postgres adds a `ctid` column when row ids are asked for (they are
+/// not). So the order is ours, `order_by`, quoted the way dbx quotes names.
+/// `large_value_preview_size` is never set: every value comes whole.
+fn page_sql_for(kind: &DbKind, table: &TablePath, order_by: &[String], limit: usize, offset: usize) -> String {
+    use dbx_core::sql_dialect::{build_table_data_select_sql, quote_table_identifier, TableDataSelectSqlOptions};
+    let db_type = database_type_of(kind);
+    let order = order_by.iter().map(|c| quote_table_identifier(db_type, &guarded(db_type, c))).collect::<Vec<_>>().join(", ");
+    build_table_data_select_sql(TableDataSelectSqlOptions {
+        database_type: db_type,
+        schema: Some(guarded(db_type, &table.schema.schema)).filter(|s| !s.is_empty()),
+        table_name: guarded(db_type, &table.table),
+        primary_keys: order_by.to_vec(),
+        order_by: Some(order).filter(|o| !o.is_empty()),
+        limit: Some(limit),
+        offset: Some(offset),
+        ..Default::default()
+    })
+}
+
+/// `name` made safe to hand to dbx's identifier quoting. For Postgres, GaussDB
+/// and openGauss dbx returns a name unchanged when it starts and ends with a
+/// quote (`"`, a backtick, or `[` and `]`), taking it for one already quoted,
+/// and skips the doubling of any `"` inside: a table named
+/// `"x"; delete from t; --"` would then end the identifier and run the rest.
+/// The name is quoted here, `"` doubled, so dbx's pass-through returns it
+/// whole. Every other kind (dbx doubles the quote there) and an empty name get
+/// the raw name.
+fn guarded(db_type: Option<DatabaseType>, name: &str) -> String {
+    let passes_quoted_names_through = matches!(db_type, Some(DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss));
+    if !passes_quoted_names_through || name.is_empty() {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// dbx's count statement for `table` (`build_data_grid_count_sql`).
+fn count_sql_for(kind: &DbKind, table: &TablePath) -> String {
+    use dbx_core::data_grid_sql::{build_data_grid_count_sql, DataGridCountSqlOptions};
+    let db_type = database_type_of(kind);
+    build_data_grid_count_sql(DataGridCountSqlOptions {
+        database_type: db_type,
+        identifier_quote: None,
+        catalog: None,
+        database: None,
+        schema: Some(guarded(db_type, &table.schema.schema)).filter(|s| !s.is_empty()),
+        table_name: guarded(db_type, &table.table),
+        where_input: None,
+        count_hint: None,
+    })
 }
 
 /// dbx's `analyze_sql_references` for `sql`, in our own types. Its spans are
@@ -1469,6 +1531,88 @@ impl Core for DbxCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn film() -> TablePath {
+        TablePath {
+            schema: crate::core::SchemaPath {
+                database: DatabasePath { connection: ConnectionId("c".into()), database: "pagila".into() },
+                schema: "public".into(),
+            },
+            table: "film".into(),
+        }
+    }
+
+    #[test]
+    fn the_page_select_for_film_on_postgres_is_dbxs_own_with_the_key_as_its_order() {
+        let key = vec!["film_id".to_string()];
+        assert_eq!(
+            page_sql_for(&DbKind::Postgres, &film(), &key, 1000, 0),
+            r#"SELECT * FROM "public"."film" ORDER BY "film_id" LIMIT 1000;"#
+        );
+        assert_eq!(
+            page_sql_for(&DbKind::Postgres, &film(), &key, 1000, 1000),
+            r#"SELECT * FROM "public"."film" ORDER BY "film_id" LIMIT 1000 OFFSET 1000;"#
+        );
+        // dbx orders by nothing of its own, whatever `fallback_order_columns` says.
+        assert_eq!(page_sql_for(&DbKind::Postgres, &film(), &[], 1000, 0), r#"SELECT * FROM "public"."film" LIMIT 1000;"#);
+        let two = vec!["a".to_string(), "Mixed Case".to_string()];
+        assert_eq!(
+            page_sql_for(&DbKind::Postgres, &film(), &two, 5, 0),
+            r#"SELECT * FROM "public"."film" ORDER BY "a", "Mixed Case" LIMIT 5;"#
+        );
+    }
+
+    fn named(schema: &str, table: &str) -> TablePath {
+        let mut t = film();
+        t.schema.schema = schema.into();
+        t.table = table.into();
+        t
+    }
+
+    #[test]
+    fn a_name_with_a_quote_inside_is_doubled_in_the_page_and_count_selects() {
+        let t = named("public", r#"a"b"#);
+        assert_eq!(page_sql_for(&DbKind::Postgres, &t, &[], 5, 0), r#"SELECT * FROM "public"."a""b" LIMIT 5;"#);
+        assert_eq!(count_sql_for(&DbKind::Postgres, &t), r#"SELECT COUNT(*) AS cnt FROM "public"."a""b""#);
+    }
+
+    #[test]
+    fn a_name_that_starts_and_ends_with_a_quote_is_never_taken_as_already_quoted() {
+        // dbx passes such a name through unchanged on Postgres, which would end the identifier.
+        let t = named("public", r#""x"; delete from public.film; --""#);
+        let want = r##""public"."""x""; delete from public.film; --""""##;
+        assert_eq!(page_sql_for(&DbKind::Postgres, &t, &[], 5, 0), format!("SELECT * FROM {want} LIMIT 5;"));
+        assert_eq!(count_sql_for(&DbKind::Postgres, &t), format!("SELECT COUNT(*) AS cnt FROM {want}"));
+        for other in ["gaussdb", "opengauss"] {
+            let kind = DbKind::Other(other.into());
+            assert!(page_sql_for(&kind, &t, &[], 5, 0).contains(r##""""x""; delete from public.film; --""""##), "{other}");
+            assert!(count_sql_for(&kind, &t).contains(r##""""x""; delete from public.film; --""""##), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_schema_and_an_order_column_that_start_and_end_with_a_quote_are_quoted_whole() {
+        let t = named(r#""s"; drop table t; --""#, "film");
+        let order = vec![r#""id" desc; --""#.to_string()];
+        assert_eq!(
+            page_sql_for(&DbKind::Postgres, &t, &order, 5, 0),
+            r#"SELECT * FROM """s""; drop table t; --"""."film" ORDER BY """id"" desc; --""" LIMIT 5;"#
+        );
+        assert_eq!(count_sql_for(&DbKind::Postgres, &t), r#"SELECT COUNT(*) AS cnt FROM """s""; drop table t; --"""."film""#);
+    }
+
+    #[test]
+    fn mysql_and_sqlite_names_keep_dbxs_own_quoting() {
+        let t = named("", "a`b");
+        assert_eq!(page_sql_for(&DbKind::MySql, &t, &[], 5, 0), "SELECT * FROM `a``b` LIMIT 5;");
+        let q = named("", r#"a"b"#);
+        assert_eq!(page_sql_for(&DbKind::Sqlite, &q, &[], 5, 0), r#"SELECT * FROM "a""b" LIMIT 5;"#);
+    }
+
+    #[test]
+    fn the_count_select_for_film_on_postgres_is_dbxs_own() {
+        assert_eq!(count_sql_for(&DbKind::Postgres, &film()), r#"SELECT COUNT(*) AS cnt FROM "public"."film""#);
+    }
 
     #[test]
     fn only_selects_dbx_proves_read_only_are_proven_rerunnable() {

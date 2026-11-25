@@ -18,7 +18,7 @@ check pagila "select count(*) from film" 1000
 check pagila "select title from film where film_id = 1" "ACADEMY DINOSAUR"
 # Every user schema is read by the ground-truth harness: tables and views.
 check edge "select string_agg(table_schema || '.' || table_name, ',' order by table_schema || '.' || table_name collate \"C\") from information_schema.tables where table_schema not in ('pg_catalog', 'information_schema') and left(table_schema, 3) <> 'pg_' and table_type in ('BASE TABLE', 'VIEW')" \
-  "other.things,public.Mixed Case,public.composite_key,public.empty_table,public.gt_arrays,public.gt_arrays_more,public.gt_bool_uuid_bytea,public.gt_catalog_types,public.gt_computed,public.gt_documents,public.gt_floats,public.gt_geometric,public.gt_integers,public.gt_json,public.gt_money_bits,public.gt_network,public.gt_numerics,public.gt_other_types,public.gt_precision,public.gt_temporal,public.gt_text,public.gt_types,public.inherit_child,public.inherit_parent_a,public.inherit_parent_b,public.million_rows,public.no_pk,public.numbers,public.other_types,public.temporal,public.text_values,public.wide_120,public.width_text"
+  "other.things,public.\"x\"; select pg_sleep(0) --\",public.Mixed Case,public.composite_key,public.empty_table,public.gt_arrays,public.gt_arrays_more,public.gt_bool_uuid_bytea,public.gt_catalog_types,public.gt_computed,public.gt_documents,public.gt_floats,public.gt_geometric,public.gt_integers,public.gt_json,public.gt_money_bits,public.gt_network,public.gt_numerics,public.gt_other_types,public.gt_precision,public.gt_temporal,public.gt_text,public.gt_types,public.inherit_child,public.inherit_parent_a,public.inherit_parent_b,public.million_rows,public.no_pk,public.numbers,public.other_types,public.temporal,public.text_values,public.wide_120,public.width_text"
 check edge "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('m', 'f', 'p') and n.nspname not in ('pg_catalog', 'information_schema') and left(n.nspname, 3) <> 'pg_'" 0
 check edge "select string_agg(id || ':' || coalesce('[' || v || ']', 'NULL'), ',' order by id) from text_values where id <= 4" "1:NULL,2:[],3:[NULL],4:[ ]"
 check edge "select big::text from numbers where id = 1" 9007199254740993
@@ -29,6 +29,8 @@ check edge "select v from text_values where id = 7" "日本語 😀 👨‍👩�
 check edge "select count(*) from empty_table" 0
 check edge "select count(*) from pg_inherits where inhrelid = 'inherit_child'::regclass" 2
 check edge "select \"select\" from \"Mixed Case\"" reserved
+# The table named with quotes and a second statement (edge/06-quoted-name.sql).
+check edge "select v from \"\"\"x\"\"; select pg_sleep(0) --\"\"\" where id = 1" "one known row"
 # The grid's tables (slice 07): 120 columns that name themselves, a million
 # rows, and text of known display width.
 check edge "select count(*) from information_schema.columns where table_schema = 'public' and table_name = 'wide_120'" 121

@@ -44,12 +44,20 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect) {
     let tab = model.active(ui.tab.id);
     // The outcome is the latest run's only while nothing came after it, and
     // the rows being loaded more of are the same statement's.
-    let earlier = tab.run != RunState::Idle && tab.loading_more.is_none();
+    let counting = counting(tab);
+    // A cancelled count leaves the page the latest; a failed page does not.
+    let count_cancelled = tab.browse.as_ref().is_some_and(|b| b.count_cancelled);
+    let failed_page = tab.browse.as_ref().is_some_and(|b| b.failed.is_some());
+    let earlier = failed_page || (tab.run != RunState::Idle && tab.loading_more.is_none() && !counting && !count_cancelled);
     match &tab.outcome {
         Some(Outcome::Rows(set)) => {
             // What ran heads the pane: the cursor's statement is not always
-            // the one in view (dbx runs the one before a blank line).
-            draw_ran(&p, buf, area, &set.ran, earlier);
+            // the one in view (dbx runs the one before a blank line). A
+            // table being paged says which rows these are instead.
+            match browse_header(tab, set) {
+                Some(text) => draw_header(&p, buf, area, &text, earlier),
+                None => draw_ran(&p, buf, area, &set.ran, earlier),
+            }
             let below = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
             if set.columns.is_empty() {
                 draw_affected(&p, buf, below, set)
@@ -93,6 +101,47 @@ pub(super) fn head_rows(app: &App, width: u16) -> u16 {
 /// What heads a result that is not the latest run's.
 const EARLIER: &str = "earlier run:";
 
+/// Whether the tab's run in flight is the count of its table's rows: the
+/// page on screen is still the latest page, not an earlier run's.
+fn counting(tab: &crate::app::query::QueryTab) -> bool {
+    tab.run.in_flight().is_some() && tab.browse.as_ref().is_some_and(|b| b.fetch == Some(crate::app::query::Fetch::Count))
+}
+
+/// `film · rows 1,001–2,000 of 1,000,000` for the page of a browse tab on
+/// screen, with the primary-key note after it where there is no key. The
+/// total is `of ?` from the moment it is asked for until it arrives, and
+/// absent before.
+fn browse_header(tab: &crate::app::query::QueryTab, set: &ResultSet) -> Option<String> {
+    use crate::app::query::Count;
+    let b = tab.browse.as_ref()?;
+    let mut text = format!("{} · ", b.table.table);
+    if set.rows.is_empty() {
+        if b.offset == 0 {
+            text.push_str("no rows");
+        } else {
+            text.push_str(&format!("no more rows after {}", thousands(b.offset)));
+        }
+    } else {
+        text.push_str(&format!("rows {}–{}", thousands(b.offset + 1), thousands(b.offset + set.rows.len())));
+    }
+    match b.count {
+        Count::NotAsked => {}
+        Count::Asking => text.push_str(" of ?"),
+        Count::Known(n) => text.push_str(&format!(" of {}", thousands(n as usize))),
+    }
+    if b.order_by.is_empty() {
+        text.push_str(" · no primary key: rows may move between pages");
+    }
+    Some(text)
+}
+
+/// A line in `overlay0` heading the grid, after `earlier run:` when it is not
+/// the latest run's.
+fn draw_header(p: &Painter, buf: &mut Buffer, area: Rect, text: &str, earlier: bool) {
+    let text = if earlier { format!("{EARLIER} {text}") } else { text.to_string() };
+    p.put(buf, area.x, area.y, &text, p.fg(Role::Overlay0));
+}
+
 /// The run's state, when there is one to tell, then a line for each run the
 /// tab let go of that may still be running, each wrapped over at most three
 /// rows, then a blank row. Returns the rows used.
@@ -127,7 +176,11 @@ fn run_line(app: &App) -> Option<(String, Role)> {
     let secs = |started: std::time::Instant| app.ui.now.map_or(0, |now| now.saturating_duration_since(started).as_secs());
     let cancel_key = app.ui.keys.key_for(Action::CancelDirect).unwrap_or_default();
     Some(match &tab.run {
-        RunState::Idle => return None,
+        RunState::Idle => return tab.browse.as_ref().and_then(|b| b.failed.clone()).map(|text| (text, Role::Red)),
+        RunState::Running { started, .. } if counting(tab) => (
+            format!("counting rows… {}s: the page stays below", secs(*started)),
+            Role::Yellow,
+        ),
         RunState::Running { started, .. } if tab.loading_more.is_some() => (
             format!("loading more… {}s: the rows so far stay below", secs(*started)),
             Role::Yellow,

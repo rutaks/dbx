@@ -628,6 +628,9 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     } else if row.node.parent().is_some() || !row.is_node() {
         hints.extend(one(Action::Collapse, "parent"));
     }
+    if app.cursor_can_browse() {
+        hints.extend(one(Action::OpenTable, "browse"));
+    }
     if app.cursor_can_be_used() {
         hints.extend(one(Action::UseTarget, "use"));
     }
@@ -671,6 +674,16 @@ fn results_hints(app: &App, mut hints: Vec<Hint>, prefix: Hint) -> Vec<Hint> {
             hints.extend(one(Action::LoadMore, "more"));
         }
         hints.push(several(&[Action::GridLeft, Action::GridDown, Action::GridUp, Action::GridRight], "move"));
+    }
+    // A browse tab pages and counts; the keys are offered where they work.
+    if app.can_page_next() {
+        hints.extend(one(Action::NextPage, "next page"));
+    }
+    if app.can_page_prev() {
+        hints.extend(one(Action::PrevPage, "prev page"));
+    }
+    if app.can_count() {
+        hints.extend(one(Action::CountRows, "count"));
     }
     hints.push(prefix);
     if !set.rows.is_empty() {

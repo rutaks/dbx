@@ -32,6 +32,9 @@ pub enum Target {
     /// latest request for a thing wins: a longer word asks again, and the
     /// older reply is stale. Each tab asks for its own.
     Complete(TabId, Need),
+    /// The columns of a table `o` was pressed on before the tree had them: the
+    /// primary key is read from them, then the table opens.
+    OpenTable(crate::core::TablePath),
 }
 
 /// What a reply is, by the table.
