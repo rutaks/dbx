@@ -3,14 +3,14 @@ name = "dbx-tui"
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
-description = "A terminal database client, a head on dbx's core"
+description = "dbpane: a terminal database client, a head on dbx's core"
 
 [lib]
 name = "dbx_tui"
 path = "src/lib.rs"
 
 [[bin]]
-name = "dbx-tui"
+name = "dbpane"
 path = "src/main.rs"
 
 [features]

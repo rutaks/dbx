@@ -5,7 +5,20 @@ set -u
 JOURNEY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$JOURNEY_DIR/../../../.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-BIN="$TARGET_DIR/debug/dbx-tui"
+# PROFILE=release runs the journey against the release binary
+# (target/release/dbpane); the default is the debug one.
+PROFILE="${PROFILE:-debug}"
+case "$PROFILE" in
+  debug) PROFILE_FLAG="" ;;
+  release) PROFILE_FLAG="--release" ;;
+  *) echo "PROFILE must be debug or release" >&2; exit 2 ;;
+esac
+BIN="$TARGET_DIR/$PROFILE/dbpane"
+# Captures and scratch stores live in OUT. A journey that passes removes it
+# unless JOURNEY_OUT names the directory to keep them in; a failing journey
+# always keeps it (its last screen is printed first).
+if [ -n "${JOURNEY_OUT:-}" ]; then KEEP_OUT=1; else KEEP_OUT=0; fi
+FAILED=0
 OUT="${JOURNEY_OUT:-$(mktemp -d)}"
 # One tmux server per journey run, so journeys run side by side cannot kill
 # each other's sessions.
@@ -32,10 +45,19 @@ seed() {
 }
 
 tm() { tmux -L "$SOCK" "$@"; }
-cleanup() { tm kill-server >/dev/null 2>&1 || true; }
+# Ends this journey's tmux server (and so its socket file under /tmp).
+kill_tmux() {
+  tm kill-server >/dev/null 2>&1 || true
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCK"
+}
+# The journey's exit: its tmux server and, when it passed, its scratch directory.
+cleanup() {
+  kill_tmux
+  if [ "$KEEP_OUT" = 0 ] && [ "$FAILED" = 0 ]; then rm -rf "$OUT"; fi
+}
 trap cleanup EXIT
 
-fail() { echo "FAIL: $*" >&2; [ -n "${LAST_CAPTURE:-}" ] && { echo "--- last screen ---" >&2; cat "$LAST_CAPTURE" >&2; }; exit 1; }
+fail() { FAILED=1; echo "FAIL: $*" >&2; [ -n "${LAST_CAPTURE:-}" ] && { echo "--- last screen ---" >&2; cat "$LAST_CAPTURE" >&2; }; exit 1; }
 
 # capture NAME -> saves the pane text to $OUT/NAME.txt and sets LAST_CAPTURE
 capture() {
@@ -70,15 +92,19 @@ expect_not() { grep -Eq -- "$2" "$LAST_CAPTURE" && fail "$1: did not expect /$2/
 
 # start_shell: a plain sh with a recognisable prompt, 120x35
 start_shell() {
-  cleanup
+  kill_tmux
   tm new-session -d -s "$SESSION" -x 120 -y 35 "env PS1='PROMPT>' sh"
   tm set-option -t "$SESSION" -g status off >/dev/null
   wait_for shell-ready 'PROMPT>'
 }
 
 # Always build: cargo makes this a no-op when nothing changed.
-build_bin() { (cd "$ROOT" && cargo build -p dbx-tui) >/dev/null 2>&1 || fail "build"; }
+build_bin() { (cd "$ROOT" && cargo build -p dbx-tui $PROFILE_FLAG) >/dev/null 2>&1 || fail "build"; }
+# Examples are test tools (seeding a store): always the debug build.
 build_example() { (cd "$ROOT" && cargo build -p dbx-tui --example "$1") >/dev/null 2>&1 || fail "build example $1"; }
+# An example built in the journey's own profile (`panic_probe`, which must
+# behave as the release binary does under panic = "abort").
+build_example_in_profile() { (cd "$ROOT" && cargo build -p dbx-tui $PROFILE_FLAG --example "$1") >/dev/null 2>&1 || fail "build example $1"; }
 
 # expect_terminal_restored LABEL: the pane is back to a normal shell
 expect_terminal_restored() {

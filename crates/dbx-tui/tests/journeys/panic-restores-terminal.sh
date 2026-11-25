@@ -4,8 +4,8 @@
 # thread or inside a spawned task, and must end the process with code 101.
 . "$(dirname "$0")/lib.sh"
 
-build_example panic_probe
-PROBE="$TARGET_DIR/debug/examples/panic_probe"
+build_example_in_profile panic_probe
+PROBE="$TARGET_DIR/$PROFILE/examples/panic_probe"
 
 for mode in main task; do
   start_shell

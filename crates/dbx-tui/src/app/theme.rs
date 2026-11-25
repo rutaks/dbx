@@ -4,7 +4,7 @@
 //! v0.9.5, commit ee5bfb5: the role names come from `Palette` in
 //! `src/app/state.rs`, and the values of the default theme (herdr's
 //! "catppuccin", Catppuccin Mocha) and of the `terminal` theme are copied from
-//! it. dbx-tui is also Apache-2.0. Only these two of herdr's 18 themes are
+//! it. dbpane is also Apache-2.0. Only these two of herdr's 18 themes are
 //! ported so far.
 //!
 //! View code names a `Role`; a theme maps roles to colours. No colour literal

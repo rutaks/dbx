@@ -28,6 +28,8 @@ use dbx_core::query_cancel::RunningTaskMetadata;
 use dbx_core::storage::{MigrationPreflight, Storage};
 use tokio::sync::Mutex;
 
+#[cfg(feature = "test-support")]
+use super::store::desktop_data_dir;
 use super::*;
 
 /// Where the store is. Built once, from the environment, by `from_env`; tests
@@ -42,6 +44,9 @@ pub struct StoreOptions {
     pub create_if_missing: bool,
     /// Where dbx will take the store key from, for advice when it fails.
     pub key_source: KeySource,
+    /// Whose store this is, and how it came to be chosen.
+    pub kind: StoreKind,
+    pub source: StoreSource,
 }
 
 /// Where dbx takes the store key from. `DBX_SECRET_KEY_FILE` and
@@ -52,59 +57,52 @@ pub enum KeySource {
     EnvValue,
     /// The compatibility key file if present, else the OS keychain or Secret Service.
     Platform,
+    /// A key file inside dbpane's own store (`<dir>/.dbx/secret.key`).
+    StoreFile,
 }
 
 impl StoreOptions {
-    /// `DBX_DATA_DIR` if set, else the desktop app's data directory. The one
-    /// place the client reads the environment to find its store. (The key
-    /// variables `DBX_SECRET_KEY_FILE` and `DBX_SECRET_KEY` are read by dbx.)
-    pub fn from_env() -> Result<Self, CoreError> {
-        Self::from_vars(|name| std::env::var_os(name))
+    /// The store `choice` and the environment name (`resolve`). The one place
+    /// the client reads the environment to find its store. (The key variables
+    /// `DBX_SECRET_KEY_FILE` and `DBX_SECRET_KEY` are read by dbx.)
+    pub fn from_env(choice: &StoreChoice) -> Result<Self, CoreError> {
+        Self::resolve(choice, |name| std::env::var_os(name), has_dbx_store)
     }
 
-    /// `from_env` with the lookup injected, so tests need not change the
-    /// process environment.
+    /// `from_env` with nothing chosen and the lookup injected, so tests need
+    /// not change the process environment. Looks at the disk for a dbx store.
     pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, CoreError> {
-        let set = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-        // dbx itself tests presence, not emptiness, for the key variables.
-        let key_source = if var("DBX_SECRET_KEY_FILE").is_some() {
-            KeySource::EnvFile
-        } else if var("DBX_SECRET_KEY").is_some() {
-            KeySource::EnvValue
-        } else {
-            KeySource::Platform
-        };
-        if let Some(dir) = set("DBX_DATA_DIR") {
-            if !dir.is_absolute() {
-                return Err(CoreError::new(
-                    CoreErrorKind::Store,
-                    format!(
-                        "DBX_DATA_DIR is {:?}, which is not an absolute path (a leading ~ is not expanded). \
-                         Set it to the full path of a dbx data directory, such as /Users/you/dbx-data.",
-                        dir.as_os_str()
-                    ),
-                ));
-            }
-            return Ok(StoreOptions { data_dir: dir, create_if_missing: false, key_source });
-        }
-        let data_dir = desktop_data_dir(set("HOME"), set("XDG_DATA_HOME")).ok_or_else(|| {
-            CoreError::new(
-                CoreErrorKind::Store,
-                "dbx-tui cannot tell where dbx keeps its store: HOME is not set. \
-                 Set DBX_DATA_DIR to a dbx data directory and start again.",
-            )
-        })?;
-        Ok(StoreOptions { data_dir, create_if_missing: true, key_source })
+        Self::resolve(&StoreChoice::Auto, var, has_dbx_store)
     }
-}
 
-/// Where the desktop app (Tauri identifier `com.dbx.app`) keeps its data:
-/// Tauri's `app_data_dir`.
-fn desktop_data_dir(home: Option<PathBuf>, xdg_data_home: Option<PathBuf>) -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        return home.map(|h| h.join("Library/Application Support/com.dbx.app"));
+    /// What the welcome screen and `--help` say about this store.
+    pub fn info(&self) -> StoreInfo {
+        StoreInfo { kind: self.kind, source: self.source, path: self.data_dir.clone() }
     }
-    xdg_data_home.or_else(|| home.map(|h| h.join(".local/share"))).map(|d| d.join("com.dbx.app"))
+
+    /// dbx's key policy for this store. The desktop app's store and any named
+    /// directory use the platform default (the key dbx keeps in the keychain
+    /// or Secret Service, as the desktop app does). dbpane's own store keeps
+    /// its key in a file inside the store (`<dir>/.dbx/secret.key`, 0600):
+    /// dbx fixes the keychain entry's service name to `com.dbx.app...` in a
+    /// private constant, so an entry named `dbpane` needs a change in dbx,
+    /// and a stranger's first run must not create an entry under dbx's name.
+    pub(crate) fn key_policy(&self) -> SecretKeyPolicy {
+        self.key_policy_with(|dir| dbx_core::persistence::secret_codec::managed_key_path(dir).exists())
+    }
+
+    /// `key_policy` with the presence check injected (`has_key` says whether a
+    /// directory holds dbx's managed key file, `<dir>/.dbx/secret.key`). A
+    /// named directory that already has one was made under the managed
+    /// policy, so it keeps that policy: the platform default would look in
+    /// the keychain for a key the store was never written with.
+    pub(crate) fn key_policy_with(&self, has_key: impl Fn(&Path) -> bool) -> SecretKeyPolicy {
+        match self.kind {
+            StoreKind::Named if has_key(&self.data_dir) => SecretKeyPolicy::ManagedDataDir,
+            StoreKind::Own => SecretKeyPolicy::ManagedDataDir,
+            StoreKind::Shared | StoreKind::Named => SecretKeyPolicy::PlatformDefault,
+        }
+    }
 }
 
 /// Whether a seeding tool may write to `dir`: never the desktop app's store
@@ -199,13 +197,23 @@ async fn blocking<T: Send + 'static>(fut: impl std::future::Future<Output = T> +
 
 impl DbxCore {
     pub fn new(options: StoreOptions) -> Self {
-        DbxCore { options: Ok(options), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default(), switched: Default::default() }
+        Self::with_options(Ok(options))
     }
 
-    /// The client's DbxCore: the store named by the environment. If that
-    /// cannot be worked out, every call fails with the reason.
-    pub fn from_env() -> Self {
-        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default(), switched: Default::default() }
+    /// The client's DbxCore: the store `choice` and the environment name. If
+    /// that cannot be worked out, every call fails with the reason.
+    pub fn from_env(choice: &StoreChoice) -> Self {
+        Self::with_options(StoreOptions::from_env(choice))
+    }
+
+    fn with_options(options: Result<StoreOptions, CoreError>) -> Self {
+        let policy = options.as_ref().map_or(SecretKeyPolicy::PlatformDefault, StoreOptions::key_policy);
+        DbxCore { options, state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default(), switched: Default::default() }
+    }
+
+    /// Which store this is and why, when it could be worked out.
+    pub fn store_info(&self) -> Option<StoreInfo> {
+        self.options.as_ref().ok().map(StoreOptions::info)
     }
 
     /// Keys only from the environment or the data directory, never the OS
@@ -443,7 +451,7 @@ async fn open(dir: &Path, create_if_missing: bool, source: KeySource, policy: Se
         return Err(CoreError::new(
             CoreErrorKind::Store,
             format!(
-                "DBX_DATA_DIR names {}, which does not exist or is not a directory. Check the path, or create \
+                "DBX_DATA_DIR or --store names {}, which does not exist or is not a directory. Check the path, or create \
                  the directory for a new store, then retry.",
                 dir.display()
             ),
@@ -496,7 +504,7 @@ fn advice(code: &str, source: KeySource) -> String {
     let wrong = matches!(code, "SECRET_KEY_MISMATCH" | "ENCRYPTED_DATA_KEY_MISSING");
     match source {
         KeySource::EnvFile => match code {
-            "KEY_FILE_UNAVAILABLE" => "dbx-tui cannot read the file DBX_SECRET_KEY_FILE names. Check the path and its \
+            "KEY_FILE_UNAVAILABLE" => "dbpane cannot read the file DBX_SECRET_KEY_FILE names. Check the path and its \
                 permissions, then start again."
                 .into(),
             "SECRET_KEY_INVALID" => "The file DBX_SECRET_KEY_FILE names does not hold a valid key (64 hex characters). \
@@ -513,13 +521,17 @@ fn advice(code: &str, source: KeySource) -> String {
                 to use the key dbx keeps for you, then start again."
                 .into(),
         },
+        KeySource::StoreFile => "dbpane's key file inside its own store (.dbx/secret.key) is missing, unreadable or \
+            not the key this store was written with. Restore the file, or set DBX_SECRET_KEY_FILE to the right key \
+            file, then start again."
+            .into(),
         KeySource::Platform if wrong || code == "SECRET_KEY_INVALID" => "The key dbx keeps for this user does not \
             open this store. Set DBX_SECRET_KEY_FILE to the key file this store was written with, then start again."
             .into(),
         KeySource::Platform if code == "KEY_FILE_UNAVAILABLE" => "dbx's key file in your user directory cannot be \
             read. Check its permissions, or set DBX_SECRET_KEY_FILE, then retry."
             .into(),
-        KeySource::Platform if cfg!(target_os = "macos") => "Unlock your login keychain (and allow dbx-tui to use \
+        KeySource::Platform if cfg!(target_os = "macos") => "Unlock your login keychain (and allow dbpane to use \
             the dbx key if asked), then retry. Or set DBX_SECRET_KEY_FILE to the store's key file and start again."
             .into(),
         KeySource::Platform => "Make sure the Secret Service (such as GNOME Keyring) is running and unlocked, then \
@@ -548,7 +560,7 @@ fn classify(raw: &str, source: KeySource) -> Option<CoreError> {
 }
 
 fn key_error(code: &str, dbx_says: Option<&str>, source: KeySource) -> CoreError {
-    let what = dbx_says.unwrap_or("dbx-tui cannot read the key that encrypts this store's saved passwords");
+    let what = dbx_says.unwrap_or("dbpane cannot read the key that encrypts this store's saved passwords");
     CoreError::new(CoreErrorKind::Key, format!("{} ({code}). {}", what.trim_end_matches('.'), advice(code, source)))
 }
 
@@ -559,8 +571,8 @@ fn store_error(dir: &Path, doing: &str, raw: &str) -> CoreError {
     CoreError::new(
         CoreErrorKind::Store,
         format!(
-            "dbx-tui could not {doing} at {}: {raw}. Check that DBX_DATA_DIR names a dbx data directory you can \
-             read and write, then retry.",
+            "dbpane could not {doing} at {}: {raw}. Check that the store directory (the default, DBX_DATA_DIR or \
+             --store) can be read and written, then retry.",
             dir.display()
         ),
     )
@@ -2376,11 +2388,6 @@ mod tests {
         }
     }
 
-    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
-        let owned: Vec<(String, OsString)> = pairs.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect();
-        move |name| owned.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
-    }
-
     fn request(buffer: &str, row: usize, col: usize) -> RunRequest {
         RunRequest {
             connection: ConnectionId("c".into()),
@@ -2586,22 +2593,38 @@ mod tests {
     }
 
     #[test]
-    fn dbx_data_dir_wins_and_otherwise_the_store_is_the_desktop_apps() {
-        let set = StoreOptions::from_vars(vars(&[("DBX_DATA_DIR", "/tmp/scratch"), ("HOME", "/Users/x")])).unwrap();
-        assert_eq!(set.data_dir, PathBuf::from("/tmp/scratch"));
-        assert!(!set.create_if_missing, "an explicit directory must already exist");
-        let empty = StoreOptions::from_vars(vars(&[("DBX_DATA_DIR", ""), ("HOME", "/Users/x")])).unwrap();
-        let default = StoreOptions::from_vars(vars(&[("HOME", "/Users/x")])).unwrap();
-        assert_eq!(empty, default, "an empty DBX_DATA_DIR counts as unset");
-        assert!(default.create_if_missing, "a fresh machine gets its store");
-        if cfg!(target_os = "macos") {
-            assert_eq!(default.data_dir, PathBuf::from("/Users/x/Library/Application Support/com.dbx.app"));
-        } else {
-            assert_eq!(default.data_dir, PathBuf::from("/Users/x/.local/share/com.dbx.app"));
-        }
-        let err = StoreOptions::from_vars(vars(&[])).unwrap_err();
-        assert_eq!(err.kind, CoreErrorKind::Store);
-        assert!(err.message.contains("DBX_DATA_DIR"), "{}", err.message);
+    fn only_dbpanes_own_store_keeps_its_key_in_a_file_the_others_use_the_platform_default() {
+        let v = |name: &str| (name == "HOME").then(|| OsString::from("/scratch/home"));
+        let own = StoreOptions::resolve(&StoreChoice::Own, v, |_| false).unwrap();
+        assert_eq!(own.key_policy(), SecretKeyPolicy::ManagedDataDir);
+        let auto_own = StoreOptions::resolve(&StoreChoice::Auto, v, |_| false).unwrap();
+        assert_eq!(auto_own.key_policy(), SecretKeyPolicy::ManagedDataDir, "no dbx store found: the stranger's own store");
+        let shared = StoreOptions::resolve(&StoreChoice::Auto, v, |d| d.ends_with("com.dbx.app")).unwrap();
+        assert_eq!(shared.key_policy(), SecretKeyPolicy::PlatformDefault, "the desktop app's store keeps the desktop app's key");
+        let named = StoreOptions::resolve(&StoreChoice::Dir("/scratch/x".into()), v, |_| false).unwrap();
+        assert_eq!(named.key_policy_with(|_| false), SecretKeyPolicy::PlatformDefault);
+        assert_eq!(DbxCore::new(own).policy, SecretKeyPolicy::ManagedDataDir);
+        assert_eq!(DbxCore::new(shared).policy, SecretKeyPolicy::PlatformDefault);
+    }
+
+    #[test]
+    fn a_named_store_that_already_has_a_managed_key_file_uses_the_managed_policy() {
+        let v = |name: &str| (name == "HOME").then(|| OsString::from("/scratch/home"));
+        let named = StoreOptions::resolve(&StoreChoice::Dir("/scratch/x".into()), v, |_| false).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let policy = named.key_policy_with(|dir| {
+            seen.borrow_mut().push(dir.to_path_buf());
+            true
+        });
+        assert_eq!(policy, SecretKeyPolicy::ManagedDataDir);
+        assert_eq!(*seen.borrow(), vec![PathBuf::from("/scratch/x")]);
+        assert_eq!(named.key_policy_with(|_| false), SecretKeyPolicy::PlatformDefault, "no key file: the platform default");
+        // DBX_DATA_DIR names a store the same way.
+        let env = StoreOptions::resolve(&StoreChoice::Auto, |n| (n == "DBX_DATA_DIR").then(|| OsString::from("/scratch/y")), |_| false).unwrap();
+        assert_eq!(env.key_policy_with(|_| true), SecretKeyPolicy::ManagedDataDir);
+        // The desktop app's store never switches policy on a stray key file.
+        let shared = StoreOptions::resolve(&StoreChoice::Dbx, v, |_| false).unwrap();
+        assert_eq!(shared.key_policy_with(|_| true), SecretKeyPolicy::PlatformDefault);
     }
 
     #[cfg(feature = "test-support")]

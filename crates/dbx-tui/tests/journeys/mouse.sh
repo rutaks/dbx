@@ -187,7 +187,7 @@ dragto "$start_sep" 3 "$((start_sep + 10))" 3
 key C-g q
 wait_for 60-quit 'EXIT=0' 3
 expect_terminal_restored quit
-prefs="$STORE/dbx-tui-prefs.json"
+prefs="$STORE/dbpane-prefs.json"
 [ -f "$prefs" ] || fail "no preferences file at $prefs"
 grep -q 'sidebar_permille' "$prefs" || fail "the sidebar proportion was not saved: $(cat "$prefs")"
 grep -q 'editor_permille' "$prefs" || fail "the editor proportion was not saved: $(cat "$prefs")"

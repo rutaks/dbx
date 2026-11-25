@@ -92,7 +92,7 @@ fn key_error_app() -> Harness {
     let fake = FakeCore::new();
     fake.script_connections(Scripted::err(
         crate::core::CoreErrorKind::Key,
-        "dbx-tui cannot read the key for this store (KEYRING_ACCESS_FAILED). Unlock your login keychain, then retry.",
+        "dbpane cannot read the key for this store (KEYRING_ACCESS_FAILED). Unlock your login keychain, then retry.",
     ));
     Harness::start(fake)
 }

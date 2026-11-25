@@ -1,0 +1,36 @@
+# cargo-about configuration for legal/THIRD-PARTY.txt. Regenerate with
+# scripts/gen-third-party.sh. Lists every crate in the dbpane binary's
+# dependency graph (normal dependencies only) for the release targets.
+#
+# The order matters: for a crate offered under several licences ("MIT OR
+# Apache-2.0") cargo-about records the first one found here. MIT is first so
+# the crate's own copyright line is kept in the output; an Apache-2.0 text
+# carries none.
+accepted = [
+    "MIT",
+    "MIT-0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unlicense",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MPL-2.0",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+private = { ignore = false }
+workarounds = ["ring"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]

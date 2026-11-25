@@ -154,7 +154,7 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// The first part of `word` that fits `width` columns (at least one grapheme),
 /// and the rest.
-fn split_at_width(word: &str, width: usize) -> (String, String) {
+pub(super) fn split_at_width(word: &str, width: usize) -> (String, String) {
     let mut used = 0;
     let mut end = 0;
     for g in word.graphemes(true) {

@@ -236,7 +236,7 @@ key C-c
 wait_for 52-confirm "Close this tab's session" 2
 kill -TERM "$(cat "$OUT/client.pid")"
 wait_for 53-quit 'EXIT=0' 4
-expect quit 'dbx-tui: A statement may still be running on proxied pg / pagila\.'
+expect quit 'dbpane: A statement may still be running on proxied pg / pagila\.'
 expect_terminal_restored quit
 expect_gone quit "$TAG" 9
 

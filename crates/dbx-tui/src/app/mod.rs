@@ -44,6 +44,8 @@ pub mod viewer;
 pub(crate) mod view;
 
 #[cfg(test)]
+mod welcome_tests;
+#[cfg(test)]
 mod cancel_tests;
 #[cfg(test)]
 mod dump_tests;
@@ -289,6 +291,9 @@ pub struct Ui {
     /// How the last dump ended (its words, and whether it failed), for the
     /// progress overlay once it is over.
     pub dump_ended: Option<(String, bool)>,
+    /// Which store is in use and where (given by the shell), for the welcome
+    /// screen. None when it could not be worked out.
+    pub store: Option<crate::core::StoreInfo>,
 }
 
 #[derive(Debug)]
@@ -485,6 +490,7 @@ impl App {
                 drag: None,
                 clicks: Clicks::default(),
                 export_env: export::ExportEnv::default(),
+                store: None,
                 next_export: 1,
                 dump_ended: None,
             },

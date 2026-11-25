@@ -12,6 +12,7 @@ mod popup;
 mod results;
 mod tab_bar;
 mod viewer;
+mod welcome;
 
 pub(crate) use results::cell_text;
 
@@ -659,6 +660,17 @@ fn normal_hints(app: &App) -> Vec<Hint> {
     // the ones after it with it: what the row under the cursor can do, then
     // what is always possible.
     let Some(row) = app.cursor_row() else {
+        // Nothing saved yet (the welcome is showing): the three things worth
+        // doing, each clickable, before the prefix.
+        if matches!(&app.model.connections, Loadable::Ready(list) if list.is_empty()) {
+            for (action, desc) in [(Action::NewConnection, "new"), (Action::Help, "help"), (Action::Quit, "quit")] {
+                if let Some(k) = keys.key_for(action) {
+                    hints.push(Hint { keys: vec![(format!("{} {k}", keys.prefix), action)], desc });
+                }
+            }
+            hints.push(prefix);
+            return hints;
+        }
         return general_hints(app, hints);
     };
     if row.is_node() && !row.expanded {

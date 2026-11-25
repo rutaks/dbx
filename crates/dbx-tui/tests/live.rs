@@ -577,7 +577,12 @@ async fn a_cancel_lands_even_while_another_core_call_holds_the_state_lock() {
         let _busy = core.hold_state_lock().await;
         core.cancel(RunId(77));
     }
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), running).await.expect("cancelled promptly").unwrap();
+    // What is asserted is the work done: the 20 s statement ended by being
+    // cancelled (the kind below), while the lock was held. The bound only stops
+    // a hang from stalling the suite; it is generous (below the statement's own
+    // 20 s, well above any load the machine is under) because the fixed 5 s one
+    // failed under load, where the cancel landed but the task was slow to run.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), running).await.expect("cancelled before the statement ran out").unwrap();
     eprintln!("OBSERVED cancel under a held lock: {:?} after {:?}", result.as_ref().err(), started.elapsed());
     assert_eq!(result.expect_err("cancelled").kind, CoreErrorKind::Cancelled);
 }

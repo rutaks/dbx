@@ -11,7 +11,7 @@ for sig in TERM HUP; do
   tm send-keys -t "$SESSION" "$CLIENT; echo EXIT=\$?" Enter
   wait_for "20-running-$sig" 'No connections yet'
   pane_pid="$(tm display -p -t "$SESSION" '#{pane_pid}')"
-  client_pid="$(pgrep -P "$pane_pid" -f dbx-tui | head -n 1)"
+  client_pid="$(pgrep -P "$pane_pid" -f dbpane | head -n 1)"
   [ -n "$client_pid" ] || fail "client process not found"
   kill -"$sig" "$client_pid"
   wait_for "21-after-$sig" 'EXIT=[0-9]' 6

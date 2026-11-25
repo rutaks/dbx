@@ -3,6 +3,7 @@
 //! `select!` over the terminal's events, the reply channel and the app's
 //! next deadline; it draws only when an update asks for a repaint.
 
+pub mod cli;
 pub mod dump;
 pub mod export;
 pub mod kitty;
@@ -25,7 +26,7 @@ use crate::app::tree::{Level, Listing, NodeId};
 use crate::app::{App, Command, CoreCall, CoreReply, Effects, Event};
 use crate::core::{ConnectionId, Core, SessionId};
 
-pub use terminal::TerminalGuard;
+pub use terminal::{install_panic_hook, TerminalGuard};
 
 /// The Core calls in flight, by request, so the app can abandon one: aborting
 /// the task drops the Core's future, which is what stops a slow listing.
@@ -181,11 +182,12 @@ pub fn install_crypto_provider() {
 /// `prefs` is the layout preferences file (beside the store): read at the
 /// start, written when the layout changes. Without one the layout is the
 /// default and nothing is written.
-pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>) -> io::Result<Option<String>> {
+pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>, store: Option<crate::core::StoreInfo>) -> io::Result<Option<String>> {
     let mut guard = TerminalGuard::enter()?;
     let (tx, mut rx) = mpsc::unbounded_channel::<(RequestId, CoreReply)>();
     let mut events = EventStream::new();
     let mut app = App::new();
+    app.ui.store = store;
     app.ui.caps.keyboard_protocol = guard.keyboard_protocol;
     let syntax: Arc<dyn crate::core::Syntax> = core.clone();
     app.ui.syntax.set_handle(syntax);

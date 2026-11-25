@@ -7,6 +7,7 @@ mod dbx;
 mod dump;
 mod export;
 mod fake;
+mod store;
 
 use std::fmt;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 pub use dbx::{DbxCore, KeySource, StoreOptions};
+pub use store::{has_dbx_store, StoreChoice, StoreInfo, StoreKind, StoreSource};
 #[cfg(feature = "test-support")]
 pub use dbx::check_seed_dir;
 pub use dump::{DumpContent, DumpEnd, DumpFailure, DumpId, DumpProgress, DumpRequest, DumpSink, DumpStatus, Dumped, FileLeft};

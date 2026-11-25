@@ -1,6 +1,7 @@
-# dbx-tui
+# dbpane
 
-A terminal database client, built as another head on dbx's core. Plans and
+dbpane is a terminal database client, built as another head on dbx's core. The
+cargo package is `dbx-tui` (`crates/dbx-tui`); the binary is `dbpane`. Plans and
 decisions live in the dbx-tui docs repo; this crate is the code.
 
 Run it against a scratch store (never your real one while developing), from
@@ -10,15 +11,62 @@ the dbx workspace root:
 store="$(mktemp -d)"                                   # DBX_DATA_DIR must exist and be absolute
 openssl rand -hex 32 >"$store.key" && chmod 600 "$store.key"
 cargo build -p dbx-tui                                 # not under the scratch HOME: cargo needs yours
-HOME="$store" DBX_DATA_DIR="$store" DBX_SECRET_KEY_FILE="$store.key" target/debug/dbx-tui
+HOME="$store" DBX_DATA_DIR="$store" DBX_SECRET_KEY_FILE="$store.key" target/debug/dbpane
 ```
 
 `DBX_SECRET_KEY_FILE` (or `DBX_SECRET_KEY`, 64 hex characters) wins over every
 key policy, so the keychain is not touched; pointing `HOME` at the scratch
-directory keeps dbx from even looking for its per-user key file. Without
-`DBX_DATA_DIR` the client opens the desktop app's store
-(`~/Library/Application Support/com.dbx.app` on macOS) and its key from the
-login keychain.
+directory keeps dbx from even looking for its per-user key file.
+
+## The command line, the name and the store (slice 24a)
+
+`dbpane --help` lists the flags and environment variables and ends with the
+store in force; `dbpane --version` prints the version and the dbx commit it was
+built from (`build.rs`; `DBPANE_DBX_COMMIT` overrides it); `dbpane --licenses`
+prints `legal/NOTICE` (dbpane is a modified work of dbx, the fork's URL, herdr's
+theme attribution, dbx's own NOTICE), `legal/THIRD-PARTY.txt` (the direct
+dependencies and their licences; a test fails when one is missing) and
+`legal/LICENSE` (dbx's Apache-2.0). These three files go in the release archive.
+(The directory is `legal`, not `dist`: the repository's `.gitignore` ignores `dist/`.)
+
+**Which store.** In order (`StoreOptions::resolve`, `src/core/store.rs`):
+
+1. `--store dbx|own|<dir>`: the dbx desktop app's store, dbpane's own, or an
+   absolute directory that already exists.
+2. `DBX_DATA_DIR`, an absolute directory that already exists.
+3. dbpane's own store if it already holds a `dbx.db`
+   (`~/Library/Application Support/dbpane` on macOS, `$XDG_DATA_HOME/dbpane`
+   or `~/.local/share/dbpane` on Linux). Once made it stays the one in use,
+   even if the dbx desktop app is installed later.
+4. Else the dbx desktop app's store if its data directory holds a `dbx.db`
+   (`~/Library/Application Support/com.dbx.app` on macOS,
+   `$XDG_DATA_HOME/com.dbx.app` or `~/.local/share/com.dbx.app` on Linux): the
+   two share it, with the key dbx keeps in the keychain or Secret Service.
+5. Otherwise a new dbpane store in the directory of step 3.
+
+A relative `HOME` or `XDG_DATA_HOME` counts as unset. A named store
+(`--store <dir>`, `DBX_DATA_DIR`) that already has a `.dbx/secret.key` uses it
+(dbx's managed key policy) instead of the keychain.
+
+dbx fixes the keychain entry's service name (`com.dbx.app.secret-store.v1`) in
+a private constant, so an entry named `dbpane` needs a change in dbx. Until
+that is decided, dbpane's own store keeps its key in a file inside it,
+`.dbx/secret.key` (mode 0600, dbx's `ManagedDataDir` policy, the one dbx-web
+uses), and never touches the keychain; `DBX_SECRET_KEY_FILE` still wins. On
+Linux, dbx's platform policy with no Secret Service running (a headless box)
+falls back to a per-user key file instead of failing, and a Secret Service that
+exists but cannot be read stops with a message naming `DBX_SECRET_KEY_FILE`.
+
+With no connection saved, the results pane shows a welcome: what dbpane is, the
+store in use and its path, and the keys for adding a connection, help and quit
+(read from the live bindings; the mode bar offers the same as clickable hints).
+It is not drawn while the store is still answering (the first frame comes
+first) or when the store failed, and it goes once a connection exists.
+
+The release binary (`cargo build -p dbx-tui --release`, `target/release/dbpane`)
+runs every journey: `PROFILE=release bash crates/dbx-tui/tests/journeys/<name>.sh`.
+Under the release profile's `panic = "abort"` a panic still runs our hook, which
+restores the terminal and exits 101 before any abort.
 
 ## Capabilities (what a connection can do)
 
@@ -168,7 +216,7 @@ returns at once but does not stop its statement; dbx drops the connection when
 the statement ends. Giving the tab another target, or removing its connection,
 while a run is in flight leaves the same marker. Quitting while a statement may
 still be running prints, once the terminal is restored,
-`dbx-tui: A statement may still be running on <connection / database>.`
+`dbpane: A statement may still be running on <connection / database>.`
 
 ## Query tabs (slice 15b)
 
@@ -649,7 +697,7 @@ Without the protocol it asks for xterm's `modifyOtherKeys` (level 2), which tmux
 - **No setup needed:** `f5` runs, `ctrl+g` is the prefix, and in a terminal with
   the protocol every Ctrl binding works.
 - **kitty:** kitty keeps `cmd+enter`, `cmd+f`, `cmd+l`, `cmd+c` and others for
-  itself. `dbx-tui kitty-setup` prints the path of `extras/kitty/dbx-tui.conf`
+  itself. `dbpane kitty-setup` prints the path of `extras/kitty/dbx-tui.conf`
   and the one line to add to `kitty.conf` (`include <path>`; `--write` copies the
   file into kitty's configuration directory first). The file uses `map
   --when-focus-on var:dbx_tui <key>` for each key, and the client sets the user
@@ -960,9 +1008,9 @@ divider a column, `j`/`k` or down/up the split a row; `esc` or `enter` leaves.
 A drag is clamped to the limits wherever the pointer goes.
 
 **Preferences.** What the user set is kept as thousandths of the width and
-height (`sidebar_permille`, `editor_permille`) in `dbx-tui-prefs.json` in the
-directory the store lives in (`DbxCore::store_dir`: `DBX_DATA_DIR`, or the
-desktop app's directory). The shell reads it at the start and writes it
+height (`sidebar_permille`, `editor_permille`) in `dbpane-prefs.json` in the
+directory the store lives in (`DbxCore::store_dir`: whichever store is in use,
+see above). The shell reads it at the start and writes it
 (`Command::SavePrefs`, atomically) when a drag ends, a double-click resets, the
 resize mode is left, and on quit; `app` only holds the values
 (`Ui.layout`). A missing, unreadable or corrupt file, or a value that is not
@@ -981,8 +1029,13 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `export` (writes files in a scratch directory only), `dump` (dumps `pagila` into a scratch directory, cancels a dump of `edge`), `first-query`, `history`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `export` (writes files in a scratch directory only), `dump` (dumps `pagila` into a scratch directory, cancels a dump of `edge`), `first-query`, `first-run` (a scratch HOME with no dbx store; needs the fixtures), `history`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys against the release binary | `cargo build -p dbx-tui --release`, then the same loop with `PROFILE=release` in front (`PROFILE=release bash <journey>`) | as above |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
+
+A journey that passes removes its scratch directory and tmux socket from `/tmp`;
+set `JOURNEY_OUT=<dir>` to keep the captures (a failing journey always keeps
+them). `cli-flags` (`--version`, `--help`, `--licenses`) needs nothing external.
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live
 ones fail, saying so, when the fixtures are not up). Test helpers on the

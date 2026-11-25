@@ -1,4 +1,4 @@
-//! `dbx-tui kitty-setup`: where the kitty configuration that releases kitty's
+//! `dbpane kitty-setup`: where the kitty configuration that releases kitty's
 //! own Cmd shortcuts while this client has focus is, and the one line to add to
 //! `kitty.conf`. The file ships in `extras/kitty/dbx-tui.conf` and is also
 //! compiled in, so `--write` can put a copy in kitty's configuration directory
@@ -36,12 +36,12 @@ pub fn setup(write: bool, env: &dyn Fn(&str) -> Option<String>) -> Result<String
     } else {
         let path = shipped();
         if !path.exists() {
-            return Err("the shipped file is not on this machine: run `dbx-tui kitty-setup --write` to put a copy in kitty's configuration directory".into());
+            return Err("the shipped file is not on this machine: run `dbpane kitty-setup --write` to put a copy in kitty's configuration directory".into());
         }
         path
     };
     Ok(format!(
-        "{}\n\nAdd this line to kitty.conf, then restart kitty:\n\ninclude {}\n\nIt releases kitty's Cmd shortcuts (cmd+enter, cmd+f, cmd+l, ...) only while dbx-tui is the focused program.\n",
+        "{}\n\nAdd this line to kitty.conf, then restart kitty:\n\ninclude {}\n\nIt releases kitty's Cmd shortcuts (cmd+enter, cmd+f, cmd+l, ...) only while dbpane is the focused program.\n",
         if write { "Wrote the file:" } else { "The file:" },
         path.display()
     ))

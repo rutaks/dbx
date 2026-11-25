@@ -850,3 +850,46 @@ async fn the_operation_is_the_first_keyword_after_comments_like_the_desktops_and
     let e = found.entries.iter().find(|e| e.sql.starts_with("insert")).unwrap();
     assert_eq!(e.error.as_deref(), Some("line one\nline two"));
 }
+
+/// dbpane's own store keeps its key in `<store>/.dbx/secret.key` and never
+/// asks the keychain. Safe because: `Scratch` holds the process lock and
+/// points `HOME` at a scratch directory; the environment's key variables are
+/// removed (this is the one test that runs with none); and the options come
+/// from `StoreChoice::Own`, whose policy is dbx's `ManagedDataDir` (asserted
+/// via the key source), which reads only the file inside the store and never
+/// the keychain or the per-user key file.
+#[tokio::test]
+async fn dbpanes_own_store_makes_and_keeps_its_key_file_and_names_it_when_it_goes() {
+    use std::os::unix::fs::PermissionsExt;
+    use dbx_tui::core::{KeySource, StoreChoice};
+
+    let s = Scratch::new();
+    s.use_no_key();
+    std::env::remove_var("XDG_DATA_HOME");
+    let home = s.tmp.path().join("home");
+    let options = || {
+        let home = home.clone();
+        StoreOptions::resolve(&StoreChoice::Own, move |name| (name == "HOME").then(|| home.clone().into_os_string()), |_| false).unwrap()
+    };
+    let first = options();
+    assert_eq!(first.key_source, KeySource::StoreFile, "the own store's key is a file in the store");
+    assert!(first.data_dir.starts_with(&home), "{}", first.data_dir.display());
+    let dir = first.data_dir.clone();
+
+    let core = DbxCore::new(first);
+    let saved = core.save_connection(&draft("own")).await.expect("first run makes the store and its key");
+    let key = dir.join(".dbx/secret.key");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert!(key.is_file(), "the key file was made");
+    assert_eq!(mode(&key), 0o600);
+    assert_eq!(mode(&dir.join(".dbx")), 0o700);
+
+    let listed = DbxCore::new(options()).connections().await.expect("a second open reads the same key");
+    assert_eq!(listed, vec![saved]);
+
+    std::fs::remove_file(&key).unwrap();
+    let err = DbxCore::new(options()).connections().await.expect_err("the key is gone, the data is encrypted");
+    assert_eq!(err.kind, CoreErrorKind::Key, "{err:?}");
+    assert!(err.message.contains(".dbx/secret.key") && err.message.contains("DBX_SECRET_KEY_FILE"), "{}", err.message);
+    assert!(!err.message.contains(PASSWORD));
+}

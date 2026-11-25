@@ -1,0 +1,35 @@
+dbpane
+
+dbpane is a modified work of dbx (https://github.com/t8y2/dbx), distributed
+under the Apache License, Version 2.0 (see LICENSE). It is built from a fork of
+dbx, https://github.com/rutaks/dbx, branch dbx-tui.
+
+What changed from dbx: the fork adds one crate, crates/dbx-tui, which is the
+dbpane terminal client (a new head on dbx's core, beside the desktop app), and
+lists it as a member of the workspace in Cargo.toml (with the matching entries
+in Cargo.lock). No other dbx source file is modified. The dbx crates are used
+as libraries, unchanged.
+
+Theme: the colour roles and the default and terminal themes in
+crates/dbx-tui/src/app/theme.rs are derived from herdr
+(https://github.com/herdrdev/herdr), Apache-2.0, v0.9.5, commit ee5bfb5. The
+layout and look of the client follow herdr's.
+
+dbx's own NOTICE follows.
+
+----------------------------------------------------------------------------
+
+PL/SQL debugging contributions
+
+The PL/SQL debugger incorporates work by Ziyu Yang (yangziyu1230) from:
+https://github.com/yangziyu1230/dbx
+Oracle: 2b4b67eb668f685c9e1972b190abccd063191060 (upstream PR #12067)
+OceanBase Oracle: 1f0aed7f502997ac171e9f70f90619347ddc2767
+
+The DBMS_DEBUG call sequences were adapted by that contribution from OceanBase
+Developer Center (ODC V3.3.2.1), https://github.com/oceanbase/odc, Apache-2.0.
+DBX's integration replaces the persistent helper package with anonymous system
+package calls and adds shared desktop/Web session ownership and lifecycle handling.
+
+These contributions are distributed under the Apache License, Version 2.0.
+See LICENSE.

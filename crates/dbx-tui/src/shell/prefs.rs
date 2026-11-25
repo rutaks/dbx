@@ -1,5 +1,5 @@
 //! The preferences file: where the user left the dividers, kept beside the
-//! store as `dbx-tui-prefs.json`. The shell reads and writes it; `app` only
+//! store as `dbpane-prefs.json`. The shell reads and writes it; `app` only
 //! holds the values (`LayoutPrefs`).
 //!
 //! A missing, unreadable or corrupt file means the defaults, never an error
@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use crate::app::layout::LayoutPrefs;
 
 /// The file's name.
-pub const FILE: &str = "dbx-tui-prefs.json";
+pub const FILE: &str = "dbpane-prefs.json";
+
+/// The name it had before the product was named, still read as a fallback.
+pub const OLD_FILE: &str = "dbx-tui-prefs.json";
 
 /// Where the file lives for a store in `dir`.
 pub fn path_in(dir: &Path) -> PathBuf {
@@ -22,7 +25,16 @@ pub fn path_in(dir: &Path) -> PathBuf {
 
 /// The layout the file holds, or the defaults.
 pub fn load(path: &Path) -> LayoutPrefs {
-    let Ok(text) = std::fs::read_to_string(path) else { return LayoutPrefs::default() };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // Before dbpane had its name the file was `dbx-tui-prefs.json`: read
+        // it while the new one is absent. Only the new name is ever written.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match std::fs::read_to_string(path.with_file_name(OLD_FILE)) {
+            Ok(text) => text,
+            Err(_) => return LayoutPrefs::default(),
+        },
+        Err(_) => return LayoutPrefs::default(),
+    };
     parse(&text)
 }
 
@@ -72,6 +84,19 @@ mod tests {
         save(&path, &LayoutPrefs { sidebar: None, editor: Some(300) }).unwrap();
         assert_eq!(load(&path), LayoutPrefs { sidebar: None, editor: Some(300) });
         assert!(!path.with_extension("json.tmp").exists(), "no temporary file is left");
+    }
+
+    #[test]
+    fn the_old_file_name_is_read_when_the_new_one_is_absent_and_only_the_new_one_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+        let old = dir.path().join(OLD_FILE);
+        std::fs::write(&old, r#"{"sidebar_permille": 450, "editor_permille": 520}"#).unwrap();
+        assert_eq!(load(&path), LayoutPrefs { sidebar: Some(450), editor: Some(520) });
+        // Once the new file exists it wins, even over a different old one.
+        save(&path, &LayoutPrefs { sidebar: Some(300), editor: None }).unwrap();
+        assert_eq!(load(&path), LayoutPrefs { sidebar: Some(300), editor: None });
+        assert!(std::fs::read_to_string(&old).unwrap().contains("450"), "the old file is left alone");
     }
 
     #[test]

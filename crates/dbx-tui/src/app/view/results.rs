@@ -75,6 +75,10 @@ pub(super) fn draw(app: &mut App, p: &Painter, buf: &mut Buffer, area: Rect) {
             draw_error(&p, buf, area, error)
         }
         None if used > 0 => {}
+        // No connection is saved: the first-run welcome stands in for the hint.
+        None if matches!(&model.connections, crate::app::Loadable::Ready(list) if list.is_empty()) => {
+            super::welcome::draw(&ui.keys, ui.store.as_ref(), &p, buf, area);
+        }
         None => {
             p.put(buf, area.x, area.y, &hint, p.fg(Role::Overlay0));
         }

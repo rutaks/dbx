@@ -27,6 +27,30 @@ static MODIFY_OTHER_ON: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Set once the kitty user variable was written.
 static USER_VAR_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set once the terminal is in the client's mode; a panic before that has
+/// nothing to restore.
+static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes a panic anywhere end the process with code 101, after putting the
+/// terminal back if it was entered. Call it at the top of `main`: a panic in a
+/// spawned task would otherwise leave the main loop running, and a panic
+/// before the terminal is entered would otherwise unwind through `main` to
+/// Rust's own exit code. Installed once; later calls do nothing.
+pub fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+                restore_extras();
+                let _ = ratatui::try_restore();
+            }
+            previous(info);
+            std::process::exit(101);
+        }));
+    });
+}
+
 /// The user variable kitty's `map --when-focus-on var:dbx_tui` looks at.
 pub const USER_VAR: &str = "dbx_tui";
 
@@ -48,18 +72,11 @@ fn in_kitty() -> bool {
 
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
+        // Ours first, so ratatui's hook (installed by `try_init`, which
+        // restores raw mode and the screen) runs ahead of it.
+        install_panic_hook();
         let terminal = ratatui::try_init()?; // raw mode, alternate screen, restoring panic hook
-        // Chain our own restore ahead of ratatui's hook, so a panic also
-        // switches mouse and paste reporting off before the message prints.
-        // Then end the process: a panic inside a spawned task would otherwise
-        // leave the main loop running against a terminal that is already
-        // restored.
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            restore_extras();
-            previous(info);
-            std::process::exit(101);
-        }));
+        ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
         execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
         // Asked once, now: it reads the terminal's answer, which must not race
         // the event stream. Disambiguated keys give Cmd (as SUPER), Ctrl+Enter
@@ -108,6 +125,7 @@ fn modify_other_keys_is_safe() -> bool {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        ENTERED.store(false, std::sync::atomic::Ordering::SeqCst);
         restore_extras();
         let _ = ratatui::try_restore();
     }
