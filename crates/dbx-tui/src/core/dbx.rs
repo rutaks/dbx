@@ -179,6 +179,8 @@ pub struct DbxCore {
     /// Sessions closed: a run's wait for its session (`wait_for_session`)
     /// must not open one of them again.
     closed_sessions: std::sync::Mutex<std::collections::HashSet<SessionId>>,
+    /// Sessions in which a `USE` has been sent (`SwitchedSessions`).
+    switched: SwitchedSessions,
 }
 
 /// The most early cancels remembered. A cancel for a run that has already
@@ -197,13 +199,13 @@ async fn blocking<T: Send + 'static>(fut: impl std::future::Future<Output = T> +
 
 impl DbxCore {
     pub fn new(options: StoreOptions) -> Self {
-        DbxCore { options: Ok(options), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default() }
+        DbxCore { options: Ok(options), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default(), switched: Default::default() }
     }
 
     /// The client's DbxCore: the store named by the environment. If that
     /// cannot be worked out, every call fails with the reason.
     pub fn from_env() -> Self {
-        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default() }
+        DbxCore { options: StoreOptions::from_env(), state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy: SecretKeyPolicy::PlatformDefault, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default(), switched: Default::default() }
     }
 
     /// Keys only from the environment or the data directory, never the OS
@@ -407,6 +409,19 @@ impl DbxCore {
             // A type that can be browsed, or no such connection (dbx says so itself).
             _ => Ok(()),
         }
+    }
+
+    /// The connection `id` as saved in the store right now. Loading decrypts
+    /// every saved secret: they stay in the returned config, which the gate
+    /// only reads flags from, and a failure is the store's error without
+    /// them.
+    async fn saved_config(&self, state: &AppState, id: &str) -> Result<Option<ConnectionConfig>, CoreError> {
+        let saved = state
+            .storage
+            .load_connections()
+            .await
+            .map_err(|raw| self.store_failure("re-read the saved connections before a write", &raw))?;
+        Ok(saved.into_iter().find(|c| c.id == id))
     }
 
     fn store_failure(&self, doing: &str, raw: &str) -> CoreError {
@@ -666,6 +681,7 @@ fn to_connection(c: &ConnectionConfig) -> Connection {
         username: display_safe(&c.username),
         tls: c.ssl,
         production: c.is_production,
+        production_databases: c.production_databases.iter().map(|d| display_safe(d)).collect(),
         query_timeout: query_timeout(c),
     }
 }
@@ -932,6 +948,257 @@ fn rerun_of(sql: &str, database_type: DatabaseType) -> Rerun {
         dbx_core::sql_risk::ReadProof::ProvenReadOnly => Rerun::Proven,
         dbx_core::sql_risk::ReadProof::Unproven => Rerun::ReadOnlyUnproven,
     }
+}
+
+/// Why a statement must wait for a yes, before the names of the connection
+/// and the confirmation are added (`Assessment`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Verdict {
+    production: bool,
+    reasons: Vec<Reason>,
+    named: Vec<String>,
+    target_unknown: bool,
+}
+
+/// The gate (slice 17): whether `sql`, about to run on `database` of the
+/// connection `config`, needs the user's yes, and why. `None` runs it.
+///
+/// 1. Anything but a read (a parse failure counts as a write) that dbx's
+///    `targets_production_database` says reaches production. No setting
+///    turns this off.
+/// 2. A read dbx cannot prove read-only (`prove_read_only_for_database`:
+///    it calls functions dbx cannot vouch for) on production. Stricter than
+///    the desktop app, which lets every read through.
+/// 3. What dbx's `is_dangerous_sql_for_database` flags, when the request
+///    has not turned the check off.
+///
+/// A write on a `read_only` connection is let through to dbx, which refuses
+/// it with its own error: asking first would only offer a yes that fails.
+fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerous: bool, switched: bool) -> Option<Verdict> {
+    use dbx_core::production_safety::{is_production_database, targets_production_database};
+    use dbx_core::sql_risk::{classify_sql_risk_for_database, is_dangerous_sql_for_database, prove_read_only_for_database, ReadProof, SqlRisk};
+    let db_type = config.db_type;
+    // `EXPLAIN ANALYZE` executes the statement it explains: that statement is
+    // judged too.
+    let inner = explain_analyze_inner(sql);
+    if config.read_only && [Some(sql), inner.as_deref()].into_iter().flatten().any(|s| dbx_core::query_execution_sql::is_write_sql_for_database(s, db_type)) {
+        return None;
+    }
+    let first_of = |text: &str| match classify_sql_risk_for_database(text, db_type) {
+        Err(_) => Some(Reason::Unparsed),
+        Ok(SqlRisk::Write) => Some(Reason::Writes),
+        Ok(SqlRisk::Ddl) => Some(Reason::ChangesSchema),
+        Ok(SqlRisk::Transaction) => Some(Reason::TransactionControl),
+        Ok(SqlRisk::ReadOnly) => match prove_read_only_for_database(text, db_type) {
+            ReadProof::ProvenReadOnly => None,
+            ReadProof::Unproven => Some(Reason::Unproven),
+        },
+    };
+    let mut first = first_of(sql);
+    let mut lead = Vec::new();
+    if let Some(inner) = &inner {
+        let inner_first = first_of(inner);
+        if matches!(first, None | Some(Reason::Unproven)) {
+            first = inner_first;
+        }
+        if inner_first.is_some() {
+            lead.push(Reason::ExplainRuns);
+        }
+    }
+    // A `USE` is named for what it does, not for "it writes data".
+    let switches = switches_database(sql);
+    if switches && only_switches(sql) {
+        first = Some(Reason::SwitchesDatabase);
+    }
+    let dangerous = is_dangerous_sql_for_database(sql, db_type) || inner.as_deref().is_some_and(|i| is_dangerous_sql_for_database(i, db_type));
+    // A session that has switched database may be anywhere the connection
+    // lists as production: judged against the tab's database, a write would
+    // pass. Whatever is not proven read-only is aimed at production.
+    let listed = config.is_production || !config.production_databases.is_empty();
+    let by_sql = first.is_some() && targets_production_database(config, database, sql);
+    let by_session = first.is_some() && !by_sql && switched && listed;
+    let production = by_sql || by_session;
+    let mut reasons = lead;
+    if production {
+        reasons.extend(first);
+        if switches && first != Some(Reason::SwitchesDatabase) {
+            reasons.push(Reason::SwitchesDatabase);
+        }
+        if dangerous {
+            reasons.push(Reason::Dangerous);
+        }
+        if by_session {
+            reasons.push(Reason::SessionSwitched);
+        }
+    } else if dangerous && confirm_dangerous {
+        if first == Some(Reason::Unparsed) {
+            reasons.push(Reason::Unparsed);
+        }
+        reasons.push(Reason::Dangerous);
+    } else {
+        return None;
+    }
+    // The target was found through the SQL: say which marked databases it
+    // names, asking dbx one marked name at a time. A name no database has
+    // tells whether dbx could not work out the target at all.
+    let (mut named, mut target_unknown) = (Vec::new(), false);
+    if by_sql && !is_production_database(config, database) {
+        let only = |name: &str| {
+            let mut one = config.clone();
+            one.is_production = false;
+            one.production_databases = vec![name.to_string()];
+            targets_production_database(&one, database, sql)
+        };
+        target_unknown = only("\u{1}dbx-tui: no such database");
+        if !target_unknown {
+            named = config.production_databases.iter().filter(|d| only(d)).map(|d| display_safe(d)).collect();
+        }
+    }
+    Some(Verdict { production, reasons, named, target_unknown })
+}
+
+/// The gate on a run: `Err` with what the user is asked, unless `statement`
+/// needs no yes, or the request carries a yes for exactly this statement,
+/// connection, `database` and session. A yes for anything else asks again.
+fn gate(config: &ConnectionConfig, request: &RunRequest, statement: &str, database: &str, switched: bool) -> Result<(), Box<Assessment>> {
+    let this = Confirmation {
+        statement: statement.to_string(),
+        connection: request.connection.clone(),
+        database: database.to_string(),
+        session: request.session,
+    };
+    let verdict = assess(config, database, statement, request.confirm_dangerous, switched);
+    let mut verdict = match (&request.confirmation, verdict) {
+        (Some(yes), _) if *yes == this => return Ok(()),
+        (None, None) => return Ok(()),
+        (None, Some(v)) => v,
+        // A yes given for something else: the client's view is out of date,
+        // so it is asked again, whatever this statement is.
+        (Some(_), v) => {
+            let production = dbx_core::production_safety::is_production_database(config, database);
+            let mut v = v.unwrap_or(Verdict { production, reasons: Vec::new(), named: Vec::new(), target_unknown: false });
+            v.reasons.push(Reason::Changed);
+            v
+        }
+    };
+    verdict.reasons.dedup();
+    Err(Box::new(Assessment {
+        production: verdict.production,
+        reasons: verdict.reasons,
+        named: verdict.named,
+        target_unknown: verdict.target_unknown,
+        connection_name: display_safe(&config.name),
+        confirmation: this,
+    }))
+}
+
+/// The statements of `sql`, comments gone (MySQL's executable comments
+/// opened), split at `;`. A `;` inside a literal splits it too: that can only
+/// make the checks below see more, never less.
+fn statements_of(sql: &str) -> Vec<String> {
+    dbx_core::query_execution_sql::strip_sql_comments(sql)
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The first word of a statement, as written.
+fn first_word(statement: &str) -> &str {
+    let end = statement.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(statement.len());
+    &statement[..end]
+}
+
+/// Whether any statement of `sql` begins with `USE`: it switches the
+/// session's database (MySQL, SQL Server and kin), and the switch lasts.
+fn switches_database(sql: &str) -> bool {
+    statements_of(sql).iter().any(|s| first_word(s).eq_ignore_ascii_case("use"))
+}
+
+/// Whether dbx proves `sql` (and what an `EXPLAIN ANALYZE` of it runs)
+/// read-only, and it switches nothing: the statements that need no second
+/// look at the saved flags.
+fn proven_read_only(sql: &str, db_type: DatabaseType) -> bool {
+    use dbx_core::sql_risk::{classify_sql_risk_for_database, prove_read_only_for_database, ReadProof, SqlRisk};
+    let proven = |text: &str| {
+        matches!(classify_sql_risk_for_database(text, db_type), Ok(SqlRisk::ReadOnly))
+            && prove_read_only_for_database(text, db_type) == ReadProof::ProvenReadOnly
+    };
+    !switches_database(sql) && (proven(sql) || explain_analyze_inner(sql).is_some_and(|inner| proven(&inner)))
+}
+
+/// Whether every statement of `sql` is a `USE`.
+fn only_switches(sql: &str) -> bool {
+    let all = statements_of(sql);
+    !all.is_empty() && all.iter().all(|s| first_word(s).eq_ignore_ascii_case("use"))
+}
+
+/// The sessions in which a statement that switches the database has run. A
+/// `USE` lasts in the session, but the gate judges a run against the tab's
+/// database: for such a session, on a connection that lists a production
+/// database, nothing not proven read-only is assumed to be elsewhere.
+#[derive(Default)]
+struct SwitchedSessions(std::sync::Mutex<std::collections::HashSet<SessionId>>);
+
+impl SwitchedSessions {
+    /// `sql` is about to be sent in `session`.
+    fn note(&self, session: SessionId, sql: &str) {
+        if switches_database(sql) {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).insert(session);
+        }
+    }
+    fn contains(&self, session: SessionId) -> bool {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).contains(&session)
+    }
+    /// The session is closed: a new one starts where the tab's database is.
+    fn forget(&self, session: SessionId) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(&session);
+    }
+}
+
+/// The statement an `EXPLAIN` with `ANALYZE` in any option form will run:
+/// `explain analyze s`, `explain (analyze) s`, `explain (analyze true,
+/// verbose) s`, `explain analyze verbose s`, MySQL's `explain analyze
+/// format=tree s`. `None` when it is not an EXPLAIN, or has no ANALYZE (or
+/// `analyze false`).
+fn explain_analyze_inner(sql: &str) -> Option<String> {
+    let stripped = dbx_core::query_execution_sql::strip_sql_comments(sql);
+    let mut rest = stripped.trim_start();
+    let word = first_word(rest);
+    if !word.eq_ignore_ascii_case("explain") {
+        return None;
+    }
+    rest = rest[word.len()..].trim_start();
+    let mut analyze = false;
+    loop {
+        if let Some(open) = rest.strip_prefix('(') {
+            let (options, after) = open.split_once(')')?;
+            for option in options.split(',') {
+                let mut parts = option.split_whitespace();
+                let name = parts.next().unwrap_or("").to_ascii_lowercase();
+                if name == "analyze" || name == "analyse" {
+                    analyze = !matches!(parts.next().map(str::to_ascii_lowercase).as_deref(), Some("false" | "off" | "0"));
+                }
+            }
+            rest = after.trim_start();
+            continue;
+        }
+        let word = first_word(rest);
+        match word.to_ascii_lowercase().as_str() {
+            "analyze" | "analyse" => analyze = true,
+            "verbose" => {}
+            "format" => {
+                // `format=tree`, `format = json`
+                let after = rest[word.len()..].trim_start().strip_prefix('=')?.trim_start();
+                rest = &after[first_word(after).len()..];
+                rest = rest.trim_start();
+                continue;
+            }
+            _ => break,
+        }
+        rest = rest[word.len()..].trim_start();
+    }
+    (analyze && !rest.is_empty()).then(|| rest.to_string())
 }
 
 /// One cell as text. dbx sends numbers it cannot hold exactly as strings
@@ -1428,6 +1695,24 @@ impl Core for DbxCore {
             return Err(CoreError::new(CoreErrorKind::Other, "There is no statement at the cursor to run."));
         }
         let database = request.database.clone().filter(|d| !d.is_empty()).or_else(|| config.database.clone()).unwrap_or_default();
+        // The gate (slice 17), on the exact text about to be sent, with the
+        // config as it is now (the desktop app can change the flags).
+        // Nothing reaches dbx without the matching yes.
+        let switched = self.switched.contains(request.session);
+        let mut gated = gate(&config, &request, &statement, &database, switched);
+        // A flag set in the desktop while this client runs is not in the
+        // runtime copy. Before letting through anything not proven
+        // read-only, look at the saved connection once more. A statement
+        // already confirmed for this exact target has been asked about.
+        if gated.is_ok() && request.confirmation.is_none() && !proven_read_only(&statement, config.db_type) {
+            if let Some(saved) = self.saved_config(&state, &request.connection.0).await? {
+                gated = gate(&saved, &request, &statement, &database, switched);
+            }
+        }
+        gated.map_err(|a| CoreError::needs_confirmation(*a))?;
+        // From here the statement is sent: a switch of database lasts in the
+        // session, and the gate remembers it.
+        self.switched.note(request.session, &statement);
         let session = session_id(request.session);
         let registered = {
             let mut early = self.early_cancels.lock().unwrap_or_else(|p| p.into_inner());
@@ -1517,6 +1802,7 @@ impl Core for DbxCore {
         // Before the close, so a run's wait for this session (which could
         // otherwise open it again) sees it is gone.
         self.closed_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(session);
+        self.switched.forget(session);
         state
             .close_client_session_pool(&at.connection.0, Some(self.database_name(&at.connection, &at.database).await.as_str()).filter(|d| !d.is_empty()), &session_id(session))
             .await
@@ -1680,6 +1966,8 @@ mod tests {
             cursor: Cursor { row, col },
             selection: None,
             row_cap: 1000,
+            confirm_dangerous: true,
+            confirmation: None,
         }
     }
 
@@ -2070,5 +2358,289 @@ mod tests {
         assert!(refs.columns.iter().any(|c| c.name == "title" && c.qualifier.as_deref() == Some("f")), "{:?}", refs.columns);
         assert!(refs.scopes.iter().any(|(_, parent)| parent.is_none()));
         assert!(references_for(&DbKind::Postgres, "select a from film f join").is_err(), "a half-typed statement does not parse");
+    }
+
+    // ---- the gate (slice 17) ---------------------------------------------------
+
+    /// A Postgres connection config: marked production or not, with these
+    /// databases marked, and maybe read-only.
+    fn config(production: bool, marked: &[&str], read_only: bool) -> ConnectionConfig {
+        let value = serde_json::json!({
+            "id": "c", "name": "prod pg", "db_type": "postgres", "host": "h", "port": 5432,
+            "username": "u", "password": "", "database": "edge", "ssl": false, "driver_profile": null,
+            "is_production": production, "production_databases": marked, "read_only": read_only,
+        });
+        serde_json::from_value(value).expect("a config")
+    }
+
+    fn production() -> ConnectionConfig {
+        config(true, &[], false)
+    }
+
+    fn plain() -> ConnectionConfig {
+        config(false, &[], false)
+    }
+
+    /// The reasons asked about, or `None` when it runs.
+    fn asked(config: &ConnectionConfig, database: &str, sql: &str, setting: bool) -> Option<(bool, Vec<Reason>)> {
+        assess(config, database, sql, setting, false).map(|v| (v.production, v.reasons))
+    }
+
+    #[test]
+    fn a_proven_select_runs_on_production() {
+        assert_eq!(asked(&production(), "edge", "select 1", true), None);
+        assert_eq!(asked(&production(), "edge", "select * from t where id = 1", false), None);
+    }
+
+    #[test]
+    fn a_select_calling_a_function_dbx_cannot_prove_is_confirmed_on_production_only() {
+        // A function dbx knows nothing of: read-only to its classifier, not proven.
+        assert_eq!(asked(&production(), "edge", "select my_func(1)", true), Some((true, vec![Reason::Unproven])));
+        assert_eq!(asked(&plain(), "edge", "select my_func(1)", true), None);
+    }
+
+    #[test]
+    fn dbx_calls_terminating_a_backend_a_dangerous_write() {
+        // The slice expected "functions not proven"; dbx knows this one and says more.
+        let terminate = "select pg_terminate_backend(1)";
+        assert_eq!(asked(&production(), "edge", terminate, false), Some((true, vec![Reason::Writes, Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", terminate, true), Some((false, vec![Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", terminate, false), None);
+    }
+
+    #[test]
+    fn a_scoped_delete_is_confirmed_on_production_and_runs_elsewhere() {
+        assert_eq!(asked(&production(), "edge", "delete from t where id = 1", true), Some((true, vec![Reason::Writes])));
+        assert_eq!(asked(&production(), "edge", "delete from t where id = 1", false), Some((true, vec![Reason::Writes])), "no setting turns it off");
+        assert_eq!(asked(&plain(), "edge", "delete from t where id = 1", true), None);
+    }
+
+    #[test]
+    fn an_unscoped_delete_outside_production_follows_the_setting() {
+        assert_eq!(asked(&plain(), "edge", "delete from t", true), Some((false, vec![Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", "delete from t", false), None);
+        // On production it is asked either way, and says both.
+        assert_eq!(asked(&production(), "edge", "delete from t", false), Some((true, vec![Reason::Writes, Reason::Dangerous])));
+    }
+
+    #[test]
+    fn ddl_outside_production_is_dangerous() {
+        assert_eq!(asked(&plain(), "edge", "drop table t", true), Some((false, vec![Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", "create table t (a int)", true), Some((false, vec![Reason::Dangerous])), "unlike the desktop's regex");
+        assert_eq!(asked(&production(), "edge", "drop table t", true), Some((true, vec![Reason::ChangesSchema, Reason::Dangerous])));
+    }
+
+    #[test]
+    fn transaction_control_is_confirmed_on_production() {
+        // dbx also flags transaction control dangerous, so outside production
+        // it follows the setting.
+        assert_eq!(asked(&production(), "edge", "commit", false), Some((true, vec![Reason::TransactionControl, Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", "commit", true), Some((false, vec![Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", "commit", false), None);
+    }
+
+    #[test]
+    fn dbx_flags_set_dangerous_so_it_follows_the_setting_outside_production() {
+        let set = "set search_path to public";
+        assert_eq!(asked(&plain(), "edge", set, true).map(|(p, r)| (p, r.contains(&Reason::Dangerous))), Some((false, true)));
+        assert_eq!(asked(&plain(), "edge", set, false), None);
+    }
+
+    #[test]
+    fn what_dbx_cannot_parse_is_a_write() {
+        // dbx's classifier falls back to keywords rather than fail, and
+        // calls it a write; its danger test fails closed.
+        assert_eq!(asked(&production(), "edge", "delet from t", false), Some((true, vec![Reason::Writes, Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", "delet from t", true), Some((false, vec![Reason::Dangerous])));
+    }
+
+    #[test]
+    fn a_database_marked_production_is_confirmed_only_when_it_is_the_target() {
+        let marked = config(false, &["edge"], false);
+        let sql = "update t set a = 1 where id = 1";
+        assert_eq!(asked(&marked, "edge", sql, true), Some((true, vec![Reason::Writes])));
+        assert_eq!(asked(&marked, "pagila", sql, true), None);
+    }
+
+    #[test]
+    fn a_marked_database_named_in_the_sql_is_named_in_the_verdict() {
+        // On Postgres `edge.t` is a schema: a statement reaches only the
+        // database it runs on.
+        let marked = config(false, &["edge", "other"], false);
+        assert_eq!(asked(&marked, "pagila", "delete from edge.t where id = 1", true), None);
+        // On MySQL it is a database.
+        let mut mysql = marked.clone();
+        mysql.db_type = DatabaseType::Mysql;
+        let v = assess(&mysql, "staging", "delete from edge.t where id = 1", true, false).expect("asked");
+        assert!(v.production);
+        assert_eq!((v.named, v.target_unknown), (vec!["edge".to_string()], false));
+        assert_eq!(asked(&mysql, "staging", "delete from staging.t where id = 1", true), None);
+    }
+
+    #[test]
+    fn generated_browse_selects_run_on_production() {
+        let key = vec!["film_id".to_string()];
+        assert_eq!(asked(&production(), "pagila", &page_sql_for(&DbKind::Postgres, &film(), &key, 1000, 1000), true), None);
+        assert_eq!(asked(&production(), "pagila", &count_sql_for(&DbKind::Postgres, &film()), true), None);
+    }
+
+    #[test]
+    fn a_write_on_a_read_only_connection_is_left_to_dbx_to_refuse() {
+        assert_eq!(asked(&config(true, &[], true), "edge", "delete from t where id = 1", true), None);
+        assert_eq!(asked(&config(false, &[], true), "edge", "drop table t", true), None);
+    }
+
+    fn mysql(production: bool, marked: &[&str]) -> ConnectionConfig {
+        let mut c = config(production, marked, false);
+        c.db_type = DatabaseType::Mysql;
+        c
+    }
+
+    fn asked_after_use(config: &ConnectionConfig, database: &str, sql: &str) -> Option<(bool, Vec<Reason>)> {
+        assess(config, database, sql, true, true).map(|v| (v.production, v.reasons))
+    }
+
+    #[test]
+    fn a_use_names_what_it_does_not_that_it_writes() {
+        let c = mysql(false, &["prod"]);
+        assert_eq!(asked(&c, "staging", "use prod", true), Some((true, vec![Reason::SwitchesDatabase])));
+        assert_eq!(asked(&c, "staging", "USE `prod`;", true), Some((true, vec![Reason::SwitchesDatabase])));
+        // Into a database not marked, nothing is asked: the session is tracked instead.
+        assert_eq!(asked(&c, "staging", "use other", true), None);
+        // With more after it, the rest is judged as well.
+        let both = asked(&c, "staging", "use prod; delete from t where id = 1", true).expect("asked");
+        assert!(both.1.contains(&Reason::SwitchesDatabase) && both.1.contains(&Reason::Writes), "{both:?}");
+    }
+
+    #[test]
+    fn in_a_session_that_switched_database_anything_not_proven_is_aimed_at_production() {
+        let c = mysql(false, &["prod"]);
+        let sql = "delete from t where id = 1";
+        assert_eq!(asked(&c, "staging", sql, true), None, "before any USE, it is judged on the tab's database");
+        assert_eq!(asked_after_use(&c, "staging", sql), Some((true, vec![Reason::Writes, Reason::SessionSwitched])));
+        assert_eq!(asked_after_use(&c, "staging", "select 1"), None, "a proven read is not held up");
+        assert_eq!(asked_after_use(&c, "staging", "select my_func(1)"), Some((true, vec![Reason::Unproven, Reason::SessionSwitched])));
+        assert_eq!(asked_after_use(&c, "staging", "commit").map(|a| a.0), Some(true));
+        // A connection with no production database has nothing to be moved onto.
+        assert_eq!(asked_after_use(&mysql(false, &[]), "staging", sql), None);
+        // A connection marked production is production whatever the session did.
+        assert_eq!(asked_after_use(&mysql(true, &[]), "staging", sql), Some((true, vec![Reason::Writes])));
+    }
+
+    #[test]
+    fn what_switches_the_database_is_seen_in_any_statement_of_the_text() {
+        for yes in ["use prod", "USE prod", "  use `prod`", "/* hi */ use prod", "-- x\nuse prod", "select 1; use prod", "select 1;\n  Use [prod]", "/*!40101 use prod */"] {
+            assert!(switches_database(yes), "{yes}");
+        }
+        for no in ["select 1", "select 'use prod'", "-- use prod\nselect 1", "update t set a = 1", "select * from users", "useless", "select 1; select 2"] {
+            assert!(!switches_database(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_session_is_marked_when_a_switch_is_sent_and_stays_marked_until_it_closes() {
+        let (a, b) = (SessionId { tab: TabId(1), serial: 1 }, SessionId { tab: TabId(1), serial: 2 });
+        let marks = SwitchedSessions::default();
+        marks.note(a, "select 1");
+        assert!(!marks.contains(a));
+        marks.note(a, "select 1; use prod");
+        marks.note(a, "select 2");
+        assert!(marks.contains(a), "stays");
+        assert!(!marks.contains(b), "another session of the tab is unaffected");
+        marks.forget(a);
+        assert!(!marks.contains(a));
+    }
+
+    #[test]
+    fn the_gate_asks_for_a_write_in_a_switched_session_and_a_yes_for_it_runs() {
+        let c = mysql(false, &["prod"]);
+        let sql = "delete from t where id = 1";
+        assert_eq!(gate(&c, &whole(sql), sql, "staging", false), Ok(()));
+        let a = gate(&c, &whole(sql), sql, "staging", true).expect_err("asked");
+        assert!(a.production);
+        assert_eq!(a.reasons, [Reason::Writes, Reason::SessionSwitched]);
+    }
+
+    #[test]
+    fn explain_analyze_is_judged_as_the_statement_it_runs() {
+        for form in [
+            "explain analyze delete from t where id = 1",
+            "explain (analyze) delete from t where id = 1",
+            "explain (analyze true, verbose) delete from t where id = 1",
+            "explain (format json, analyze on) delete from t where id = 1",
+            "explain analyze verbose delete from t where id = 1",
+            "/* c */ explain analyze delete from t where id = 1",
+        ] {
+            assert_eq!(asked(&production(), "edge", form, true), Some((true, vec![Reason::ExplainRuns, Reason::Writes])), "{form}");
+            assert_eq!(asked(&plain(), "edge", form, true), None, "scoped, not production: {form}");
+        }
+        // dbx's parser does not take the ANALYSE spelling, so it also calls it dangerous.
+        assert_eq!(
+            asked(&production(), "edge", "EXPLAIN ANALYSE delete from t where id = 1", true),
+            Some((true, vec![Reason::ExplainRuns, Reason::Writes, Reason::Dangerous]))
+        );
+        // Not production: the inner statement's danger counts.
+        assert_eq!(asked(&plain(), "edge", "explain analyze delete from t", true), Some((false, vec![Reason::ExplainRuns, Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", "explain (analyze) drop table t", true), Some((false, vec![Reason::ExplainRuns, Reason::Dangerous])));
+        assert_eq!(asked(&plain(), "edge", "explain analyze delete from t", false), None, "the setting still turns it off");
+    }
+
+    #[test]
+    fn explain_without_analyze_and_explain_analyze_of_a_read_run() {
+        for form in [
+            "explain delete from t where id = 1",
+            "explain (analyze false) delete from t",
+            "explain (analyze off, verbose) delete from t",
+            "explain (verbose) delete from t",
+            "explain analyze select 1",
+            "explain (analyze) select * from t where id = 1",
+        ] {
+            assert_eq!(asked(&plain(), "edge", form, true), None, "{form}");
+        }
+        assert_eq!(asked(&production(), "edge", "explain (analyze) select 1", true), None);
+        assert_eq!(asked(&production(), "edge", "explain analyze select my_func(1)", true).map(|a| a.1), Some(vec![Reason::ExplainRuns, Reason::Unproven]));
+        assert_eq!(explain_analyze_inner("explain (analyze) delete from t").as_deref(), Some("delete from t"));
+        assert_eq!(explain_analyze_inner("explain delete from t"), None);
+    }
+
+    fn whole(sql: &str) -> RunRequest {
+        let end = Cursor { row: 0, col: sql.chars().count() };
+        RunRequest { connection: ConnectionId("c".into()), database: Some("edge".into()), selection: Some((Cursor::default(), end)), ..request(sql, 0, 0) }
+    }
+
+    fn yes(sql: &str) -> Confirmation {
+        Confirmation { statement: sql.into(), connection: ConnectionId("c".into()), database: "edge".into(), session: SessionId { tab: TabId(1), serial: 1 } }
+    }
+
+    #[test]
+    fn the_gate_refuses_without_a_yes_and_names_what_a_yes_must_send() {
+        let sql = "delete from t where id = 1";
+        let a = gate(&production(), &whole(sql), sql, "edge", false).expect_err("asked");
+        assert!(a.production);
+        assert_eq!(a.reasons, [Reason::Writes]);
+        assert_eq!(a.connection_name, "prod pg");
+        assert_eq!(a.confirmation, yes(sql));
+        assert_eq!(gate(&production(), &whole("select 1"), "select 1", "edge", false), Ok(()));
+    }
+
+    #[test]
+    fn a_yes_counts_only_for_the_exact_statement_connection_database_and_session() {
+        let sql = "delete from t where id = 1";
+        let sent = |confirmation: Confirmation, statement: &str| {
+            let request = RunRequest { confirmation: Some(confirmation), ..whole(statement) };
+            gate(&production(), &request, statement, "edge", false)
+        };
+        assert_eq!(sent(yes(sql), sql), Ok(()));
+        let other = "delete from t where id = 2";
+        let a = sent(yes(sql), other).expect_err("a yes for id = 1 does not run id = 2");
+        assert!(a.reasons.contains(&Reason::Changed), "{:?}", a.reasons);
+        assert_eq!(a.confirmation.statement, other);
+        let moved = Confirmation { session: SessionId { tab: TabId(1), serial: 2 }, ..yes(sql) };
+        assert!(sent(moved, sql).is_err(), "another session");
+        assert!(sent(Confirmation { database: "pagila".into(), ..yes(sql) }, sql).is_err(), "another database");
+        assert!(sent(Confirmation { connection: ConnectionId("d".into()), ..yes(sql) }, sql).is_err(), "another connection");
+        // A stale yes asks again even where no yes would be needed.
+        let a = sent(yes(sql), "select 1").expect_err("asks again");
+        assert_eq!(a.reasons, [Reason::Changed]);
     }
 }

@@ -335,6 +335,8 @@ fn run_request(id: &ConnectionId, database: &str, tab: u32, buffer: &str) -> Run
         cursor,
         selection: None,
         row_cap: DEFAULT_ROW_CAP,
+        confirm_dangerous: false, // The gate has its own tests (slice 17).
+        confirmation: None,
     }
 }
 
@@ -1407,4 +1409,197 @@ async fn a_table_named_with_quotes_and_a_second_statement_opens_as_one_statement
     assert!(is_one_statement(&count), "one statement: {count}");
     let counted = core.run(RunId(rand_id()), run_request(&id, "edge", 2, &count)).await.unwrap_or_else(|e| panic!("{count}: {e}"));
     assert_eq!(flat(&counted.rows), vec![Some("1".into())], "{count}");
+}
+
+// ---- slice 17: confirmations ------------------------------------------------------
+
+/// `psql` on `edge` in the fixture container: its output, rows on lines.
+fn psql_edge(sql: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args(["exec", "dbxtui-fixtures-postgres-1", "psql", "-U", "postgres", "-d", "edge", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-tA", "-c", sql])
+        .output()
+        .expect("docker exec psql");
+    assert!(out.status.success(), "psql: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A scratch schema on `edge`, `scratch_17_<pid>_<what>`, holding table `t`
+/// with rows 1 to 5. Dropped when it goes, a failed test included. Never a
+/// fixture table.
+struct ScratchTable {
+    schema: String,
+}
+
+impl ScratchTable {
+    fn new(what: &str) -> Self {
+        let schema = format!("scratch_17_{}_{what}", std::process::id());
+        psql_edge(&format!(
+            "drop schema if exists {schema} cascade; create schema {schema}; \
+             create table {schema}.t (id int primary key, v text); \
+             insert into {schema}.t select i, 'v' || i from generate_series(1, 5) i"
+        ));
+        ScratchTable { schema }
+    }
+
+    fn t(&self) -> String {
+        format!("{}.t", self.schema)
+    }
+
+    /// The table's rows, as `psql` shows them, in key order.
+    fn rows(&self) -> Vec<String> {
+        psql_edge(&format!("select id || '|' || v from {} order by id", self.t())).lines().map(str::to_string).collect()
+    }
+}
+
+impl Drop for ScratchTable {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["exec", "dbxtui-fixtures-postgres-1", "psql", "-U", "postgres", "-d", "edge", "--no-psqlrc", "-c", &format!("drop schema if exists {} cascade", self.schema)])
+            .output();
+    }
+}
+
+/// The fixture saved with these markers, as the desktop app would save it.
+async fn seeded_marked(core: &DbxCore, id: &str, production: bool, marked: &[&str], read_only: bool) -> ConnectionId {
+    core.seed_config(serde_json::json!({
+        "id": id, "name": format!("marked {id}"), "db_type": "postgres", "host": "127.0.0.1", "port": 55433,
+        "username": "postgres", "password": FIXTURE_PASSWORD, "database": "edge", "ssl": false, "driver_profile": null,
+        "is_production": production, "production_databases": marked, "read_only": read_only,
+    }))
+    .await
+    .expect("seed")
+}
+
+/// A run of exactly `sql` on `edge`, the danger check as `confirm_dangerous`.
+fn exactly(id: &ConnectionId, sql: &str, confirm_dangerous: bool) -> RunRequest {
+    RunRequest { confirm_dangerous, ..run_request(id, "edge", 1, sql) }
+}
+
+/// Refused, then run with the yes: exactly row 1 goes.
+async fn refused_then_confirmed(core: &DbxCore, id: &ConnectionId, table: &ScratchTable) {
+    let before = table.rows();
+    let sql = format!("delete from {} where id = 1", table.t());
+    let refused = core.run(RunId(rand_id()), exactly(id, &sql, true)).await.expect_err("refused");
+    assert_eq!(refused.kind, CoreErrorKind::NeedsConfirmation, "{refused:?}");
+    let assessment = refused.assessment.expect("with the assessment");
+    assert!(assessment.production);
+    assert_eq!(assessment.reasons, vec![dbx_tui::core::Reason::Writes]);
+    assert_eq!(assessment.confirmation.statement, sql);
+    assert_eq!(table.rows(), before, "nothing ran");
+
+    // A yes for id = 1 sent with id = 2 runs nothing.
+    let other = format!("delete from {} where id = 2", table.t());
+    let wrong = RunRequest { confirmation: Some(assessment.confirmation.clone()), ..exactly(id, &other, true) };
+    let again = core.run(RunId(rand_id()), wrong).await.expect_err("asked again");
+    assert_eq!(again.kind, CoreErrorKind::NeedsConfirmation);
+    assert_eq!(table.rows(), before, "still nothing ran");
+
+    let yes = RunRequest { confirmation: Some(assessment.confirmation), ..exactly(id, &sql, true) };
+    let set = core.run(RunId(rand_id()), yes).await.expect("confirmed, it runs");
+    assert_eq!(set.affected, 1);
+    assert_eq!(table.rows(), before[1..].to_vec(), "exactly row 1 is gone, every other row as it was");
+    core.close_session(tab_session(1), &database(id, "edge")).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_delete_on_a_connection_marked_production_runs_only_with_the_matching_yes() {
+    require_fixtures().await;
+    let table = ScratchTable::new("conn");
+    let s = Scratch::new();
+    let core = s.core();
+    let id = seeded_marked(&core, "prod", true, &[], false).await;
+    refused_then_confirmed(&core, &id, &table).await;
+}
+
+#[tokio::test]
+async fn a_delete_on_a_database_marked_production_runs_only_with_the_matching_yes() {
+    require_fixtures().await;
+    let table = ScratchTable::new("db");
+    let s = Scratch::new();
+    let core = s.core();
+    let id = seeded_marked(&core, "marked-db", false, &["edge"], false).await;
+    refused_then_confirmed(&core, &id, &table).await;
+}
+
+#[tokio::test]
+async fn an_unscoped_delete_outside_production_is_asked_with_the_setting_on_and_runs_with_it_off() {
+    require_fixtures().await;
+    let table = ScratchTable::new("danger");
+    let s = Scratch::new();
+    let core = s.core();
+    let id = seeded_marked(&core, "plain", false, &[], false).await;
+    let before = table.rows();
+    let sql = format!("delete from {}", table.t());
+    let refused = core.run(RunId(rand_id()), exactly(&id, &sql, true)).await.expect_err("asked");
+    assert_eq!(refused.kind, CoreErrorKind::NeedsConfirmation);
+    let assessment = refused.assessment.expect("why");
+    assert!(!assessment.production);
+    assert_eq!(assessment.reasons, vec![dbx_tui::core::Reason::Dangerous]);
+    assert_eq!(table.rows(), before, "nothing ran");
+    let set = core.run(RunId(rand_id()), exactly(&id, &sql, false)).await.expect("the check is off");
+    assert_eq!(set.affected, 5);
+    assert!(table.rows().is_empty());
+    core.close_session(tab_session(1), &database(&id, "edge")).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_read_only_connection_refuses_the_write_with_dbxs_error_and_no_question() {
+    require_fixtures().await;
+    let table = ScratchTable::new("ro");
+    let s = Scratch::new();
+    let core = s.core();
+    let id = seeded_marked(&core, "ro", true, &[], true).await;
+    let before = table.rows();
+    let sql = format!("delete from {} where id = 1", table.t());
+    let refused = core.run(RunId(rand_id()), exactly(&id, &sql, true)).await.expect_err("refused");
+    assert_ne!(refused.kind, CoreErrorKind::NeedsConfirmation, "{refused:?}");
+    assert!(refused.message.to_lowercase().contains("read-only"), "dbx's message: {}", refused.message);
+    assert_eq!(table.rows(), before);
+}
+
+#[tokio::test]
+async fn generated_selects_and_a_proven_select_run_on_production_without_a_question() {
+    require_fixtures().await;
+    let table = ScratchTable::new("read");
+    let s = Scratch::new();
+    let core = s.core();
+    let id = seeded_marked(&core, "prod-read", true, &[], false).await;
+    let path = TablePath { schema: schema(&id, "edge", &table.schema), table: "t".into() };
+    for sql in [
+        format!("select * from {} order by id", table.t()),
+        core.table_page_sql(&dbx_tui::core::DbKind::Postgres, &path, &["id".to_string()], 1000, 0),
+        core.table_count_sql(&dbx_tui::core::DbKind::Postgres, &path),
+    ] {
+        core.run(RunId(rand_id()), exactly(&id, &sql, true)).await.unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    core.close_session(tab_session(1), &database(&id, "edge")).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_production_flag_set_while_the_client_runs_is_seen_by_the_next_write() {
+    require_fixtures().await;
+    let table = ScratchTable::new("late");
+    let s = Scratch::new();
+    let client = s.core();
+    let id = seeded_marked(&client, "late", false, &[], false).await;
+    // Warm: the client has loaded its config, and a scoped write is not asked.
+    let before = table.rows();
+    let first = format!("delete from {} where id = 5", table.t());
+    client.run(RunId(rand_id()), exactly(&id, &first, true)).await.expect("not production yet: it runs");
+    assert_eq!(table.rows(), before[..4].to_vec());
+    // The desktop app marks the connection while the client is open: another
+    // head, the same store.
+    let desktop = s.core();
+    seeded_marked(&desktop, "late", true, &[], false).await;
+    let sql = format!("delete from {} where id = 1", table.t());
+    let refused = client.run(RunId(rand_id()), exactly(&id, &sql, true)).await.expect_err("now asked");
+    assert_eq!(refused.kind, CoreErrorKind::NeedsConfirmation, "{refused:?}");
+    let assessment = refused.assessment.as_ref().expect("why");
+    assert!(assessment.production);
+    assert_eq!(table.rows(), before[..4].to_vec(), "nothing ran");
+    // A proven read stays on the fast path, and the mark is not lost.
+    client.run(RunId(rand_id()), exactly(&id, "select 1", true)).await.expect("a proven read runs");
+    // The flag set at the desktop and nothing about secrets in the question.
+    assert!(!format!("{refused:?}").contains(FIXTURE_PASSWORD));
+    client.close_session(tab_session(1), &database(&id, "edge")).await.unwrap();
 }

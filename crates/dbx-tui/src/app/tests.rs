@@ -298,6 +298,7 @@ fn a_reply_with_a_stale_generation_changes_no_state() {
         username: String::new(),
         tls: false,
         production: false,
+        production_databases: Vec::new(),
         query_timeout: None,
     };
     let stale = app.update(Event::Core(old, CoreReply::Connections(Ok(vec![conn.clone()]))), base());
@@ -325,6 +326,7 @@ fn a_long_connection_list_stays_inside_the_sidebar_and_off_the_mode_bar() {
             username: String::new(),
             tls: false,
             production: false,
+            production_databases: Vec::new(),
             query_timeout: None,
         })
         .collect();

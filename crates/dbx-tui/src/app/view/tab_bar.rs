@@ -29,11 +29,19 @@ struct Item {
     label: String,
     glyph: Option<Role>,
     active: bool,
+    /// It runs on a database marked production: a red `PROD` follows.
+    prod: bool,
 }
+
+/// After the label of a tab on production.
+const PROD: &str = "PROD";
 
 impl Item {
     fn width(&self) -> u16 {
         let mut w = drawn_width(&self.label);
+        if self.prod {
+            w += 1 + PROD.len();
+        }
         if self.glyph.is_some() {
             w += 2;
         }
@@ -106,7 +114,7 @@ pub(super) fn draw(app: &App, p: &Painter, buf: &mut Buffer, row: Rect, editor_f
                 None => app.target_label_of(t.id).unwrap_or_else(|| "no target".to_string()),
             };
             let target = cut(&display_safe(&target), TARGET_MOST);
-            Item { id: t.id, label: format!("{} {target}", i + 1), glyph: query::glyph(t), active: t.id == active }
+            Item { id: t.id, label: format!("{} {target}", i + 1), glyph: query::glyph(t), active: t.id == active, prod: app.tab_is_production(t.id) }
         })
         .collect();
     let widths: Vec<u16> = items.iter().map(Item::width).collect();
@@ -142,6 +150,9 @@ pub(super) fn draw(app: &App, p: &Painter, buf: &mut Buffer, row: Rect, editor_f
             (false, _) => dim,
         };
         x = p.put(buf, x, row.y, &item.label, style);
+        if item.prod {
+            x = p.put(buf, x + 1, row.y, PROD, p.bold(Role::Red));
+        }
         if let Some(role) = item.glyph {
             x = p.put(buf, x + 1, row.y, GLYPH, p.fg(role));
         }

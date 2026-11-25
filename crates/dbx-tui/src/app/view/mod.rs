@@ -140,6 +140,7 @@ fn draw_overlay(overlay: &mut Overlay, closing_tab_running: bool, keys: &super::
         Overlay::Form(form) => form::draw(form, buttons, p, buf),
         Overlay::CellViewer(v) => viewer::draw(v, keys, notice, p, buf),
         Overlay::Chooser(c) => overlays::draw_chooser(c, p, buf),
+        Overlay::ConfirmRun(c) => overlays::draw_confirm_run(c, p, buf),
         Overlay::Help(h) => overlays::draw_help(h, keys, caps, p, buf),
     }
 }
@@ -718,6 +719,10 @@ fn draw_mode_bar(app: &App, p: &Painter, buf: &mut Buffer, hits: &HitMap) -> Vec
     let label = |role| p.bold(role).add_modifier(Modifier::REVERSED);
     let pane = format!(" {}{} ", app.ui.focus.name(), if app.ui.zoomed { " (zoom)" } else { "" });
     let mut x = p.put(buf, r.x, r.y, &pane, label(Role::Accent));
+    // Before anything runs: this tab's statements reach production.
+    if app.tab_is_production(app.ui.tab.id) {
+        x = p.put(buf, x + 1, r.y, " PROD ", label(Role::Red));
+    }
 
     let hints = match app.ui.mode {
         // An overlay takes all input and shows its own keys.

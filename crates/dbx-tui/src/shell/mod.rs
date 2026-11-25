@@ -495,6 +495,8 @@ mod tests {
             cursor: crate::core::Cursor::default(),
             selection: None,
             row_cap: 10,
+            confirm_dangerous: true,
+            confirmation: None,
         };
         Command::Core(RequestId(n), CoreCall::Run(RunId(n), request))
     }

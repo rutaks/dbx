@@ -37,6 +37,11 @@ impl<T> Scripted<T> {
         Self { result: Err(CoreError::new(kind, message)), delay: Duration::ZERO, deaf: false }
     }
 
+    /// An error the test built itself (one carrying an assessment, say).
+    pub fn fail(error: CoreError) -> Self {
+        Self { result: Err(error), delay: Duration::ZERO, deaf: false }
+    }
+
     /// Hold the reply back for `delay` (tokio time, so tests can pause it).
     pub fn after(mut self, delay: Duration) -> Self {
         self.delay = delay;
@@ -535,7 +540,7 @@ mod tests {
     use super::*;
 
     fn conn(name: &str) -> Connection {
-        Connection { id: ConnectionId(name.into()), name: name.into(), kind: DbKind::Postgres, capabilities: Capabilities::postgres(), host: "localhost".into(), port: None, database: None, username: String::new(), tls: false, production: false, query_timeout: None }
+        Connection { id: ConnectionId(name.into()), name: name.into(), kind: DbKind::Postgres, capabilities: Capabilities::postgres(), host: "localhost".into(), port: None, database: None, username: String::new(), tls: false, production: false, production_databases: Vec::new(), query_timeout: None }
     }
 
     fn draft() -> ConnectionDraft {
@@ -575,6 +580,8 @@ mod tests {
             cursor: Cursor::default(),
             selection: None,
             row_cap: 1000,
+            confirm_dangerous: true,
+            confirmation: None,
         }
     }
 

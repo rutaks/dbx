@@ -3,6 +3,7 @@
 
 mod bar;
 mod browse;
+mod confirm;
 mod connection_ui;
 mod edit_keys;
 pub mod finish;
@@ -55,6 +56,8 @@ mod template_tests;
 mod complete_tests;
 #[cfg(test)]
 mod complete_scope_tests;
+#[cfg(test)]
+mod confirm_tests;
 #[cfg(test)]
 mod connections_tests;
 #[cfg(test)]
@@ -868,6 +871,26 @@ impl App {
                 fx.repaint = true;
                 true
             }
+            // The statement scrolls; the view keeps it in range.
+            Some(Overlay::ConfirmRun(c)) => {
+                if key(&["down", "j"]) {
+                    c.scroll += 1;
+                } else if key(&["up", "k"]) {
+                    c.scroll = c.scroll.saturating_sub(1);
+                } else if key(&["pagedown", "space"]) {
+                    c.scroll += 10;
+                } else if key(&["pageup"]) {
+                    c.scroll = c.scroll.saturating_sub(10);
+                } else if key(&["g", "home"]) {
+                    c.scroll = 0;
+                } else if key(&["G", "end"]) {
+                    c.scroll = usize::MAX / 2;
+                } else {
+                    return false;
+                }
+                fx.repaint = true;
+                true
+            }
             Some(Overlay::Help(h)) => {
                 if key(&["down", "j"]) {
                     h.scroll += 1;
@@ -896,6 +919,21 @@ impl App {
         // A divider drag that ends here is saved all the same.
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
             self.on_release(fx);
+        }
+        if let Some(Overlay::ConfirmRun(c)) = &mut self.ui.overlay {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    c.scroll += WHEEL_ROWS as usize;
+                    fx.repaint = true;
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    c.scroll = c.scroll.saturating_sub(WHEEL_ROWS as usize);
+                    fx.repaint = true;
+                    return;
+                }
+                _ => {}
+            }
         }
         if let Some(Overlay::Help(h)) = &mut self.ui.overlay {
             match mouse.kind {
@@ -979,6 +1017,11 @@ impl App {
                 let now = self.ui.now.unwrap_or_else(Instant::now);
                 self.chooser_run(Some(i), now, fx)
             }
+            OverlayAction::ConfirmRunYes => {
+                let now = self.ui.now.unwrap_or_else(Instant::now);
+                self.confirm_run(now, fx)
+            }
+            OverlayAction::ConfirmRunNo => self.decline_run(fx),
             OverlayAction::Dismiss => {
                 self.ui.overlay = None;
                 fx.repaint = true;

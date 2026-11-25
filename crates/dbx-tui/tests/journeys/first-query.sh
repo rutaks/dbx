@@ -87,6 +87,10 @@ expect_not slept 'ACADEMY DINOSAUR'
 key Enter
 type_sql 'set search_path to public;'
 key F5
+# dbx's danger check flags SET (slice 17): confirmed with `y`.
+wait_for 08-asked 'Run a dangerous statement\?'
+sleep 0.5  # a `y` in the first 300 ms is ignored
+key y
 wait_for 08-no-result-set '0 rows affected'
 
 # NULL, the empty string and the text NULL, side by side, and a number.

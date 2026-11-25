@@ -147,6 +147,8 @@ impl App {
             cursor: Cursor::default(),
             selection: Some((Cursor::default(), end)),
             row_cap: cap,
+            confirm_dangerous: self.model.settings.confirm_dangerous,
+            confirmation: None,
         };
         let tab = self.model.active_mut(id);
         tab.run = RunState::Running { run, request: request_id, started: now };

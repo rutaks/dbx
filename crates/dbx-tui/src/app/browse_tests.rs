@@ -257,6 +257,26 @@ async fn the_header_names_the_table_and_the_rows_on_screen() {
 }
 
 #[tokio::test]
+async fn a_page_answered_needs_confirmation_asks_and_y_fetches_that_page() {
+    let mut h = browsing(1000).await;
+    // The fake's own answer to this run never comes: the test gives it.
+    h.fake.script_run(Scripted::ok(page(1, 1)).after(Duration::from_secs(3600)));
+    let commands = h.press_fx("]");
+    super::confirm_tests::ask(&mut h, &commands, true, &[crate::core::Reason::Unproven]);
+    assert!(matches!(h.app.ui.overlay, Some(super::overlay::Overlay::ConfirmRun(_))), "{:?}", h.app.ui.overlay);
+    assert_eq!(model_tab(&h).run, RunState::Idle);
+    assert_eq!(model_tab(&h).browse.as_ref().and_then(|b| b.fetch.clone()), None, "no page is on its way");
+    assert_eq!(model_tab(&h).browse.as_ref().map(|b| b.offset), Some(0), "still the first page");
+    h.fake.script_run(Scripted::ok(page(1001, 1000)));
+    let sent = runs(&h.press_fx("y"));
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].2.buffer, film_sql(&h, 1000));
+    assert!(sent[0].2.confirmation.is_some());
+    land(&mut h).await;
+    assert_eq!(model_tab(&h).browse.as_ref().map(|b| b.offset), Some(1000), "the page landed as a page");
+}
+
+#[tokio::test]
 async fn right_bracket_emits_the_run_for_offset_1000_and_the_editor_follows() {
     let mut h = browsing(1000).await;
     h.fake.script_run(Scripted::ok(page(1001, 1000)));

@@ -60,6 +60,8 @@ async fn run_core(core: &DbxCore, id: &ConnectionId, n: &mut u64, serial: u32, s
         cursor: Cursor { row: lines.len() - 1, col: lines.last().unwrap().chars().count() },
         selection: None,
         row_cap: cap,
+        confirm_dangerous: false, // The gate has its own tests (slice 17).
+        confirmation: None,
     };
     core.run(RunId(*n), request).await.map_err(|e| e.message)
 }

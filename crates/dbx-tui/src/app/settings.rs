@@ -43,6 +43,10 @@ pub struct Settings {
     pub format_indent: usize,
     /// Reformat code: where the comma of a broken list goes.
     pub format_comma: CommaPosition,
+    /// Ask before a statement dbx flags dangerous (DDL, an UPDATE or DELETE
+    /// without a limiting WHERE) on any database. On by default, as in the
+    /// desktop app. A write to production is confirmed whatever this says.
+    pub confirm_dangerous: bool,
 }
 
 impl Default for Settings {
@@ -58,6 +62,7 @@ impl Default for Settings {
             format_keyword_case: KeywordCase::Leave,
             format_indent: 4,
             format_comma: CommaPosition::Trailing,
+            confirm_dangerous: true,
         }
     }
 }

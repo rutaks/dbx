@@ -29,6 +29,9 @@ pub enum Overlay {
     /// Closing a tab that has text, or a statement running: "close tab 2?",
     /// saying what goes with it.
     ConfirmCloseTab(ConfirmCloseTab),
+    /// The adapter would not run a statement without a yes: on production,
+    /// or dangerous. Red, naming where, why and exactly what.
+    ConfirmRun(Box<ConfirmRun>),
     /// One cell's whole value, wrapped and scrollable.
     CellViewer(Box<super::viewer::CellViewer>),
     /// "What to run?" when the caret is inside a subquery.
@@ -78,6 +81,36 @@ pub struct ConfirmRerun {
     /// The statement's first non-blank line.
     pub statement: String,
 }
+
+/// What a confirmed statement was run as, so a yes runs it the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunPurpose {
+    /// A run of the editor's text, or of what the chooser picked.
+    Plain,
+    /// "Load more", with the cap it asked for.
+    LoadMore(super::query::LoadMore),
+    /// A page or the count of a browse tab.
+    Browse(super::query::Fetch),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmRun {
+    /// The tab the run was in.
+    pub tab: TabId,
+    /// Why, and what a yes sends back.
+    pub assessment: crate::core::Assessment,
+    pub purpose: RunPurpose,
+    /// The row cap the run asked for.
+    pub row_cap: usize,
+    /// The first line of the statement shown.
+    pub scroll: usize,
+    /// When the box opened: a `y` before `CONFIRM_GRACE` has passed is
+    /// ignored (typing that was already under way must not confirm).
+    pub opened: Option<std::time::Instant>,
+}
+
+/// How long a new confirmation box ignores `y`.
+pub const CONFIRM_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmCloseTab {
@@ -144,6 +177,9 @@ pub enum OverlayAction {
     DropSessionYes,
     /// The close-tab question: close it.
     CloseTabYes,
+    /// The run confirmation: run it, or not (`Not run.`).
+    ConfirmRunYes,
+    ConfirmRunNo,
     /// The statement chooser: run the highlighted entry, or one that was clicked.
     ChooserRun,
     ChooserPick(usize),
@@ -216,6 +252,9 @@ const DROP_SESSION_BUTTONS: &[ButtonSpec] = &[
 // one level always works.
 const CHOOSER_BUTTONS: &[ButtonSpec] =
     &[button("↵", "enter", "run", OverlayAction::ChooserRun), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
+// No `enter`: a habit of `f5` then `enter` must not confirm.
+const CONFIRM_RUN_BUTTONS: &[ButtonSpec] =
+    &[button("y", "y", "run", OverlayAction::ConfirmRunYes), button("esc", "esc", "cancel", OverlayAction::ConfirmRunNo)];
 const HELP_BUTTONS: &[ButtonSpec] = &[button("esc", "esc", "close", OverlayAction::Dismiss)];
 const FAILURE_BUTTONS: &[ButtonSpec] = &[button("↵", "enter", "close", OverlayAction::Dismiss)];
 
@@ -233,6 +272,7 @@ impl Overlay {
             Overlay::Failure(_) => FAILURE_BUTTONS,
             Overlay::ConfirmRerun(_) => RERUN_BUTTONS,
             Overlay::ConfirmCloseTab(_) => CLOSE_TAB_BUTTONS,
+            Overlay::ConfirmRun(_) => CONFIRM_RUN_BUTTONS,
             Overlay::ConfirmDropSession(ask) if ask.stopped => STOPPED_BUTTONS,
             Overlay::ConfirmDropSession(_) => DROP_SESSION_BUTTONS,
             // Drawn with the live keys, not from this table.

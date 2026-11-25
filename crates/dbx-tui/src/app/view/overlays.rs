@@ -6,7 +6,8 @@ use ratatui::style::Style;
 
 use super::{panel, Drawn, Painter};
 use crate::app::keys::{Binding, Keybinds};
-use crate::app::overlay::{Chooser, HelpOverlay, Overlay, OverlayAction, OverlayButton};
+use crate::app::overlay::{Chooser, ConfirmRun, HelpOverlay, Overlay, OverlayAction, OverlayButton};
+use crate::core::Reason;
 use crate::app::theme::Role;
 use crate::app::Capabilities;
 
@@ -114,4 +115,89 @@ pub(super) fn draw_help(h: &mut HelpOverlay, keys: &Keybinds, caps: Capabilities
     }
     let buttons = panel::buttons(p, buf, inner, foot, Overlay::Help(h.clone()).buttons());
     Drawn { buttons, fields: Vec::new() }
+}
+
+/// The run confirmation: red, the title saying production or dangerous, then
+/// where it runs, why, and the exact statement, scrollable, through the
+/// painter. `y run` and `esc cancel` at the foot; `enter` is not a button.
+pub(super) fn draw_confirm_run(c: &mut ConfirmRun, p: &Painter, buf: &mut Buffer) -> Drawn {
+    let a = &c.assessment;
+    let title = if a.production {
+        "Run on production?"
+    } else if a.reasons.iter().any(|r| *r != Reason::Changed) {
+        "Run a dangerous statement?"
+    } else {
+        "Run this statement?"
+    };
+    let mut head = format!("On {} / {}.", a.connection_name, a.confirmation.database);
+    if !a.named.is_empty() {
+        head.push_str(&format!(" It names {}, marked production.", a.named.join(", ")));
+    }
+    if a.target_unknown {
+        head.push_str(" dbx cannot tell which database it writes to, so it counts as production.");
+    }
+    let why: Vec<&str> = a.reasons.iter().map(|r| r.words()).collect();
+    let mut why = format!("Stopped because {}.", why.join("; "));
+    if a.production {
+        why.push_str(" Production is always confirmed: no setting turns this off.");
+    }
+    let area = buf.area;
+    let width = 90.min(area.width.saturating_sub(4)).max(24.min(area.width));
+    let text_w = width.saturating_sub(4) as usize;
+    let mut intro = panel::wrap(&head, text_w);
+    intro.extend(panel::wrap(&why, text_w));
+    let statement = statement_lines(&a.confirmation.statement, text_w.saturating_sub(2).max(1));
+    // Border, intro, a blank row, the statement, a blank row, the foot, border.
+    let want = intro.len() + statement.len() + 5;
+    let height = (want as u16).min(area.height.saturating_sub(2));
+    let rect = panel::centred(area, width, height);
+    let inner = panel::panel(p, buf, rect, title, Role::Red, Role::Red);
+    if inner.width < 8 || inner.height < 4 {
+        return Drawn::default();
+    }
+    let bg = p.theme.color(Role::PanelBg);
+    let pane = p.within(inner);
+    let mut y = inner.y;
+    let foot = inner.bottom() - 1;
+    for line in &intro {
+        if y + 2 >= foot {
+            break;
+        }
+        pane.put(buf, inner.x, y, line, p.fg(Role::Text).bg(bg));
+        y += 1;
+    }
+    y += 1;
+    let rows = foot.saturating_sub(y + 1) as usize;
+    c.scroll = c.scroll.min(statement.len().saturating_sub(rows));
+    for (i, line) in statement.iter().skip(c.scroll).take(rows).enumerate() {
+        pane.put(buf, inner.x + 2, y + i as u16, line, p.bold(Role::Text).bg(bg));
+    }
+    if statement.len() > rows && rows > 0 {
+        let text = format!("lines {}-{} of {}", c.scroll + 1, (c.scroll + rows).min(statement.len()), statement.len());
+        pane.put(buf, inner.x, foot, &text, p.fg(Role::Overlay0).bg(bg));
+    }
+    let buttons = panel::buttons(p, buf, inner, foot, Overlay::ConfirmRun(Box::new(c.clone())).buttons());
+    Drawn { buttons, fields: Vec::new() }
+}
+
+/// The statement's lines, each cut into pieces of at most `width` cells,
+/// spaces kept: nothing of the text is dropped or reflowed.
+fn statement_lines(text: &str, width: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let line = crate::core::display_safe(line.trim_end_matches('\r'));
+        let (mut piece, mut used) = (String::new(), 0usize);
+        for g in line.graphemes(true) {
+            let w = super::drawn_width(g);
+            if used + w > width && !piece.is_empty() {
+                out.push(std::mem::take(&mut piece));
+                used = 0;
+            }
+            piece.push_str(g);
+            used += w;
+        }
+        out.push(piece);
+    }
+    out
 }

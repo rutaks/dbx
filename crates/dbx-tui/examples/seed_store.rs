@@ -7,7 +7,8 @@
 //! unless `DBX_TUI_SEED_PASSWORD` is set (the journeys use it for the Docker
 //! fixture's well-known password). With `DBX_TUI_SEED_QUERY_TIMEOUT=N` the
 //! connection is saved with dbx's `query_timeout_secs` set to N, as the dbx
-//! desktop app saves it (Postgres only).
+//! desktop app saves it (Postgres only). With `DBX_TUI_SEED_PRODUCTION=1` it
+//! is marked production.
 //! DATA_DIR must be under the system temp directory (or set
 //! `DBX_TUI_ALLOW_SEED=1`); the desktop app's store is always refused.
 
@@ -45,7 +46,8 @@ fn main() {
         username: "postgres".into(),
         password: Some(std::env::var("DBX_TUI_SEED_PASSWORD").unwrap_or_else(|_| "seeded-dummy-password".into())),
         tls: false,
-        production: false,
+        // `DBX_TUI_SEED_PRODUCTION=1`: marked production, as the desktop app marks it.
+        production: std::env::var("DBX_TUI_SEED_PRODUCTION").as_deref() == Ok("1"),
     };
     dbx_tui::shell::install_crypto_provider();
     let rt = dbx_tui::shell::runtime().expect("runtime");

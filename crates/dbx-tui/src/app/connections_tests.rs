@@ -18,6 +18,7 @@ pub fn conn(name: &str, kind: DbKind) -> Connection {
         username: "postgres".into(),
         tls: false,
         production: false,
+        production_databases: Vec::new(),
         query_timeout: None,
     }
 }

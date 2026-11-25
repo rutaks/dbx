@@ -123,10 +123,15 @@ pub fn press(app: &mut App, keys: &str) -> Effects {
 
 /// Left-clicks the middle of `rect`.
 pub fn click(app: &mut App, rect: Rect) -> Effects {
+    click_at(app, rect, base())
+}
+
+/// As `click`, at the time `now`.
+pub fn click_at(app: &mut App, rect: Rect, now: std::time::Instant) -> Effects {
     let (column, row) = (rect.x + rect.width / 2, rect.y + rect.height / 2);
     let ev = |kind| MouseEvent { kind, column, row, modifiers: crossterm::event::KeyModifiers::NONE };
-    let down = app.update(Event::Mouse(ev(MouseEventKind::Down(MouseButton::Left))), base());
-    let up = app.update(Event::Mouse(ev(MouseEventKind::Up(MouseButton::Left))), base());
+    let down = app.update(Event::Mouse(ev(MouseEventKind::Down(MouseButton::Left))), now);
+    let up = app.update(Event::Mouse(ev(MouseEventKind::Up(MouseButton::Left))), now);
     Effects { repaint: down.repaint || up.repaint, commands: [down.commands, up.commands].concat() }
 }
 

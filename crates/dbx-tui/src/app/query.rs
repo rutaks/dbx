@@ -497,6 +497,8 @@ impl App {
             cursor: self.ui.tab.editor.cursor(),
             selection: range.or_else(|| self.ui.tab.editor.selection()),
             row_cap: self.model.row_cap,
+            confirm_dangerous: self.model.settings.confirm_dangerous,
+            confirmation: None,
         };
         self.tab_mut().run = RunState::Running { run, request: id, started: now };
         if let Some(b) = self.tab_mut().browse.as_mut() {
@@ -597,7 +599,8 @@ impl App {
         let after = now.map_or(Duration::ZERO, |now| now.saturating_duration_since(started));
         let (statement, how) = match result {
             Ok(set) => (Some(set.ran), CancelEnd::FinishedFirst),
-            Err(e) if e.kind == CoreErrorKind::Cancelled => (e.statement, CancelEnd::Stopped),
+            // Nothing ran (it waited for a yes): it is as stopped as can be.
+            Err(e) if matches!(e.kind, CoreErrorKind::Cancelled | CoreErrorKind::NeedsConfirmation) => (e.statement, CancelEnd::Stopped),
             Err(e) => {
                 let named = match e.kind {
                     CoreErrorKind::Connect => format!("could not reach the server: {}", e.message),
@@ -642,6 +645,14 @@ impl App {
         };
         let more = t.loading_more.take();
         t.run = RunState::Idle;
+        // Nothing ran: it waits for a yes, and the tab is as it was.
+        if matches!(&result, Err(e) if e.kind == CoreErrorKind::NeedsConfirmation) {
+            let fetch = t.browse.as_mut().and_then(|b| b.fetch.take());
+            if let Err(error) = result {
+                self.ask_to_run(tab, error, more, fetch, fx);
+            }
+            return;
+        }
         // A page or the count of a browse tab lands by its own rules.
         if let Some(fetch) = t.browse.as_mut().and_then(|b| b.fetch.take()) {
             return self.browse_landed(tab, fetch, result, elapsed, fx);

@@ -150,9 +150,25 @@ pub struct Connection {
     pub tls: bool,
     /// dbx marks the connection as production: writes need confirming.
     pub production: bool,
+    /// The databases dbx marks production on this connection
+    /// (`production_databases`), as stored.
+    pub production_databases: Vec<String>,
     /// The connection's own query timeout in seconds, when it sets one: the
     /// longest a run may take before it is cancelled. `None` is no limit.
     pub query_timeout: Option<u64>,
+}
+
+impl Connection {
+    /// Whether `database` on this connection is marked production: the whole
+    /// connection is, or the database is in its list. Names compare as dbx
+    /// compares them (`is_production_database`: trimmed, outer quotes off,
+    /// without regard to ASCII case). For the `PROD` badge only: the adapter
+    /// decides what needs confirming, from the config it reads at the run.
+    pub fn is_production_database(&self, database: &str) -> bool {
+        let norm = |s: &str| s.trim().trim_matches(|c| matches!(c, '`' | '"' | '[' | ']')).to_ascii_lowercase();
+        self.production
+            || (!database.trim().is_empty() && self.production_databases.iter().any(|d| norm(d) == norm(database)))
+    }
 }
 
 /// `s` made safe to draw: control characters (which a terminal would act on,
@@ -411,6 +427,89 @@ pub struct RunRequest {
     pub cursor: Cursor,
     pub selection: Option<(Cursor, Cursor)>,
     pub row_cap: usize,
+    /// Ask before a statement dbx calls dangerous (DDL, an UPDATE or DELETE
+    /// without a limiting WHERE), on any database. The setting
+    /// `confirm_dangerous`. Production writes are confirmed whatever it says.
+    pub confirm_dangerous: bool,
+    /// The user's yes to an `Assessment`: the run executes only if it is for
+    /// exactly the statement, connection, database and session of this run.
+    pub confirmation: Option<Confirmation>,
+}
+
+/// What a yes is bound to: a confirmation for anything else does not count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confirmation {
+    /// The exact text that runs.
+    pub statement: String,
+    pub connection: ConnectionId,
+    /// The database it runs on, as the adapter resolved it.
+    pub database: String,
+    pub session: SessionId,
+}
+
+/// Why a statement waits for the user's yes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// It writes data.
+    Writes,
+    /// It changes the schema (DDL).
+    ChangesSchema,
+    /// It controls a transaction (`commit`, `rollback`, `begin`).
+    TransactionControl,
+    /// It reads, but calls functions dbx cannot prove read-only.
+    Unproven,
+    /// dbx flags it dangerous: DDL, or UPDATE/DELETE without a limiting WHERE.
+    Dangerous,
+    /// dbx cannot parse it, so it is treated as a write.
+    Unparsed,
+    /// A yes was given, but for another statement or another target.
+    Changed,
+    /// It is a `USE` (or the like): it switches the session's database.
+    SwitchesDatabase,
+    /// An earlier `USE` in this tab's session may have moved it to a
+    /// production database, so this statement is treated as aimed there.
+    SessionSwitched,
+    /// `EXPLAIN ANALYZE` runs the statement it explains.
+    ExplainRuns,
+}
+
+impl Reason {
+    /// The reason in words, for the confirmation.
+    pub fn words(self) -> &'static str {
+        match self {
+            Reason::Writes => "it writes data",
+            Reason::ChangesSchema => "it changes the schema",
+            Reason::TransactionControl => "it controls a transaction",
+            Reason::Unproven => "it calls functions dbx cannot prove read-only",
+            // Not "DDL or an unscoped UPDATE/DELETE": dbx flags more than
+            // that (`SET`, `COMMIT`, locking clauses), and says only "dangerous".
+            Reason::Dangerous => "dbx flags it dangerous",
+            Reason::Unparsed => "dbx cannot parse it, so it is treated as a write",
+            Reason::Changed => "the statement or where it runs changed since it was confirmed",
+            Reason::SwitchesDatabase => "it switches the session's database; later statements in this tab will be confirmed",
+            Reason::SessionSwitched => "an earlier USE in this tab switched its database, so this may run on production",
+            Reason::ExplainRuns => "EXPLAIN ANALYZE runs the statement it explains",
+        }
+    }
+}
+
+/// The adapter's answer to a statement that needs confirming before it runs
+/// (`CoreErrorKind::NeedsConfirmation`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assessment {
+    /// It runs on, or names, a database marked production.
+    pub production: bool,
+    pub reasons: Vec<Reason>,
+    /// For a production target found through the SQL (the database the tab
+    /// runs on is not marked): the marked databases it names.
+    pub named: Vec<String>,
+    /// dbx cannot tell which database it writes to, and counts it as
+    /// production.
+    pub target_unknown: bool,
+    /// The connection's name, safe to draw.
+    pub connection_name: String,
+    /// What a yes sends back.
+    pub confirmation: Confirmation,
 }
 
 /// How far into `buffer` the position `at` is, in UTF-16 code units: the unit
@@ -591,6 +690,9 @@ pub enum CoreErrorKind {
     Sql,
     Store,
     Key,
+    /// Nothing ran: the statement waits for the user's yes
+    /// (`CoreError::assessment` says why).
+    NeedsConfirmation,
     Other,
 }
 
@@ -612,11 +714,22 @@ pub struct CoreError {
     /// For a SQL error, where the server says it is, when it says (native
     /// Postgres does).
     pub position: Option<SqlPosition>,
+    /// For `NeedsConfirmation`: why, and what a yes sends back.
+    pub assessment: Option<Box<Assessment>>,
 }
 
 impl CoreError {
     pub fn new(kind: CoreErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), statement: None, position: None }
+        Self { kind, message: message.into(), statement: None, position: None, assessment: None }
+    }
+
+    /// Nothing ran: `assessment` says why it waits for a yes.
+    pub fn needs_confirmation(assessment: Assessment) -> Self {
+        let message = format!("Not run: {} needs confirming.", if assessment.production { "a statement on production" } else { "a dangerous statement" });
+        let mut e = Self::new(CoreErrorKind::NeedsConfirmation, message);
+        e.statement = Some(assessment.confirmation.statement.clone());
+        e.assessment = Some(Box::new(assessment));
+        e
     }
 }
 

@@ -244,6 +244,94 @@ running a selection of it, and running makes the tab an ordinary query tab: the
 title returns to its target and the paging keys leave the mode bar; giving the
 tab another target does the same.
 
+## Confirmations (slice 17)
+
+The gate is in the adapter, on the run path: `DbxCore::run` assesses the exact
+text it is about to send, with the connection's config as dbx holds it at that
+moment, and executes nothing without a matching yes. Every path that runs a
+statement goes through it: the run keys, the statement chooser, load more,
+browse pages and counts (and history re-runs, later). A statement waits for a
+yes when:
+
+1. dbx's `classify_sql_risk_for_database` does not say read-only (a parse
+   failure counts as a write) and `targets_production_database` holds: the
+   connection is marked production, the database is in its
+   `production_databases`, or the SQL names a marked database (MySQL-style
+   `db.table`; on Postgres `x.t` is a schema) or dbx cannot tell. No setting
+   turns this off.
+2. It is read-only but `prove_read_only_for_database` cannot prove it (it
+   calls functions dbx cannot vouch for), on production.
+3. `is_dangerous_sql_for_database` holds and the setting `confirm_dangerous`
+   (on by default; the config file comes in slice 22) is on.
+
+A write on a `read_only` connection is not asked about: dbx refuses it with its
+own error. The answer is `CoreErrorKind::NeedsConfirmation` carrying an
+`Assessment` (why, the connection's name, the marked databases the SQL names,
+and the `Confirmation` a yes sends back). A yes is bound to the exact text, the
+connection, the database and the tab's session; a yes for anything else (the
+text, or the tab's session, changed) is asked again, even for a statement that
+would need none.
+
+The app shows a red box: `Run on production?` or `Run a dangerous statement?`,
+`On <connection> / <database>.`, why in words, and the exact statement,
+scrollable (`j`/`k`, pages, `g`/`G`, the wheel), drawn through the painter.
+`y run` sends the same run again with the yes (the confirmed text, whatever is
+under the caret by then; load more keeps its cap, a page stays a page); `esc
+cancel` runs nothing and says `Not run.`. `enter` does nothing, so `f5` then
+`enter` cannot confirm. The tab stays idle and its result as it was while it
+asks. A tab not on screen is told when it is shown again. A red `PROD` follows
+the tab's label in the tab bar, and the mode bar's pane label, whenever the
+tab's connection or its database is marked production, before anything runs.
+
+**How this differs from the desktop app** (`useSqlExecution.ts:422-452`,
+`productionSafety.ts:128`):
+
+- The desktop's danger check is its own regex: a statement starting with
+  `DROP`, `DELETE`, `TRUNCATE`, `ALTER`, `UPDATE`, `MERGE` or `REPLACE`. This
+  client uses dbx's Rust `is_dangerous_sql_for_database`. Outside production a
+  scoped `update t set a = 1 where id = 1` is confirmed by the desktop and not
+  here; `create table` is confirmed here and not by the desktop.
+- dbx's Rust check also flags transaction control (`commit`), `SET`
+  (`set search_path to public`) and `select pg_terminate_backend(1)` (which
+  its classifier calls a write), so with the setting on they are confirmed
+  outside production too. The box says only "dbx flags it dangerous", since
+  dbx gives no finer reason.
+- A read dbx cannot prove read-only is confirmed on production here; the
+  desktop lets every read through.
+- dbx's classifier does not fail on text it cannot parse (`delet from t`): it
+  falls back to keywords and calls it a write, so the reason shown is "writes";
+  the danger check fails closed. The "cannot parse" reason is kept for when
+  dbx does return an error.
+- Flags set in the desktop while this client runs: the gate first judges with
+  dbx's runtime copy. When that would let a statement through that dbx does
+  not prove read-only, it reads the saved connections again
+  (`Storage::load_connections`, which decrypts every saved secret; they stay
+  inside the adapter and out of errors and logs) and judges again with the
+  saved flags. Proven reads and statements carrying a matching yes skip this.
+  A store that cannot be read stops the statement with the store's error.
+
+**Sessions that switched database.** A `USE` lasts in the tab's session, but a
+run is judged against the tab's database. So the adapter notes, per session,
+that a statement beginning with `USE` was sent (in any statement of the text).
+In that session, on a connection that is marked production or lists any
+production database, every statement not proven read-only is treated as aimed
+at production (reason: an earlier USE in this tab switched its database),
+until the session closes. A `USE` is confirmed, when it names a production
+database, with its own reason: it switches the session's database, and later
+statements in this tab will be confirmed. This is the adapter's own check (a
+first-word test), since dbx's `USE_RE` is private.
+
+**`EXPLAIN ANALYZE`** runs the statement it explains. When the text is an
+EXPLAIN with ANALYZE in any option form (`analyze`, `(analyze)`, `(analyze
+true, verbose)`, `analyze verbose`, MySQL's `analyze format=tree`), the inner
+statement is judged too: its risk and danger count, and the reason says
+"EXPLAIN ANALYZE runs the statement it explains". dbx's own parser does not
+take the `ANALYSE` spelling, so it also calls that form dangerous.
+
+**A new box ignores `y` for 300 ms** (and the `y run` button), so typing that
+was already under way when the reply arrived cannot confirm by accident. Nothing
+is shown; `esc` and everything else work at once.
+
 ## Editor keys (slice 13)
 
 Every editing action is a named action in the live bindings (`Keybinds`), with
@@ -669,7 +757,7 @@ Run every command from the dbx workspace root.
 | Live: `DbxCore` against the fixture Postgres (layer 1) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test live -- --test-threads=1` | Docker (the fixtures below) |
 | Ground truth: every cell of the `edge` tables, `DbxCore` against `psql`, and through the drawn grid (layer 1; slice 08) | `crates/dbx-tui/tests/fixtures/up.sh && cargo test -p dbx-tui --test ground_truth -- --test-threads=1` | Docker (it runs `psql` inside the fixture container), about 5 s |
 | Fixtures: the test databases | `crates/dbx-tui/tests/fixtures/up.sh && crates/dbx-tui/tests/fixtures/check.sh` | Docker |
-| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `first-query`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
+| Journeys: the built binary in tmux (layer 5; `colours`, `add-connection`, `browse-pagila`, `browse-table`, `cancel`, `complete`, `confirm-production` (a scratch schema it creates and drops), `first-query`, `mouse`, `quit-mid-run`, `tabs` and `wide-result` need the fixtures) | `for j in crates/dbx-tui/tests/journeys/*.sh; do [ "$(basename "$j")" = lib.sh ] \|\| bash "$j"; done` | tmux, openssl, python3 |
 | Lint | `cargo clippy -p dbx-tui --all-targets` | |
 
 `cargo test -p dbx-tui` runs the fast, store and live tests together (the live
