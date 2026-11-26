@@ -119,6 +119,48 @@ pub fn draft(name: &str) -> ConnectionDraft {
     }
 }
 
+/// A SQLite connection to the file at `path`, as the form saves it: the path
+/// is the host, and there is no port, user, password or database.
+pub fn sqlite_draft(name: &str, path: &Path) -> ConnectionDraft {
+    ConnectionDraft {
+        id: None,
+        name: name.into(),
+        kind: DbKind::Sqlite,
+        host: path.to_string_lossy().into_owned(),
+        port: None,
+        database: None,
+        username: String::new(),
+        password: None,
+        tls: false,
+        production: false,
+    }
+}
+
+/// The directory `tests/fixtures/sqlite/build.sh` builds the SQLite fixtures in.
+pub fn sqlite_fixture_dir() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let build = root.join("tests/fixtures/sqlite/build.sh");
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let out = root.join("../../target/sqlite-fixtures");
+            let status = std::process::Command::new("bash").arg(&build).arg(&out).stdout(std::process::Stdio::null()).status().expect("bash build.sh");
+            assert!(status.success(), "tests/fixtures/sqlite/build.sh failed");
+            out.canonicalize().expect("the built fixtures")
+        })
+        .clone()
+}
+
+/// A copy of the built SQLite fixture `name` (`sakila` or `edge`) in a new
+/// temporary directory, which is removed with the returned guard. A test
+/// never opens the built file itself.
+pub fn sqlite_copy(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(format!("{name}.db"));
+    std::fs::copy(sqlite_fixture_dir().join(format!("{name}.db")), &path).expect("copy the fixture");
+    (dir, path)
+}
+
 pub fn assert_no_secret(c: &Connection) {
     let fields = [c.id.0.as_str(), c.name.as_str(), c.host.as_str(), c.database.as_deref().unwrap_or("")];
     for f in fields {

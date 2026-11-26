@@ -627,7 +627,7 @@ impl App {
                 app.ui.tab.template.columns_for = Some((schema.map(str::to_string), table.to_string(), asked_at));
             }
         };
-        let Some(current) = self.model.completions.current_schema.get(&db).cloned() else {
+        let Some(current) = self.current_schema_of(&db) else {
             return waiting_for(self, vec![(Need::CurrentSchema(db), String::new())], fx);
         };
         let path = TablePath { schema: SchemaPath { database: db, schema: schema.map_or(current, str::to_string) }, table: table.to_string() };
@@ -700,7 +700,7 @@ impl App {
             Postfix::Cast => (format!("cast({expr} as )"), "cast(".len() + expr.chars().count() + " as ".len()),
             Postfix::CFrom | Postfix::Join => {
                 if !self.core_names() {
-                    return self.notify(format!("{name} needs a PostgreSQL connection for now."), true, fx);
+                    return self.notify(format!("{name} needs a PostgreSQL or SQLite connection for now."), true, fx);
                 }
                 let Some((schema, table)) = table_of_expr(&expr) else {
                     return self.notify(format!("{name} needs a table name before the dot."), true, fx);
@@ -708,7 +708,7 @@ impl App {
                 let Some(db) = self.tab().target.clone() else {
                     return self.notify(format!("{name} needs a database: press u on one in the sidebar."), true, fx);
                 };
-                let Some(current) = self.model.completions.current_schema.get(&db).cloned() else {
+                let Some(current) = self.current_schema_of(&db) else {
                     let waiting = self.request_completion(vec![(Need::CurrentSchema(db), String::new())], fx);
                     return self.wait_for_names(waiting, name, fx);
                 };

@@ -21,7 +21,7 @@ use super::text_field::{Edit, TextField};
 use super::tree::NodeId;
 use super::view::{duration_text, thousands};
 use super::{App, Command, Effects};
-use crate::core::{DatabasePath, DumpContent, DumpFailure, DumpId, DumpProgress, DumpRequest, DumpStatus, Dumped, FileLeft};
+use crate::core::{DatabasePath, Dialect, DumpContent, DumpFailure, DumpId, DumpProgress, DumpRequest, DumpStatus, Dumped, FileLeft};
 
 /// How long quitting waits for a cancelled dump's final progress, as it waits
 /// for a cancelled run (the shell's `RUN_WAIT`).
@@ -33,6 +33,9 @@ pub struct Dumping {
     pub id: DumpId,
     pub request: RequestId,
     pub job: DumpRequest,
+    /// What the dump is called: the database, or the connection for one that
+    /// has no database level (a SQLite file).
+    pub base: String,
     pub started: Instant,
     /// The latest progress, `None` until dbx has said anything.
     pub progress: Option<DumpProgress>,
@@ -46,20 +49,16 @@ pub struct Dumping {
 impl Dumping {
     /// `pagila`, or `pagila.public` for one schema.
     pub fn name(&self) -> String {
-        name_of(&self.job)
+        if self.job.schema.is_empty() {
+            self.base.clone()
+        } else {
+            format!("{}.{}", self.base, self.job.schema)
+        }
     }
 
     /// Whether `c` can still ask it to stop.
     pub fn cancellable(&self) -> bool {
         self.cancelling.is_none() && self.ended.is_none()
-    }
-}
-
-fn name_of(job: &DumpRequest) -> String {
-    if job.schema.is_empty() {
-        job.at.database.clone()
-    } else {
-        format!("{}.{}", job.at.database, job.schema)
     }
 }
 
@@ -110,15 +109,20 @@ pub struct DumpOverlay {
     pub path: TextField,
     pub focus: DumpField,
     pub stage: DumpStage,
-    /// dbx's dump of this kind is known not to restore whole: the overlay says so.
-    pub loses: bool,
+    /// dbx's dump of this kind is known not to restore whole: the overlay
+    /// says so, with the losses of this dialect.
+    pub loses: Option<Dialect>,
+    /// What the dump is called: the database, or the connection for one that
+    /// has no database level (a SQLite file).
+    pub base: String,
 }
 
 impl DumpOverlay {
-    fn new(at: DatabasePath, schema: Option<String>, dir: &std::path::Path, stamp: &str, loses: bool) -> Self {
-        let path = dir.join(format!("{}-{stamp}.sql", stem_of(&at.database))).to_string_lossy().into_owned();
+    fn new(at: DatabasePath, schema: Option<String>, dir: &std::path::Path, stamp: &str, loses: Option<Dialect>, base: String) -> Self {
+        let path = dir.join(format!("{}-{stamp}.sql", stem_of(&base))).to_string_lossy().into_owned();
         DumpOverlay {
             whole: schema.is_none(),
+            base,
             at,
             schema,
             content: DumpContent::StructureAndData,
@@ -132,7 +136,7 @@ impl DumpOverlay {
 
     /// The title: `Dump pagila`.
     pub fn title(&self) -> String {
-        format!("Dump {}", self.at.database)
+        format!("Dump {}", self.base)
     }
 
     /// Sent, or asking about the file: the fields take no edits.
@@ -267,9 +271,21 @@ impl DumpOverlay {
 /// (README "Dump", "What dbx's dump loses"; each is pinned by a live test).
 pub const KNOWN_LOSSES: &str = "domains, partitions, composite arrays, NaN and Infinity (written as NULL), geometric and tsquery values (written as bytes), tsvector columns (dropped) and tables with several parents";
 
+/// What dbx's dump is known to lose on SQLite (README "Dump", "What dbx's dump
+/// loses on SQLite"; each is pinned by a live test).
+pub const KNOWN_LOSSES_SQLITE: &str = "blobs (written as text starting 0x), Infinity (written as NULL), a time zone in a date or time (dropped) and integers past 2^53 in an untyped column (written as text)";
+
+/// The losses of the dump of a connection speaking `dialect`.
+pub fn known_losses(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Sqlite => KNOWN_LOSSES_SQLITE,
+        _ => KNOWN_LOSSES,
+    }
+}
+
 /// The line the setup overlay shows, and a finished dump with errors repeats.
-pub fn known_losses_note() -> String {
-    format!("dbx's dump is known not to restore whole: {KNOWN_LOSSES}. See README \"Dump\".")
+pub fn known_losses_note(dialect: Dialect) -> String {
+    format!("dbx's dump is known not to restore whole: {}. See README \"Dump\".", known_losses(dialect))
 }
 
 /// `1 schema`, `22 objects`.
@@ -298,6 +314,9 @@ impl App {
         let (at, schema) = match &row.node {
             NodeId::Database(d) => (d.clone(), None),
             NodeId::Schema(s) => (s.database.clone(), Some(s.schema.clone())),
+            // A connection with no database level (a SQLite file) is itself
+            // the database: dumped whole, under the empty database name.
+            NodeId::Connection(id) if self.connection(id).is_some_and(|c| !c.capabilities.databases) => (DatabasePath { connection: id.clone(), database: String::new() }, None),
             _ => return None,
         };
         let c = self.connection(&at.connection)?;
@@ -325,8 +344,11 @@ impl App {
         }
         let Some((at, schema)) = target else { return };
         let stamp = (self.ui.export_env.stamp)();
-        let loses = self.connection(&at.connection).is_some_and(|c| c.capabilities.dump_loses);
-        let overlay = DumpOverlay::new(at, schema, &self.ui.export_env.dir, &stamp, loses);
+        let connection = self.connection(&at.connection);
+        let loses = connection.filter(|c| c.capabilities.dump_loses).map(|c| c.capabilities.dialect);
+        // A database is called by its name; a file by its connection's.
+        let base = if at.database.is_empty() { connection.map(|c| c.name.clone()).unwrap_or_default() } else { at.database.clone() };
+        let overlay = DumpOverlay::new(at, schema, &self.ui.export_env.dir, &stamp, loses, base);
         self.ui.overlay = Some(Overlay::Dump(Box::new(overlay)));
         fx.repaint = true;
     }
@@ -415,6 +437,7 @@ impl App {
             return;
         }
         let job = o.request(!replace);
+        let base = o.base.clone();
         let id = self.model.requests.begin(Target::Dump);
         let dump = DumpId(self.model.next_dump);
         self.model.next_dump += 1;
@@ -422,7 +445,7 @@ impl App {
             o.stage = DumpStage::Sent(id);
         }
         let started = self.ui.now.unwrap_or_else(Instant::now);
-        self.model.dump = Some(Dumping { id: dump, request: id, job: job.clone(), started, progress: None, cancelling: None, ended: None });
+        self.model.dump = Some(Dumping { id: dump, request: id, job: job.clone(), base, started, progress: None, cancelling: None, ended: None });
         fx.commands.push(Command::Dump(id, dump, job));
     }
 
@@ -501,7 +524,7 @@ impl App {
                     let size = format!(" ({})", size_text(n as usize));
                     let objects = if d.job.schema.is_empty() { counted(last.total, "schema", "schemas") } else { counted(last.total, "object", "objects") };
                     let rows = rows_word(last.rows as usize);
-                    let loses = self.connection(&d.job.at.connection).is_some_and(|c| c.capabilities.dump_loses);
+                    let loses = self.connection(&d.job.at.connection).filter(|c| c.capabilities.dump_loses).map(|c| c.capabilities.dialect);
                     if last.errors > 0 {
                         let first = last.first_error.as_deref().map(|e| format!(" The first: {}.", e.trim_end_matches('.'))).unwrap_or_default();
                         let mut text = format!(
@@ -509,17 +532,18 @@ impl App {
                             counted(last.errors as usize, "error", "errors"),
                             done.path
                         );
-                        if loses {
-                            text.push_str(&format!(" {}", known_losses_note()));
+                        if let Some(dialect) = loses {
+                            text.push_str(&format!(" {}", known_losses_note(dialect)));
                         }
                         (text, true)
-                    } else if loses {
+                    } else if let Some(dialect) = loses {
                         // Not a bare "Dumped": dbx's dump of this kind is
                         // known not to restore whole (README "Dump").
                         let text = format!(
-                            "Wrote the dump of {name} to {}{size}: {objects}, {rows} in {}. dbx reported no errors; its dump is known not to restore whole: {KNOWN_LOSSES}. See README \"Dump\".",
+                            "Wrote the dump of {name} to {}{size}: {objects}, {rows} in {}. dbx reported no errors; its dump is known not to restore whole: {}. See README \"Dump\".",
                             done.path,
-                            duration_text(elapsed)
+                            duration_text(elapsed),
+                            known_losses(dialect)
                         );
                         (text, false)
                     } else {

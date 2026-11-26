@@ -217,11 +217,17 @@ async fn a_postgres_dialect_connection_that_cannot_browse_asks_the_core_for_no_n
 }
 
 #[tokio::test]
-async fn a_connection_without_a_database_level_and_a_default_database_is_not_a_target() {
+async fn a_connection_without_a_database_level_is_itself_the_target_under_the_empty_database_name() {
+    // Slice 23a: a SQLite file has no database to pick, so `u` on it is the
+    // target (before, with the file not browsable, it said it had no database).
     let mut c = conn("lite", DbKind::Sqlite);
     c.database = None;
     c.capabilities.databases = false;
     let mut h = started(FakeCore::new(), c).await;
+    h.press("u");
+    assert_eq!(h.app.model.tabs[0].target, Some(DatabasePath { connection: cid("lite"), database: String::new() }));
+    // A connection that has a database level still needs one picked.
+    let mut h = started(FakeCore::new(), conn("pg", DbKind::Postgres)).await;
     h.press("u");
     assert_eq!(h.app.model.tabs[0].target, None);
     let note = h.app.ui.note.as_ref().map(|n| n.text.clone()).unwrap_or_default();

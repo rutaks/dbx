@@ -2,8 +2,8 @@
 
 About ten minutes, from install to a first query, a browsed table and an
 export. You need a PostgreSQL server you can reach (a local one, a cloud one,
-or a throwaway you start yourself); dbpane itself needs nothing else, and in
-particular no Docker.
+or a throwaway you start yourself) or a SQLite file; dbpane itself needs
+nothing else, and in particular no Docker.
 
 Keys that begin with `ctrl+g` are the **prefix**: press `ctrl+g`, release it,
 then press the next key. The bar at the bottom of the window always shows the
@@ -46,6 +46,18 @@ host, port (5432), user, password, database, then two switches, TLS and
 **production**. Press `ctrl+t` to test the connection (a failure shows the
 server's message, never your password) and `enter` to save. `esc` cancels
 without losing what you typed.
+
+**A SQLite file.** The first row of the form is the **type**: `space` (or a
+click on the row) switches between PostgreSQL and SQLite. A SQLite connection
+has only a name, the **file** (a path such as `~/data/app.db`) and the
+production switch: no host, port, user, password or TLS. The file must already
+exist and be a regular file; dbpane never creates one, and says so if the path
+is wrong. A SQLite file has no databases or schemas to pick: open the
+connection and its tables are right there, and `u` on the connection (or on a
+table) points the query tab at it. Two tabs on one file each get their own
+connection to it, so they run side by side; a write in one tab holds the file's
+write lock, and a write in another tab then waits for it (up to about ten
+seconds) and cannot be stopped sooner.
 
 Mark a connection *production* if it is one. Statements that change anything
 then ask for a confirmation before they run (see Safety in the README).
@@ -228,6 +240,15 @@ restore:
 A structure-only dump restores every table dbx can make, empty. For a backup,
 use `pg_dump`.
 
+**SQLite.** `D` on a SQLite connection dumps the whole file (the overlay is
+titled with the connection's name). The dump loads into a new file with every
+table, view, index and row count, but it loses: a blob is written as the text
+`0x...`, `Infinity` becomes `NULL`, a time zone is dropped from a date-time,
+and an integer past 2^53 in a column with no declared type is written as text.
+dbpane refuses to dump into the connection's own file or the `-wal`,
+`-journal` or `-shm` beside it. For a backup of a SQLite file, copy it with
+`sqlite3 file.db ".backup copy.db"`.
+
 ## 10. Terminal setup
 
 dbpane asks your terminal for the kitty keyboard protocol and uses it if there
@@ -341,7 +362,9 @@ Inside kitty without the include file, or inside tmux without `extended-keys`,
 Cmd and some Ctrl combinations never reach dbpane: use `f5` and the prefix, or
 see Terminal setup above.
 
-**No database to try it on, and no Docker needed.** Any PostgreSQL will do. If
+**No database to try it on, and no Docker needed.** Any SQLite file will do
+(`sqlite3 try.db "create table t(a); insert into t values (1);"`, then add
+`try.db` by its full path). Or any PostgreSQL. If
 you have Docker and want a throwaway:
 `docker run --rm -e POSTGRES_PASSWORD=pw -p 55432:5432 postgres:16`, then
 connect to `127.0.0.1` port `55432`, user `postgres`. Stop it with `ctrl+c`;

@@ -608,7 +608,8 @@ async fn a_connection_that_is_not_postgres_says_it_cannot_be_browsed_yet_and_dbx
     let s = Scratch::new();
     let core = s.core();
     // Nothing listens on port 1: a call that reached dbx would fail to connect.
-    for (kind, name) in [(DbKind::MySql, "MySQL"), (DbKind::Sqlite, "SQLite")] {
+    // SQLite is browsed since slice 23a (tests/sqlite.rs).
+    for (kind, name) in [(DbKind::MySql, "MySQL")] {
         let draft = ConnectionDraft { kind: kind.clone(), port: Some(1), ..draft("other") };
         let id = core.save_connection(&draft).await.expect("save").id;
         let expected = format!("Browsing {name} is not supported yet.");

@@ -28,7 +28,7 @@ fn screen(h: &mut Harness) -> Vec<String> {
 
 /// The text inside the form's box, one string per row, without the border.
 /// Panics if no form is on screen.
-fn form_rows(h: &mut Harness) -> Vec<String> {
+pub(super) fn form_rows(h: &mut Harness) -> Vec<String> {
     let rows = screen(h);
     let top = rows.iter().position(|r| r.contains('┌')).unwrap_or_else(|| panic!("no box on screen:\n{}", rows.join("\n")));
     let chars = |r: &str| r.chars().collect::<Vec<_>>();
@@ -125,13 +125,17 @@ async fn tab_moves_between_fields_and_typed_text_lands_in_the_focused_field_only
     h.press("up");
     h.type_text("y");
     assert!(field_row(&mut h, "host").1.contains("db.example.comy"));
+    // Name, then the type row above it (which takes no text), then the last row.
     h.press("up up");
+    h.type_text("z");
+    assert!(!form_text(&mut h).contains('z'), "the type row takes no text");
+    h.press("up");
     h.type_text("z");
     assert!(field_row(&mut h, "production").1.contains("[ ]"), "wrapped to the last row, a checkbox, which takes no text");
     assert!(!form_text(&mut h).contains('z'));
-    h.press("tab");
+    h.press("tab tab");
     h.type_text("w");
-    assert!(field_row(&mut h, "name").1.contains("alphaw"), "and forward past the last row to the first");
+    assert!(field_row(&mut h, "name").1.contains("alphaw"), "and forward past the last row to the type row and the name");
 }
 
 #[tokio::test]
@@ -140,7 +144,8 @@ async fn space_toggles_a_checkbox_only_when_it_has_focus_and_text_fields_take_a_
     h.press("ctrl+g n");
     h.press("space");
     assert!(field_row(&mut h, "name").1.contains(' '), "a space typed into the name");
-    h.press("backtab");
+    // The type row comes first: two steps back from the name is the last row.
+    h.press("backtab backtab");
     assert!(field_row(&mut h, "production").1.contains("[ ]"));
     h.press("space");
     assert!(field_row(&mut h, "production").1.contains("[x]"));
@@ -1000,7 +1005,7 @@ async fn e_edits_postgres_connections_only_and_says_where_to_edit_the_others() {
     let side = sidebar_rows(&mut h, W, H).join("\n");
     assert!(side.contains("dbx app"), "it says where to edit it: {side}");
     h.press("j");
-    assert!(!bar(&mut h).contains("e edit"), "nor on SQLite");
+    assert!(bar(&mut h).contains("e edit"), "SQLite has a form since slice 23a");
     h.press("k k");
     assert!(bar(&mut h).contains("e edit"), "back on Postgres");
     h.press("e");

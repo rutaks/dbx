@@ -255,7 +255,7 @@ impl App {
         if wanted.is_empty() {
             return out;
         }
-        let Some(current) = self.model.completions.current_schema.get(db).cloned() else {
+        let Some(current) = self.current_schema_of(db) else {
             out.needs.push((Need::CurrentSchema(db.clone()), String::new()));
             return out;
         };

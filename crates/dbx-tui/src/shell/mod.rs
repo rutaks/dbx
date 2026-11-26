@@ -470,7 +470,7 @@ mod tests {
         ExportJob {
             request: ExportRequest {
                 format: ExportFormat::Csv,
-                columns: vec![Column { name: "v".into(), db_type: "text".into(), kind: CellKind::Text }],
+                columns: vec![Column { name: "v".into(), db_type: "text".into(), kind: CellKind::Text, numbers: Vec::new() }],
                 rows: vec![vec![Cell::Value("a".into())]],
                 kind: None,
                 table: "t".into(),

@@ -351,7 +351,7 @@ async fn removing_the_tabs_connection_takes_its_target_away() {
 // ---- helpers for results ----------------------------------------------------------
 
 pub(super) fn col(name: &str, db_type: &str, kind: CellKind) -> Column {
-    Column { name: name.into(), db_type: db_type.into(), kind }
+    Column { name: name.into(), db_type: db_type.into(), kind, numbers: Vec::new() }
 }
 
 /// A one-column text result with these rows.

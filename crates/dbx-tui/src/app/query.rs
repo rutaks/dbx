@@ -323,6 +323,11 @@ impl App {
         let Some(row) = self.cursor_row().cloned() else { return };
         let at = match (&row.kind, row.node.database_path()) {
             (_, Some(at)) => at.clone(),
+            // A connection with no database level (a SQLite file) is itself
+            // what a tab runs on, under the empty database name.
+            (RowKind::Connection { .. }, None) if self.connection(row.node.connection()).is_some_and(|c| !c.capabilities.databases) => {
+                DatabasePath { connection: row.node.connection().clone(), database: String::new() }
+            }
             (RowKind::Connection { name, default_database: Some(db), .. }, None) => {
                 let _ = name;
                 DatabasePath { connection: row.node.connection().clone(), database: db.clone() }

@@ -3,7 +3,7 @@
 
 use crossterm::event::KeyEvent;
 
-use super::form::{ConnectionForm, FormKey, FormStatus};
+use super::form::{ConnectionForm, FormKey, FormStatus, KindChoice};
 use super::overlay::{ConfirmRemove, FailureOverlay, FieldHit, Overlay};
 use super::requests::Target;
 use super::{App, Command, CoreCall, Effects, Loadable, Mode};
@@ -22,7 +22,16 @@ impl App {
         // describes for it.
         let kind: DbKind = Default::default();
         let port = self.ui.syntax.capabilities(&kind).default_port;
-        self.ui.overlay = Some(Overlay::Form(Box::new(ConnectionForm::new_connection(serial, kind, port))));
+        // The types the form can fill in: those whose rows it has.
+        let choices: Vec<KindChoice> = crate::core::form_kind_candidates()
+            .into_iter()
+            .filter_map(|kind| {
+                let caps = self.ui.syntax.capabilities(&kind);
+                caps.edit_in_form.then_some(KindChoice { kind, local_file: caps.local_file, default_port: caps.default_port })
+            })
+            .collect();
+        let form = ConnectionForm::new_connection(serial, kind, port).with_choices(choices);
+        self.ui.overlay = Some(Overlay::Form(Box::new(form)));
         self.ui.mode = Mode::Normal;
     }
 

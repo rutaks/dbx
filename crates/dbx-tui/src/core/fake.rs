@@ -197,26 +197,41 @@ impl Capabilities {
             dialect: Dialect::PostgreSql,
             single_connection: false,
             dump_loses: true,
+            local_file: false,
+            completes: true,
+            fixed_schema: false,
         }
     }
 
     /// A MySQL-shaped connection: databases and then tables, no schemas.
     pub fn mysql() -> Self {
-        Capabilities { schemas: false, edit_in_form: false, default_port: Some(3306), dialect: Dialect::MySql, dump_loses: false, ..Self::postgres() }
+        Capabilities {
+            schemas: false,
+            edit_in_form: false,
+            default_port: Some(3306),
+            dialect: Dialect::MySql,
+            dump_loses: false,
+            completes: false,
+            ..Self::postgres()
+        }
     }
 
     /// A SQLite-shaped connection: a file with tables, no databases and no
-    /// schemas, one server connection.
+    /// schemas, one server connection, and `main` for the schema names
+    /// resolve in.
     pub fn sqlite() -> Self {
         Capabilities {
             databases: false,
             schemas: false,
             explain: false,
-            edit_in_form: false,
+            edit_in_form: true,
             default_port: None,
             dialect: Dialect::Sqlite,
             single_connection: true,
             dump_loses: false,
+            local_file: true,
+            completes: true,
+            fixed_schema: true,
             ..Self::postgres()
         }
     }

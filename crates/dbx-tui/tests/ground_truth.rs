@@ -531,7 +531,7 @@ async fn removing_or_changing_a_listed_entry_makes_the_check_fail_naming_table_r
 
 fn core_set(db_type: &str, kind: dbx_tui::core::CellKind, values: &[Option<&str>]) -> ResultSet {
     ResultSet {
-        columns: vec![dbx_tui::core::Column { name: "c".into(), db_type: db_type.into(), kind }],
+        columns: vec![dbx_tui::core::Column { name: "c".into(), db_type: db_type.into(), kind, numbers: Vec::new() }],
         rows: values.iter().map(|v| vec![v.map_or(Cell::Null, |v| Cell::Value(v.to_string()))]).collect(),
         truncated: false,
         elapsed: std::time::Duration::ZERO,

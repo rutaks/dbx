@@ -99,6 +99,8 @@ mod browse_tests;
 #[cfg(test)]
 mod capabilities_tests;
 #[cfg(test)]
+mod sqlite_tests;
+#[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
@@ -452,10 +454,22 @@ impl App {
     }
 
     /// Whether names, columns and analysis come from the Core for the query
-    /// tab's connection: it speaks PostgreSQL and the client can browse it.
-    /// The dialect alone says how to colour, quote and format, not this.
+    /// tab's connection: the client can browse it and the Core answers the
+    /// searches completion asks (`Capabilities::completes`). The dialect alone
+    /// says how to colour, quote and format, not this.
     pub fn core_names(&self) -> bool {
-        self.active_connection().is_some_and(|c| c.capabilities.browse && c.capabilities.dialect == crate::core::Dialect::PostgreSql)
+        self.active_connection().is_some_and(|c| c.capabilities.browse && c.capabilities.completes)
+    }
+
+    /// The schema unqualified names resolve in for the database `db`: the
+    /// connection type's fixed one (`main` for SQLite), else what the Core
+    /// said when it was asked (`Need::CurrentSchema`).
+    pub(super) fn current_schema_of(&self, db: &DatabasePath) -> Option<String> {
+        let fixed = self.connection(&db.connection).is_some_and(|c| c.capabilities.fixed_schema);
+        if fixed {
+            return Some(crate::core::FIXED_SCHEMA.to_string());
+        }
+        self.model.completions.current_schema.get(db).cloned()
     }
 
     pub fn new() -> Self {

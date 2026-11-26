@@ -127,6 +127,85 @@ line there plus its tests, not edits across `app`. A type whose
 queried. `Syntax::capabilities(kind)` answers the same for a kind before any
 connection exists (the new-connection form's port).
 
+## SQLite (slice 23a)
+
+A SQLite file is a connection of type SQLite (`BROWSED_HERE` and `COMPLETED_HERE`
+in `src/core/dbx.rs`; `Capabilities { local_file, completes, fixed_schema, .. }`).
+The form's first row is the type (`space`, the arrows or a click on the choices
+switch it; what was typed for one type is kept, and back when it is chosen
+again); a file connection has a name, the **file** (saved as dbx's `host`, `~/`
+expanded as dbx does) and the production flag. `DbxCore` refuses a path that
+is not an existing regular file starting with SQLite's 16-byte header (an empty
+file is an empty database and is accepted), and `~user/` (dbx would look the
+user up), on a test and on a save of a new path, and never creates or writes
+one (`check_local_file`). A relative path is saved joined to the working
+directory (`absolute_file_path`: `.` dropped, `..` and symbolic links kept as
+given, not resolved), so the store names the same file from anywhere.
+
+- **Tree:** no database and no schema level; `u` on the connection row targets
+  it (database name empty); `D` on it dumps the file (titled by the connection).
+- **Names:** unqualified names resolve in `main` (`FIXED_SCHEMA`), so
+  `current_schema` is never asked of the Core (`DbxCore::current_schema` answers
+  `main` too). dbx's search treats `""` and `main` alike; the app uses `main`.
+- **Tabs do not queue.** `single_connection_pool` is about the connection, not
+  the sessions: dbx opens one SQLite handle per tab session for a file (only
+  `:memory:` shares one), so two tabs read side by side, and closing a tab's
+  session closes only its own handle (`tests/sqlite.rs`). A write holds the
+  file's write lock; another tab's write waits on SQLite's busy handler (about
+  ten seconds) and the interrupt does not end the wait (dbx notes the same):
+  the run returns `Cancelled` only after the statement has ended, so the app
+  shows "has not stopped yet" until then and never claims a stop early. The
+  interrupt is remembered, though: when the lock comes free first (the other
+  tab commits), the waiting write stops there and writes nothing, so
+  `Cancelled` is the truth in both cases (pinned both ways). Not covered: a
+  cancel landing in the instant after a statement finished but before dbx
+  hands its result back is reported by dbx as cancelled (its cancel wins that
+  race), and the client cannot tell. A recursive CTE counting to 10^9 is
+  interrupted at once and the next statement runs.
+- **Confirmations:** dbx's `prove_read_only_for_database` proves nothing on
+  SQLite (`Unproven` for every statement), which would ask about every read
+  and browse page on a production file and make load more always ask. So
+  SQLite itself is asked (`src/core/sqlite_proof.rs`, used by the gate, the
+  fresh-flags check and `Rerun`): the file is opened read-only and immutable
+  (`file:…?mode=ro&immutable=1`: no lock, no journal, no `-wal` or `-shm`
+  opened or made, nothing created; unit tests compare the directory before
+  and after, with a WAL writer open too), each statement is prepared and
+  never stepped, and it is proven only if every statement starts with
+  `SELECT`, `WITH` or `VALUES`, prepares there, is `sqlite3_stmt_readonly`,
+  is not `EXPLAIN`, and names neither `load_extension` nor `fts3_tokenizer`.
+  A statement that does not prepare (a missing table, dbx's own `unistr` and
+  `if`, an extension's function, a table newer than the WAL checkpoint) stays
+  unproven and asks. Only for a local file with no URL parameters (dbx's
+  extensions) and no SSH layer. `rusqlite` is a direct dependency at dbx's
+  locked 0.32.1 with no features of ours: the same crate and bundled SQLite,
+  nothing new in the lock. `ATTACH`, `VACUUM` and `PRAGMA writable_schema`
+  are dangerous whatever dbx or SQLite says (`sqlite_dangerous`), and ask
+  on production even with the danger setting off.
+- **Values:** `tests/ground_truth_sqlite.rs` compares about 358,000 cells of
+  `edge.db` and Sakila with `sqlite3 -quote`; every difference is in
+  `tests/fixtures/KNOWN_DIFFERENCES-sqlite.md` (infinity shows as NULL, a blob as
+  `0x..`, reals in their shortest spelling; reals are compared bit for bit
+  through `hex(ieee754_to_blob(x))`).
+- **Export and dump:** dbx supports both. For a column with no type name (an
+  expression, or one declared without a type) `Column::numbers` keeps which
+  cells dbx gave as JSON numbers, and the export writes those as numbers; an
+  integer past 2^53 there comes from dbx as text and stays text. A dump loads
+  into a new file with the same tables, views, indexes and rows, losing the
+  things in `KNOWN_LOSSES_SQLITE` (`src/app/dump.rs`; pinned in
+  `tests/sqlite.rs`). A dump whose file is the connection's own file or its
+  `-wal`, `-journal` or `-shm` is refused (`sqlite_dump_target_refused`: by
+  device and inode, or by directory and name for one not there yet): dbx
+  would write it over the file it reads.
+- **Fixtures, no Docker:** `tests/fixtures/fetch-sakila.sh` (jOOQ/sakila at a
+  pinned commit, sha256-checked), `tests/fixtures/sqlite/build.sh` (`sakila.db`
+  and `edge.db` from `edge.sql` into `target/sqlite-fixtures`, with the sqlite3
+  version), `tests/fixtures/sqlite/check.sh` (also run by `check.sh`). Tests copy
+  a file to a temporary directory before opening it. Run
+  `cargo test -p dbx-tui --test sqlite --test ground_truth_sqlite -- --test-threads=1`
+  and `tests/journeys/sqlite.sh`.
+- **Not supported:** encrypted files, attached databases, creating a file,
+  SQLite over SSH.
+
 ## The schema tree (sidebar)
 
 Connection, database, schema, table or view, column, each level loaded on

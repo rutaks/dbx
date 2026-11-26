@@ -1229,8 +1229,10 @@ async fn a_scratch_sqlite_connection_has_no_database_or_schema_level_and_one_con
     assert!(caps.query && caps.edit_data && !caps.explain, "{caps:?}");
     assert_eq!(caps.default_port, None);
     assert_eq!(caps.dialect, Dialect::Sqlite);
-    // dbx can browse it; this client does not yet, and says so.
-    assert!(!caps.browse && !caps.edit_in_form, "{caps:?}");
+    // dbx can browse it, and since slice 23a so does this client, with a form
+    // of its own (a name and a file), completion and a fixed schema, `main`.
+    assert!(caps.browse && caps.edit_in_form && caps.local_file && caps.completes, "{caps:?}");
+    assert!(caps.fixed_schema, "{caps:?}");
 }
 
 #[tokio::test]
@@ -1899,7 +1901,7 @@ async fn a_quoted_column_and_table_name_reload_from_the_insert_file_with_the_sam
         q = quote_ident(quoted)
     ));
     let text = |v: &str| Cell::Value(v.to_string());
-    let column = |n: &str| Column { name: n.into(), db_type: "text".into(), kind: dbx_tui::core::CellKind::Text };
+    let column = |n: &str| Column { name: n.into(), db_type: "text".into(), kind: dbx_tui::core::CellKind::Text, numbers: Vec::new() };
     let request = ExportRequest {
         format: ExportFormat::SqlInsert,
         columns: vec![column(hostile), column(quoted), column("plain")],
@@ -1975,7 +1977,7 @@ async fn what_dbx_does_to_other_values_in_an_excel_file() {
     // lists each.
     let s = Scratch::new();
     let core = s.core();
-    let col = |name: &str, db_type: &str, kind| Column { name: name.into(), db_type: db_type.into(), kind };
+    let col = |name: &str, db_type: &str, kind| Column { name: name.into(), db_type: db_type.into(), kind, numbers: Vec::new() };
     let long = "x".repeat(40_000);
     let request = ExportRequest {
         format: ExportFormat::Excel,

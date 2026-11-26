@@ -72,3 +72,5 @@ check edge "select jp::text || '|' || x8::text || '|' || rt::text from gt_catalo
 check edge "select string_agg(ts3::text || '|' || t3::text, ',' order by id) from gt_precision where id in (3, 4)" "2024-03-05 13:45:12.124|13:45:12.124,2025-01-01 00:00:00|24:00:00"
 check edge "select string_agg(ad::text || '|' || ai8::text || '|' || ae::text || '|' || ac::text, ',' order by id) from gt_arrays_more where id = 1" '{2024-03-05,1970-01-01}|{9007199254740993,-9223372036854775808}|{ok,"a b",it'"'"'s}|{"(1,\"a b\")","(2,)"}'
 echo "OK fixtures: $n checks"
+# The SQLite fixtures need no Docker (sqlite/check.sh builds and checks them).
+./sqlite/check.sh

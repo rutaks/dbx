@@ -7,6 +7,7 @@ mod dbx;
 mod dump;
 mod export;
 mod fake;
+mod sqlite_proof;
 mod store;
 
 use std::fmt;
@@ -91,6 +92,16 @@ impl DbKind {
     }
 }
 
+/// The schema names resolve in for a connection with `Capabilities::fixed_schema`.
+pub const FIXED_SCHEMA: &str = "main";
+
+/// The kinds the connection form may offer, in order; it keeps those whose
+/// `Capabilities::edit_in_form` is set. (A function of its own, so that `app`
+/// never names a `DbKind` variant.)
+pub fn form_kind_candidates() -> Vec<DbKind> {
+    vec![DbKind::Postgres, DbKind::MySql, DbKind::Sqlite]
+}
+
 /// The SQL dialect a connection speaks, as far as the client chooses between
 /// them: the highlighter's quoting, the formatter's case rules and the
 /// completion's quoting. `Generic` is every dialect the client has no rules
@@ -139,9 +150,21 @@ pub struct Capabilities {
     /// is opened per database.
     pub single_connection: bool,
     /// dbx's dump of this kind is known not to restore whole (checked on
-    /// Postgres; GaussDB and openGauss share its dump code). The dump screen
-    /// and its end say so (README "Dump").
+    /// Postgres, whose dump code GaussDB and openGauss share, and on SQLite).
+    /// The dump screen and its end say so, with the losses of `dialect`
+    /// (README "Dump").
     pub dump_loses: bool,
+    /// The database is one file the user names by its path (SQLite): the form
+    /// asks for a name and the path, which is saved as the host, and nothing
+    /// else.
+    pub local_file: bool,
+    /// Completion, templates and marks run on it: dbx answers the catalogue
+    /// searches they ask for, and the client knows how its names resolve.
+    pub completes: bool,
+    /// The schema unqualified names resolve in is fixed, `FIXED_SCHEMA`
+    /// (`main`, for SQLite), and no query is needed to know it. When false
+    /// the app asks the Core (`current_schema`).
+    pub fixed_schema: bool,
 }
 
 /// A saved, named way to reach one database server.
@@ -609,6 +632,12 @@ pub struct Column {
     pub name: String,
     pub db_type: String,
     pub kind: CellKind,
+    /// For a column with no type name only: the rows (indexes into the
+    /// result's rows, ascending) whose value the database gave as a number.
+    /// SQLite types each value, and an expression or a column declared
+    /// without a type has no type name, so this is all that tells the
+    /// integer `42` from the text `'42'`. An export writes these as numbers.
+    pub numbers: Vec<usize>,
 }
 
 /// NULL, or the exact text the database gave. Numbers stay text so nothing

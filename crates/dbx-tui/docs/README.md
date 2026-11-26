@@ -313,9 +313,43 @@ keep a scratch store off your keychain, set `DBX_SECRET_KEY_FILE` as well as
 
 ## Supported databases
 
-**PostgreSQL** today: browsing, queries, completion, export, dump. dbx's
-connection types for MySQL and SQLite are listed in the tree but cannot be
-browsed yet; MySQL and SQLite support is coming.
+**PostgreSQL** and **SQLite**: browsing, queries, completion, export, dump.
+dbx's connection type for MySQL is listed in the tree but cannot be browsed
+yet; MySQL support is coming.
+
+**What differs on SQLite** (a file you add with `ctrl+g n`, choosing the type
+SQLite: a name and the file's path, which must be an existing SQLite file;
+dbpane never creates one; a relative path is saved joined to the directory
+dbpane was started in, and `~user/` is refused):
+
+- The tree has no databases or schemas: the connection holds the tables and
+  views. `u` on the connection or on a table points the tab at it; `D` dumps
+  the file.
+- Names resolve in `main`; completion, templates and marks work as on
+  PostgreSQL (an unqualified table is never marked as missing).
+- Tabs on one file each have their own connection, so reads run side by side.
+  A write holds the file's write lock; another tab's write waits for it for
+  about ten seconds and cannot be cancelled sooner (the cancel is shown as
+  not stopped yet, never as cancelled, until the statement has ended). A
+  write cancelled while it waits writes nothing, even if the lock comes free.
+- Confirmations: on a production file, a read runs without asking when SQLite
+  itself, preparing it on the file without running it, says it only reads;
+  anything else asks (a write, a statement SQLite cannot prepare there). The
+  same proof lets "load more" run a read again without asking. `ATTACH`,
+  `VACUUM` and `PRAGMA writable_schema` always ask, as dangerous.
+- Values: `Infinity` shows as `NULL` (dbx's decoding), a blob shows as `0x`
+  and its hex digits, and a real shows its shortest exact spelling.
+  `tests/fixtures/KNOWN_DIFFERENCES-sqlite.md` lists every difference found
+  against `sqlite3` in about 358,000 cells.
+- The dump is not a backup here either: it loads into a new file with every
+  table, view, index and row count, but a blob is written as text `0x...`,
+  `Infinity` becomes `NULL`, a time zone is dropped from a date-time, and an
+  integer past 2^53 in a column with no declared type is written as text.
+  The dump is refused when its file is the connection's own file or the
+  `-wal`, `-journal` or `-shm` beside it. Copy the file (or
+  `sqlite3 file.db ".backup copy.db"`) for a backup.
+- Not supported: encrypted files, attached databases, creating a file, and
+  SQLite over SSH.
 
 ## Uninstall
 

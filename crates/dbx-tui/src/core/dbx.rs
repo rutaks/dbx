@@ -603,7 +603,16 @@ fn not_ready(dir: &Path, p: &MigrationPreflight, source: KeySource) -> CoreError
 /// The connection types this client browses and edits in its form so far.
 /// dbx describes ninety; the adapter behind `Core::schemas`, completion and the
 /// form is built and tested for these only. One line to grow.
-const BROWSED_HERE: [DatabaseType; 1] = [DatabaseType::Postgres];
+const BROWSED_HERE: [DatabaseType; 2] = [DatabaseType::Postgres, DatabaseType::Sqlite];
+
+/// The types completion, templates and marks run on: a subset of
+/// `BROWSED_HERE`, for which the catalogue searches they ask for are tested
+/// against dbx (README "Completion").
+const COMPLETED_HERE: [DatabaseType; 2] = [DatabaseType::Postgres, DatabaseType::Sqlite];
+
+/// The schema SQLite resolves unqualified names in, and the one dbx lists
+/// its tables under.
+const SQLITE_SCHEMA: &str = FIXED_SCHEMA;
 
 /// What dbx's descriptor says that its Rust manifest does not carry: the
 /// tree-shape traits and `sqlExplain`, read from the manifest dbx bundles
@@ -657,7 +666,10 @@ fn capabilities_of(db_type: DatabaseType) -> Capabilities {
             _ => Dialect::Generic,
         },
         single_connection: entry.single_connection_pool,
-        dump_loses: matches!(db_type, DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss),
+        dump_loses: matches!(db_type, DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss | DatabaseType::Sqlite),
+        local_file: entry.local_file && here,
+        completes: COMPLETED_HERE.contains(&db_type),
+        fixed_schema: db_type == DatabaseType::Sqlite,
     }
 }
 
@@ -727,6 +739,9 @@ fn config_from_draft(draft: &ConnectionDraft, existing: Option<ConnectionConfig>
     };
     config.name = draft.name.trim().to_string();
     config.host = draft.host.trim().to_string();
+    if config.db_type == DatabaseType::Sqlite {
+        config.host = absolute_file_path(&config.host);
+    }
     config.port = draft.port.unwrap_or(capabilities_of(config.db_type).default_port.unwrap_or(0));
     config.username = draft.username.trim().to_string();
     config.database = draft.database.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
@@ -736,6 +751,76 @@ fn config_from_draft(draft: &ConnectionDraft, existing: Option<ConnectionConfig>
         config.password = password.clone();
     }
     Ok(config.canonicalized())
+}
+
+/// A SQLite connection names a SQLite file that is there. The form saves the
+/// path as the host; dbx would create nothing, but a path that is a directory
+/// or is missing fails only when the first query opens it, with a message
+/// about the driver, not the path. Refused here, before anything is saved or
+/// opened, and the file is never created or written.
+///
+/// - `~/` is expanded as dbx expands it. dbx also expands `~user/` (another
+///   user's home, looked up in the user database); this client refuses it,
+///   so the path saved is one that reads the same to a person.
+/// - A regular file that is not empty must start with SQLite's 16-byte
+///   header (`SQLite format 3\0`), as dbx's own file check has it. An empty
+///   file is an empty database to SQLite, and is accepted. (An encrypted
+///   file has no header: encrypted files are not supported.)
+fn check_local_file(config: &ConnectionConfig) -> Result<(), CoreError> {
+    if config.db_type != DatabaseType::Sqlite {
+        return Ok(());
+    }
+    let path = config.host.trim();
+    let refused = |why: &str| CoreError::new(CoreErrorKind::Refused, format!("{} {why}", display_safe(path)));
+    if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+        return Err(refused("names another user's home (`~user/`), which dbpane does not look up. Give the full path."));
+    }
+    let expanded = match path.strip_prefix("~/").or_else(|| (path == "~").then_some("")) {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => Path::new(&home).join(rest),
+            None => PathBuf::from(path),
+        },
+        None => PathBuf::from(path),
+    };
+    // `metadata` follows a symbolic link: a link to a file is a file.
+    let Some(meta) = std::fs::metadata(&expanded).ok().filter(|m| !path.is_empty() && m.is_file()) else {
+        return Err(refused("is not an existing regular file. Give the path of a SQLite file that is there: dbpane does not create one."));
+    };
+    if meta.len() > 0 {
+        use std::io::Read;
+        let mut header = [0_u8; 16];
+        let read = std::fs::File::open(&expanded).and_then(|mut f| f.read_exact(&mut header));
+        match read {
+            Ok(()) if &header == b"SQLite format 3\0" => {}
+            Ok(()) => return Err(refused("is not a SQLite database: it does not start with SQLite's header (`SQLite format 3`).")),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(refused("is not a SQLite database: it is shorter than SQLite's 16-byte header."));
+            }
+            Err(e) => return Err(refused(&format!("could not be read to check it is a SQLite database: {}.", display_safe(&e.to_string())))),
+        }
+    }
+    Ok(())
+}
+
+/// The path a SQLite connection saves: as given when it is absolute or starts
+/// with `~` (dbx expands `~/`; `check_local_file` refuses `~user/`), else
+/// joined to the working directory, so it names the same file whichever
+/// directory dbpane (or the desktop app sharing the store) is started from.
+/// `.` components are dropped; nothing else is resolved: `..` stays, and a
+/// symbolic link is kept as the name the user gave, not swapped for its
+/// target (SQLite follows it when it opens the file).
+fn absolute_file_path(host: &str) -> String {
+    let path = Path::new(host);
+    // `:memory:` is dbx's name for a database with no file (as its
+    // `is_memory_database_path` has it).
+    if host.is_empty() || host.starts_with('~') || path.is_absolute() || host.eq_ignore_ascii_case(":memory:") {
+        return host.to_string();
+    }
+    let Ok(mut joined) = std::env::current_dir() else { return host.to_string() };
+    for part in path.components().filter(|c| !matches!(c, std::path::Component::CurDir)) {
+        joined.push(part);
+    }
+    joined.to_string_lossy().into_owned()
 }
 
 /// dbx's words for a failed connection, with every secret we know of blanked
@@ -891,16 +976,31 @@ fn statement_at(buffer: &str, cursor: Cursor, db_type: DatabaseType) -> String {
 /// name (`column_types`); a column dbx gives no type name for is `Other`. Every cell is NULL or text:
 /// numbers keep the digits dbx gave, never passing through a float.
 fn result_set(result: dbx_core::db::QueryResult, ran: String, database_type: DatabaseType) -> ResultSet {
+    result_set_on(result, ran, database_type, None)
+}
+
+/// `result_set`, for a run on the SQLite file `file` (`sqlite_file`), which
+/// SQLite itself is asked whether `ran` can run again.
+fn result_set_on(result: dbx_core::db::QueryResult, ran: String, database_type: DatabaseType, file: Option<&Path>) -> ResultSet {
     let columns = result
         .columns
         .iter()
         .enumerate()
         .map(|(i, name)| {
             // No type name, no kind: the cells' JSON types change with the
-            // path dbx's driver took, so they cannot stand in for one.
+            // path dbx's driver took, so they cannot stand in for one. But
+            // for such a column dbx's JSON says, value by value, which are
+            // numbers (SQLite types each value, and an expression or a
+            // column declared without a type has no type name): the export
+            // writes those as numbers.
             let db_type = result.column_types.get(i).cloned().unwrap_or_default();
             let kind = if db_type.is_empty() { CellKind::Other } else { kind_of_type(&db_type) };
-            Column { name: name.clone(), db_type, kind }
+            let numbers = if db_type.is_empty() {
+                result.rows.iter().enumerate().filter(|(_, row)| matches!(row.get(i), Some(serde_json::Value::Number(_)))).map(|(r, _)| r).collect()
+            } else {
+                Vec::new()
+            };
+            Column { name: name.clone(), db_type, kind, numbers }
         })
         .collect();
     let rows = result.rows.into_iter().map(|row| row.into_iter().map(cell).collect()).collect();
@@ -912,7 +1012,7 @@ fn result_set(result: dbx_core::db::QueryResult, ran: String, database_type: Dat
         elapsed: std::time::Duration::from_millis(result.execution_time_ms.min(u64::MAX as u128) as u64),
         messages,
         affected: result.affected_rows,
-        rerun: rerun_of(&ran, database_type),
+        rerun: rerun_on(&ran, database_type, file),
         ran,
     }
 }
@@ -929,8 +1029,15 @@ fn result_set(result: dbx_core::db::QueryResult, ran: String, database_type: Dat
 ///    `select set_config(.., false)` read-only, because it cannot know what a
 ///    function does. Failing it is `Write`.
 /// 3. dbx's `prove_read_only_for_database` (an allowlist of pure functions)
-///    decides between `Proven` and `ReadOnlyUnproven`.
+///    decides between `Proven` and `ReadOnlyUnproven`. dbx proves nothing on
+///    SQLite: there SQLite itself is asked, on the file (`sqlite_proof`).
+#[cfg(test)]
 fn rerun_of(sql: &str, database_type: DatabaseType) -> Rerun {
+    rerun_on(sql, database_type, None)
+}
+
+/// `rerun_of` for a statement that ran on the SQLite file `file`, if any.
+fn rerun_on(sql: &str, database_type: DatabaseType, file: Option<&Path>) -> Rerun {
     let mut rest = sql.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix("--") {
@@ -955,8 +1062,34 @@ fn rerun_of(sql: &str, database_type: DatabaseType) -> Rerun {
     }
     match dbx_core::sql_risk::prove_read_only_for_database(&judged, database_type) {
         dbx_core::sql_risk::ReadProof::ProvenReadOnly => Rerun::Proven,
+        dbx_core::sql_risk::ReadProof::Unproven if file.is_some_and(|f| super::sqlite_proof::proves_read_only(f, &judged)) => Rerun::Proven,
         dbx_core::sql_risk::ReadProof::Unproven => Rerun::ReadOnlyUnproven,
     }
+}
+
+/// The file SQLite opens for `config`, when SQLite itself may be asked
+/// whether a statement only reads it (`sqlite_proof`): a SQLite connection
+/// to a local file (no SSH or other layer, no URL parameters, which is where
+/// dbx keeps the extensions it loads), named by an absolute path once `~/`
+/// is expanded as dbx expands it. `None` leaves dbx's own answer.
+fn sqlite_file(config: &ConnectionConfig) -> Option<PathBuf> {
+    if config.db_type != DatabaseType::Sqlite || !config.transport_layers.is_empty() || config.url_params.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+        return None;
+    }
+    let path = PathBuf::from(dbx_core::path_utils::expand_tilde(config.host.trim()));
+    path.is_absolute().then_some(path)
+}
+
+/// Statements on a SQLite file asked about as dangerous whatever dbx says
+/// and whatever SQLite's own proof says: `ATTACH` (opens, and can create,
+/// another file), `VACUUM` (rewrites the file; `VACUUM INTO` writes a new
+/// one) and `PRAGMA writable_schema` (lets the schema be written by hand).
+fn sqlite_dangerous(sql: &str, db_type: DatabaseType) -> bool {
+    db_type == DatabaseType::Sqlite
+        && statements_of(sql).iter().any(|s| {
+            let word = first_word(s).to_ascii_lowercase();
+            word == "attach" || word == "vacuum" || (word == "pragma" && s.to_ascii_lowercase().contains("writable_schema"))
+        })
 }
 
 /// Why a statement must wait for a yes, before the names of the connection
@@ -993,6 +1126,7 @@ fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerou
     if config.read_only && [Some(sql), inner.as_deref()].into_iter().flatten().any(|s| dbx_core::query_execution_sql::is_write_sql_for_database(s, db_type)) {
         return None;
     }
+    let file = sqlite_file(config);
     let first_of = |text: &str| match classify_sql_risk_for_database(text, db_type) {
         Err(_) => Some(Reason::Unparsed),
         Ok(SqlRisk::Write) => Some(Reason::Writes),
@@ -1000,6 +1134,8 @@ fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerou
         Ok(SqlRisk::Transaction) => Some(Reason::TransactionControl),
         Ok(SqlRisk::ReadOnly) => match prove_read_only_for_database(text, db_type) {
             ReadProof::ProvenReadOnly => None,
+            // dbx proves nothing on SQLite: SQLite does, on the file.
+            ReadProof::Unproven if file.as_deref().is_some_and(|f| super::sqlite_proof::proves_read_only(f, text)) => None,
             ReadProof::Unproven => Some(Reason::Unproven),
         },
     };
@@ -1019,7 +1155,15 @@ fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerou
     if switches && only_switches(sql) {
         first = Some(Reason::SwitchesDatabase);
     }
-    let dangerous = is_dangerous_sql_for_database(sql, db_type) || inner.as_deref().is_some_and(|i| is_dangerous_sql_for_database(i, db_type));
+    let dangerous = is_dangerous_sql_for_database(sql, db_type)
+        || inner.as_deref().is_some_and(|i| is_dangerous_sql_for_database(i, db_type))
+        || sqlite_dangerous(sql, db_type);
+    // What is dangerous on a SQLite file is never "proven read-only" (the
+    // proof takes only SELECT, WITH and VALUES; this holds even if it took
+    // more): on production it asks.
+    if first.is_none() && sqlite_dangerous(sql, db_type) {
+        first = Some(Reason::Dangerous);
+    }
     // A session that has switched database may be anywhere the connection
     // lists as production: judged against the tab's database, a write would
     // pass. Whatever is not proven read-only is aimed at production.
@@ -1033,7 +1177,7 @@ fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerou
         if switches && first != Some(Reason::SwitchesDatabase) {
             reasons.push(Reason::SwitchesDatabase);
         }
-        if dangerous {
+        if dangerous && first != Some(Reason::Dangerous) {
             reasons.push(Reason::Dangerous);
         }
         if by_session {
@@ -1127,13 +1271,16 @@ fn switches_database(sql: &str) -> bool {
 /// Whether dbx proves `sql` (and what an `EXPLAIN ANALYZE` of it runs)
 /// read-only, and it switches nothing: the statements that need no second
 /// look at the saved flags.
-fn proven_read_only(sql: &str, db_type: DatabaseType) -> bool {
+fn proven_read_only(sql: &str, config: &ConnectionConfig) -> bool {
     use dbx_core::sql_risk::{classify_sql_risk_for_database, prove_read_only_for_database, ReadProof, SqlRisk};
+    let db_type = config.db_type;
+    let file = sqlite_file(config);
     let proven = |text: &str| {
         matches!(classify_sql_risk_for_database(text, db_type), Ok(SqlRisk::ReadOnly))
-            && prove_read_only_for_database(text, db_type) == ReadProof::ProvenReadOnly
+            && (prove_read_only_for_database(text, db_type) == ReadProof::ProvenReadOnly
+                || file.as_deref().is_some_and(|f| super::sqlite_proof::proves_read_only(f, text)))
     };
-    !switches_database(sql) && (proven(sql) || explain_analyze_inner(sql).is_some_and(|inner| proven(&inner)))
+    !switches_database(sql) && !sqlite_dangerous(sql, db_type) && (proven(sql) || explain_analyze_inner(sql).is_some_and(|inner| proven(&inner)))
 }
 
 /// Whether every statement of `sql` is a `USE`.
@@ -1337,7 +1484,9 @@ impl Syntax for DbxCore {
 ///
 /// dbx's formats take JSON values, so each cell is converted: NULL is `null`;
 /// an integer column's text is a JSON number only when it is the exact text of
-/// an `i64` or `u64`; everything else is a string holding the exact text. A row
+/// an `i64` or `u64`; so is a cell the database gave as a number in a column
+/// with no type name (`Column::numbers`, SQLite), or else a JSON real;
+/// everything else is a string holding the exact text. A row
 /// longer than the header loses the cells past it (they have no column); a
 /// shorter one stays short, since a missing cell is not NULL. Cell by cell
 /// what each format then does is listed in the README.
@@ -1350,7 +1499,8 @@ pub(super) fn export_bytes_for(request: &ExportRequest) -> Result<Vec<u8>, Strin
     let rows: Vec<Vec<serde_json::Value>> = request
         .rows
         .iter()
-        .map(|row| row.iter().take(request.columns.len()).enumerate().map(|(c, cell)| json_cell(&request.columns[c], cell)).collect())
+        .enumerate()
+        .map(|(r, row)| row.iter().take(request.columns.len()).enumerate().map(|(c, cell)| json_cell(&request.columns[c], r, cell)).collect())
         .collect();
     match request.format {
         ExportFormat::Csv => {
@@ -1427,7 +1577,8 @@ fn insert_statements(request: &ExportRequest, guard_names: bool) -> Result<Strin
     let rows: Vec<Vec<serde_json::Value>> = request
         .rows
         .iter()
-        .map(|row| row.iter().take(request.columns.len()).enumerate().map(|(c, cell)| json_cell(&request.columns[c], cell)).collect())
+        .enumerate()
+        .map(|(r, row)| row.iter().take(request.columns.len()).enumerate().map(|(c, cell)| json_cell(&request.columns[c], r, cell)).collect())
         .collect();
     let insert = BuildExportInsertStatementsOptions {
         database_type: db_type,
@@ -1447,16 +1598,27 @@ fn insert_statements(request: &ExportRequest, guard_names: bool) -> Result<Strin
     build_export_sql_insert(BuildExportSqlInsertOptions { insert, insert_dialect: SqlInsertDialect::Source, exclude_columns: Vec::new() })
 }
 
-/// One cell as a JSON value, for dbx's formats (see `export_bytes_for`).
-fn json_cell(column: &Column, cell: &Cell) -> serde_json::Value {
+/// One cell as a JSON value, for dbx's formats (see `export_bytes_for`):
+/// a number for an integer column, and for a cell of row `row` that the
+/// database gave as a number in a column with no type name
+/// (`Column::numbers`); text otherwise.
+fn json_cell(column: &Column, row: usize, cell: &Cell) -> serde_json::Value {
     use serde_json::Value;
     let Cell::Value(text) = cell else { return Value::Null };
-    if column.kind == CellKind::Integer {
+    let given_as_number = column.numbers.binary_search(&row).is_ok();
+    if column.kind == CellKind::Integer || given_as_number {
         if let Some(n) = text.parse::<i64>().ok().filter(|n| n.to_string() == *text) {
             return Value::from(n);
         }
         if let Some(n) = text.parse::<u64>().ok().filter(|n| n.to_string() == *text) {
             return Value::from(n);
+        }
+    }
+    if given_as_number {
+        // dbx printed it from the double it held, in the shortest spelling
+        // that reads back as that double: parsing it gives the same double.
+        if let Some(n) = text.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+            return Value::Number(n);
         }
     }
     Value::String(text.clone())
@@ -1615,7 +1777,13 @@ impl Core for DbxCore {
             Some(id) => state.configs.read().await.get(&id.0).cloned(),
             None => None,
         };
+        let old_host = existing.as_ref().map(|c| c.host.clone());
         let config = config_from_draft(draft, existing)?;
+        // A rename or a flag change of a file that has gone is still allowed:
+        // only a path that is new is checked.
+        if old_host.as_deref() != Some(config.host.as_str()) {
+            check_local_file(&config)?;
+        }
         // The store first: if it refuses (no key, a locked file), the runtime
         // list must not move ahead of it.
         let (st, to_store) = (state.clone(), config.clone());
@@ -1657,6 +1825,7 @@ impl Core for DbxCore {
             None => None,
         };
         let mut config = config_from_draft(draft, existing)?;
+        check_local_file(&config)?;
         let secret = config.password.clone();
         config.id = format!("{TEST_PROBE_ID_PREFIX}{}", uuid::Uuid::new_v4());
         state.configs.write().await.insert(config.id.clone(), config.clone());
@@ -1811,6 +1980,11 @@ impl Core for DbxCore {
     }
     async fn current_schema(&self, at: &DatabasePath) -> Result<Option<String>, CoreError> {
         self.ensure_browsable(&at.connection).await?;
+        // A SQLite file has one schema names resolve in, `main`: nothing to ask.
+        let state = self.state().await?;
+        if state.configs.read().await.get(&at.connection.0).is_some_and(|c| c.db_type == DatabaseType::Sqlite) {
+            return Ok(Some(SQLITE_SCHEMA.to_string()));
+        }
         let (conn, database) = (at.connection.0.clone(), self.database_name(&at.connection, &at.database).await);
         self.metadata(&at.connection, move |state| async move {
             // Through the query path: dbx has no getter for it. Its own pool
@@ -1870,7 +2044,7 @@ impl Core for DbxCore {
         // runtime copy. Before letting through anything not proven
         // read-only, look at the saved connection once more. A statement
         // already confirmed for this exact target has been asked about.
-        if gated.is_ok() && request.confirmation.is_none() && !proven_read_only(&statement, config.db_type) {
+        if gated.is_ok() && request.confirmation.is_none() && !proven_read_only(&statement, &config) {
             if let Some(saved) = self.saved_config(&state, &request.connection.0).await? {
                 gated = gate(&saved, &request, &statement, &database, switched);
             }
@@ -1943,7 +2117,9 @@ impl Core for DbxCore {
         };
         match (result, timeout) {
             (Err(QueryExecutionError::Canceled { .. }), Some(secs)) if timed_out => Err(timeout_error(secs, stopped, &statement)),
-            (result, _) => result.map(|r| result_set(r, statement.clone(), config.db_type)).map_err(|e| run_error(e, &statement, &config.password, timeout)),
+            (result, _) => result
+                .map(|r| result_set_on(r, statement.clone(), config.db_type, sqlite_file(&config).as_deref()))
+                .map_err(|e| run_error(e, &statement, &config.password, timeout)),
         }
     }
     fn cancel(&self, run: RunId) {
@@ -2044,6 +2220,9 @@ impl Core for DbxCore {
             return Err(CoreError::new(CoreErrorKind::Other, "That connection is no longer saved."));
         };
         let database = self.database_name(&request.at.connection, &request.at.database).await;
+        if let Some(why) = sqlite_dump_target_refused(&config, Path::new(&request.path)) {
+            return Err(CoreError::new(CoreErrorKind::Refused, why));
+        }
         // dbx quotes the column names it reads from its own catalog with a
         // function that passes a name through unescaped when it starts and
         // ends with a quote (Postgres, GaussDB, openGauss), in its read query
@@ -2095,6 +2274,50 @@ impl Core for DbxCore {
         // dbx's flag is a set behind a lock; the async function never waits.
         futures::executor::block_on(dbx_core::database_export::set_export_cancelled(&dump_key(id)));
     }
+}
+
+/// Why a dump of the SQLite connection `config` may not be written to
+/// `target`, if it may not: `target` is the connection's own file, or the
+/// `-wal`, `-journal` or `-shm` SQLite keeps beside it. dbx would write the
+/// dump over the file it is reading (it does: the file is lost), and a stray
+/// journal or WAL beside a database is read by SQLite as its own.
+///
+/// An existing target is compared by device and inode (a symbolic or hard
+/// link, or another spelling of the path, is the same file); one that is not
+/// there yet by its directory (device and inode) and name. The siblings are
+/// looked for beside the path as saved and beside the file a link leads to.
+fn sqlite_dump_target_refused(config: &ConnectionConfig, target: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if config.db_type != DatabaseType::Sqlite {
+        return None;
+    }
+    let db = PathBuf::from(dbx_core::path_utils::expand_tilde(config.host.trim()));
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let dir_of = |p: &Path| id(p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")));
+    let target_id = id(target);
+    let mut bases = vec![db.clone()];
+    if let Ok(real) = std::fs::canonicalize(&db) {
+        bases.push(real);
+    }
+    for base in &bases {
+        for suffix in ["", "-wal", "-journal", "-shm"] {
+            let mut name = base.as_os_str().to_owned();
+            name.push(suffix);
+            let side = PathBuf::from(name);
+            let same = match (target_id, id(&side)) {
+                (Some(a), Some(b)) => a == b,
+                _ => target_id.is_none() && side.file_name() == target.file_name() && dir_of(&side).is_some() && dir_of(&side) == dir_of(target),
+            };
+            if same {
+                let what = if suffix.is_empty() { "the connection's own file".to_string() } else { format!("the {suffix} file SQLite keeps beside the connection's file") };
+                return Some(format!(
+                    "Not dumped: {} is {what}, and the dump would be written over it. Choose another file.",
+                    display_safe(&target.to_string_lossy())
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// How often running progress is passed on, at most.
@@ -3096,7 +3319,7 @@ mod tests {
     fn insert_request(kind: DbKind, columns: &[(&str, &str)], table: &str, schema: &str) -> ExportRequest {
         ExportRequest {
             format: ExportFormat::SqlInsert,
-            columns: columns.iter().map(|(n, t)| Column { name: (*n).into(), db_type: (*t).into(), kind: CellKind::Text }).collect(),
+            columns: columns.iter().map(|(n, t)| Column { name: (*n).into(), db_type: (*t).into(), kind: CellKind::Text, numbers: Vec::new() }).collect(),
             rows: vec![columns.iter().map(|_| Cell::Value("v".into())).collect()],
             kind: Some(kind),
             table: table.into(),

@@ -35,7 +35,7 @@ pub(super) fn draw(o: &mut DumpOverlay, buttons: &'static [ButtonSpec], p: &Pain
         "dbx writes CREATE statements for tables, views, functions and sequences, then the rows as INSERT statements. Nothing in the database is changed.",
         inner_w,
     );
-    let losses = if o.loses { panel::wrap(&known_losses_note(), inner_w) } else { Vec::new() };
+    let losses = o.loses.map(|dialect| panel::wrap(&known_losses_note(dialect), inner_w)).unwrap_or_default();
     let status: Vec<String> = match &o.stage {
         DumpStage::Sent(_) => vec!["checking the path…".to_string()],
         DumpStage::Failed(message) => {

@@ -21,10 +21,10 @@ pub(super) fn draw(form: &mut ConnectionForm, buttons: &'static [ButtonSpec], p:
     let width = 64.min(buf.area.width.saturating_sub(4)).max(24);
     let inner_w = width.saturating_sub(4) as usize;
     let status = status_lines(&form.status, inner_w.saturating_sub(2));
-    let notes = Field::ALL.iter().filter(|f| form.error(**f).is_none() && form.note(**f).is_some()).count();
+    let notes = form.fields().iter().filter(|f| form.error(**f).is_none() && form.note(**f).is_some()).count();
     let error_rows = (form.errors.len() + notes) as u16;
     // Border, the rows (and their errors), a blank row, the status, a blank row, the buttons, border.
-    let height = 2 + Field::ALL.len() as u16 + error_rows + 1 + status.len().max(1) as u16 + 1 + 1;
+    let height = 2 + form.fields().len() as u16 + error_rows + 1 + status.len().max(1) as u16 + 1 + 1;
     let rect = panel::centred(buf.area, width, height);
     let inner = panel::panel(p, buf, rect, form.title(), Role::Accent, Role::Accent);
     if inner.is_empty() {
@@ -37,13 +37,37 @@ pub(super) fn draw(form: &mut ConnectionForm, buttons: &'static [ButtonSpec], p:
 
     let mut fields = Vec::new();
     let mut y = inner.y;
-    for field in Field::ALL {
+    for &field in form.fields() {
         let focused = form.focus == field && !form.confirm_discard;
         let label_style = if focused { pi.bold(Role::Accent) } else { pi.fg(Role::Subtext0) }.bg(bg);
-        pi.put(buf, inner.x, y, field.label(), label_style);
+        pi.put(buf, inner.x, y, form.label(field), label_style);
         let rect = Rect::new(input_x, y, input_w, 1);
-        if field.is_text() {
-            let placeholder = (field == Field::Password && form.editing.is_some()).then_some("(unchanged)");
+        if field == Field::Kind {
+            // The types on offer, the chosen one filled; space or a click on
+            // the choices (not the label, not past them) picks the next.
+            let mut x = input_x;
+            let mut end = input_x;
+            for choice in &form.choices {
+                let chosen = choice.kind == form.kind;
+                let style = match (chosen, focused) {
+                    (true, true) => pi.bold(Role::Accent),
+                    (true, false) => pi.fg(Role::Text),
+                    (false, _) => pi.fg(Role::Overlay0),
+                }
+                .bg(bg);
+                let text = format!("{} {}", if chosen { "●" } else { "○" }, choice.kind.display_name());
+                end = pi.put(buf, x, y, &text, style);
+                x = end + 2;
+            }
+            fields.push(FieldHit { rect: Rect::new(input_x, y, end.saturating_sub(input_x), 1).intersection(inner), field });
+        } else if field.is_text() {
+            let placeholder = if field == Field::Password && form.editing.is_some() {
+                Some("(unchanged)")
+            } else if field == Field::Host && form.file {
+                Some("path of a SQLite file, e.g. ~/data/app.db")
+            } else {
+                None
+            };
             if let Some(text) = form.text_field_mut(field) {
                 draw_input(&pi, buf, rect, text, focused, placeholder);
             }

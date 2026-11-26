@@ -660,7 +660,8 @@ impl App {
             }
         }
 
-        // Names are the Core's for Postgres; other kinds get keywords for now.
+        // Names are the Core's where the connection type completes
+        // (`Capabilities::completes`); other kinds get keywords for now.
         if self.core_names() {
             if let Some(db) = self.tab().target.clone() {
                 self.metadata_candidates(&db, ctx, &mut cands, &mut needs);
@@ -759,8 +760,8 @@ impl App {
             || wants.tables
             || (wants.columns && (!ctx.refs.is_empty() || scope.has_sources()))
             || search_functions;
-        let current = match cache.current_schema.get(db) {
-            Some(schema) => Some(schema.clone()),
+        let current = match self.current_schema_of(db) {
+            Some(schema) => Some(schema),
             None if !wants_schema => None,
             None if cache.failed.contains(&Need::CurrentSchema(db.clone())) => Some("public".to_string()),
             None => {
@@ -1181,9 +1182,9 @@ impl App {
         let ctx = analyse(self.ui.tab.editor.lines(), caret);
         let Some(db) = self.tab().target.clone() else { return };
         if !self.core_names() {
-            return self.notify("Expanding * needs a PostgreSQL connection for now.".to_string(), true, fx);
+            return self.notify("Expanding * needs a PostgreSQL or SQLite connection for now.".to_string(), true, fx);
         }
-        let Some(current) = self.model.completions.current_schema.get(&db).cloned() else {
+        let Some(current) = self.current_schema_of(&db) else {
             let waiting = self.request_completion(vec![(Need::CurrentSchema(db), String::new())], fx);
             self.ui.tab.complete.pending_star = waiting.then(|| (self.ui.tab.editor.revision(), caret));
             return;

@@ -10,7 +10,10 @@ use crate::core::{Connection, ConnectionDraft, ConnectionId, DbKind};
 /// One row of the form, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    /// The type of database: one of the form's choices.
+    Kind,
     Name,
+    /// The server's host, or for a file database the path of the file.
     Host,
     Port,
     User,
@@ -20,12 +23,17 @@ pub enum Field {
     Production,
 }
 
+/// The rows of a form for a file database: the type, a name, the file, and
+/// the production flag. No host, port, user, password or TLS.
+const FILE_FIELDS: [Field; 4] = [Field::Kind, Field::Name, Field::Host, Field::Production];
+
 impl Field {
-    pub const ALL: [Field; 8] =
-        [Field::Name, Field::Host, Field::Port, Field::User, Field::Password, Field::Database, Field::Tls, Field::Production];
+    pub const ALL: [Field; 9] =
+        [Field::Kind, Field::Name, Field::Host, Field::Port, Field::User, Field::Password, Field::Database, Field::Tls, Field::Production];
 
     pub fn label(self) -> &'static str {
         match self {
+            Field::Kind => "type",
             Field::Name => "name",
             Field::Host => "host",
             Field::Port => "port",
@@ -37,10 +45,20 @@ impl Field {
         }
     }
 
-    /// Whether the row takes text (the others are checkboxes).
+    /// Whether the row takes text (the others are a choice or checkboxes).
     pub fn is_text(self) -> bool {
-        !matches!(self, Field::Tls | Field::Production)
+        !matches!(self, Field::Kind | Field::Tls | Field::Production)
     }
+}
+
+/// One type of connection the form offers, with what the form needs to know
+/// of it (from its `Capabilities`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KindChoice {
+    pub kind: DbKind,
+    /// A file database: the form asks for a name and a file.
+    pub local_file: bool,
+    pub default_port: Option<u16>,
 }
 
 /// What the form shows below its fields.
@@ -68,6 +86,7 @@ pub enum FormKey {
 /// The values the form started with, to tell whether anything was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Snapshot {
+    kind: DbKind,
     texts: [String; 5],
     tls: bool,
     production: bool,
@@ -79,9 +98,13 @@ pub struct ConnectionForm {
     pub serial: u64,
     /// The connection being edited, if any.
     pub editing: Option<ConnectionId>,
-    /// The kind of server. New connections are Postgres; an edit keeps the
-    /// connection's own kind.
+    /// The kind of server. New connections start as Postgres and the type row
+    /// changes it among `choices`; an edit keeps the connection's own kind.
     pub kind: DbKind,
+    /// What the type row offers, in order. An edit offers only its own kind.
+    pub choices: Vec<KindChoice>,
+    /// The kind in force is a file database: the rows are `FILE_FIELDS`.
+    pub file: bool,
     pub name: TextField,
     pub host: TextField,
     pub port: TextField,
@@ -97,6 +120,19 @@ pub struct ConnectionForm {
     /// The "discard changes?" question is up over the form.
     pub confirm_discard: bool,
     initial: Snapshot,
+    /// What was typed for another type, kept for when it is chosen again.
+    put_aside: Vec<(DbKind, KindFields)>,
+}
+
+/// The rows that belong to one type of connection (`cycle_kind`).
+#[derive(Debug, Clone)]
+struct KindFields {
+    host: TextField,
+    port: TextField,
+    user: TextField,
+    password: TextField,
+    database: TextField,
+    tls: bool,
 }
 
 impl ConnectionForm {
@@ -104,22 +140,39 @@ impl ConnectionForm {
     /// default (`Capabilities::default_port`).
     pub fn new_connection(serial: u64, kind: DbKind, default_port: Option<u16>) -> Self {
         let port = default_port.map(|p| p.to_string()).unwrap_or_default();
-        Self::build(serial, None, kind, ["", "", port.as_str(), "", ""], false, false)
+        let choice = KindChoice { kind: kind.clone(), local_file: false, default_port };
+        Self::build(serial, None, kind, vec![choice], false, ["", "", port.as_str(), "", ""], false, false)
+    }
+
+    /// The types the type row offers (the first is the kind the form is for).
+    /// A choice that is the form's kind sets whether it is a file database.
+    pub fn with_choices(mut self, choices: Vec<KindChoice>) -> Self {
+        if let Some(own) = choices.iter().find(|c| c.kind == self.kind) {
+            self.file = own.local_file;
+        }
+        self.choices = choices;
+        self.initial = self.snapshot();
+        self
     }
 
     /// A form for the connection as the sidebar knows it. The password field
-    /// stays empty: the stored password is never loaded into the form.
+    /// stays empty: the stored password is never loaded into the form. It
+    /// offers only the connection's own type.
     pub fn edit(serial: u64, c: &Connection) -> Self {
         let port = c.port.map(|p| p.to_string()).unwrap_or_default();
         let texts = [c.name.as_str(), c.host.as_str(), port.as_str(), c.username.as_str(), c.database.as_deref().unwrap_or("")];
-        Self::build(serial, Some(c.id.clone()), c.kind.clone(), texts, c.tls, c.production)
+        let choice = KindChoice { kind: c.kind.clone(), local_file: c.capabilities.local_file, default_port: c.capabilities.default_port };
+        Self::build(serial, Some(c.id.clone()), c.kind.clone(), vec![choice], c.capabilities.local_file, texts, c.tls, c.production)
     }
 
-    fn build(serial: u64, editing: Option<ConnectionId>, kind: DbKind, t: [&str; 5], tls: bool, production: bool) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn build(serial: u64, editing: Option<ConnectionId>, kind: DbKind, choices: Vec<KindChoice>, file: bool, t: [&str; 5], tls: bool, production: bool) -> Self {
         let mut form = ConnectionForm {
             serial,
             editing,
             kind,
+            choices,
+            file,
             name: TextField::with_text(t[0]),
             host: TextField::with_text(t[1]),
             port: TextField::with_text(t[2]),
@@ -132,15 +185,83 @@ impl ConnectionForm {
             errors: Vec::new(),
             status: FormStatus::Idle,
             confirm_discard: false,
-            initial: Snapshot { texts: Default::default(), tls, production },
+            initial: Snapshot { kind: Default::default(), texts: Default::default(), tls, production },
+            put_aside: Vec::new(),
         };
         form.initial = form.snapshot();
         form
     }
 
+    /// The rows the form shows now, in tab order.
+    pub fn fields(&self) -> &'static [Field] {
+        if self.file {
+            &FILE_FIELDS
+        } else {
+            &Field::ALL
+        }
+    }
+
+    /// What a row is called: the host row of a file database is the file.
+    pub fn label(&self, field: Field) -> &'static str {
+        if field == Field::Host && self.file {
+            "file"
+        } else {
+            field.label()
+        }
+    }
+
+    /// The type row can change the type: more than one is offered, and this
+    /// is a new connection (an edit keeps its type).
+    pub fn can_change_kind(&self) -> bool {
+        self.editing.is_none() && self.choices.len() > 1
+    }
+
+    /// The next (or previous) type. What the old type's rows held (host or
+    /// file, port, user, password, database, TLS) is put aside for that type
+    /// and comes back when it is chosen again; a type not chosen before starts
+    /// empty, its port at the type's default. The name and production flag
+    /// are the connection's, and stay.
+    pub fn cycle_kind(&mut self, step: isize) -> bool {
+        if !self.can_change_kind() {
+            return false;
+        }
+        let at = self.choices.iter().position(|c| c.kind == self.kind).unwrap_or(0) as isize;
+        let next = self.choices[(at + step).rem_euclid(self.choices.len() as isize) as usize].clone();
+        let kept = KindFields {
+            host: std::mem::take(&mut self.host),
+            port: std::mem::take(&mut self.port),
+            user: std::mem::take(&mut self.user),
+            password: std::mem::replace(&mut self.password, TextField::masked()),
+            database: std::mem::take(&mut self.database),
+            tls: self.tls,
+        };
+        self.put_aside.retain(|(kind, _)| *kind != self.kind);
+        self.put_aside.push((self.kind.clone(), kept));
+        let back = self.put_aside.iter().position(|(kind, _)| *kind == next.kind).map(|i| self.put_aside.remove(i).1);
+        let fields = back.unwrap_or_else(|| KindFields {
+            host: TextField::new(),
+            port: TextField::with_text(&next.default_port.map(|p| p.to_string()).unwrap_or_default()),
+            user: TextField::new(),
+            password: TextField::masked(),
+            database: TextField::new(),
+            tls: false,
+        });
+        self.kind = next.kind;
+        self.file = next.local_file;
+        self.host = fields.host;
+        self.port = fields.port;
+        self.user = fields.user;
+        self.password = fields.password;
+        self.database = fields.database;
+        self.tls = fields.tls;
+        self.errors.clear();
+        true
+    }
+
     fn snapshot(&self) -> Snapshot {
         let t = |f: &TextField| f.text().to_string();
         Snapshot {
+            kind: self.kind.clone(),
             texts: [t(&self.name), t(&self.host), t(&self.port), t(&self.user), t(&self.database)],
             tls: self.tls,
             production: self.production,
@@ -157,7 +278,8 @@ impl ConnectionForm {
 
     /// Whether leaving would lose something typed.
     pub fn dirty(&self) -> bool {
-        !self.password.is_empty() || self.snapshot() != self.initial
+        let typed_for_another = self.put_aside.iter().any(|(_, f)| [&f.host, &f.user, &f.password, &f.database].iter().any(|t| !t.is_empty()));
+        !self.password.is_empty() || typed_for_another || self.snapshot() != self.initial
     }
 
     pub fn text_field(&self, field: Field) -> Option<&TextField> {
@@ -168,7 +290,7 @@ impl ConnectionForm {
             Field::User => &self.user,
             Field::Password => &self.password,
             Field::Database => &self.database,
-            Field::Tls | Field::Production => return None,
+            Field::Kind | Field::Tls | Field::Production => return None,
         })
     }
 
@@ -180,7 +302,7 @@ impl ConnectionForm {
             Field::User => &mut self.user,
             Field::Password => &mut self.password,
             Field::Database => &mut self.database,
-            Field::Tls | Field::Production => return None,
+            Field::Kind | Field::Tls | Field::Production => return None,
         })
     }
 
@@ -213,8 +335,9 @@ impl ConnectionForm {
     }
 
     fn move_focus(&mut self, step: isize) {
-        let at = Field::ALL.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
-        self.focus = Field::ALL[(at + step).rem_euclid(Field::ALL.len() as isize) as usize];
+        let fields = self.fields();
+        let at = fields.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
+        self.focus = fields[(at + step).rem_euclid(fields.len() as isize) as usize];
     }
 
     /// Applies a key to the focused row. Enter, esc and the buttons' keys are
@@ -240,6 +363,11 @@ impl ConnectionForm {
             KeyCode::Up if combo.mods.is_empty() => {
                 self.move_focus(-1);
                 return FormKey::Moved;
+            }
+            // The type row: space and the arrows pick the next or previous type.
+            KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left if combo.mods.is_empty() && self.focus == Field::Kind => {
+                let step = if combo.code == KeyCode::Left { -1 } else { 1 };
+                return if self.cycle_kind(step) { FormKey::Edited } else { FormKey::Ignored };
             }
             KeyCode::Char(' ') if combo.mods.is_empty() && !self.focus.is_text() => {
                 self.toggle(self.focus);
@@ -283,6 +411,14 @@ impl ConnectionForm {
                 text.click(column);
                 FormKey::Moved
             }
+            // A click on the type row picks the next type.
+            None if field == Field::Kind => {
+                if self.cycle_kind(1) {
+                    FormKey::Edited
+                } else {
+                    FormKey::Moved
+                }
+            }
             None => {
                 self.toggle(field);
                 FormKey::Edited
@@ -299,6 +435,31 @@ impl ConnectionForm {
         let host = self.host.text().trim().to_string();
         if for_save && name.is_empty() {
             self.errors.push((Field::Name, "Name is required.".into()));
+        }
+        if self.file {
+            // A file database: the path is the host, and it is all there is.
+            // Whether the file is there is the Core's to say.
+            if host.is_empty() {
+                self.errors.push((Field::Host, "File is required: give the path of a SQLite file.".into()));
+            } else if host.chars().any(char::is_control) {
+                self.errors.push((Field::Host, "The path has a control character in it.".into()));
+            }
+            if let Some((field, _)) = self.errors.first() {
+                self.focus = *field;
+                return None;
+            }
+            return Some(ConnectionDraft {
+                id: self.editing.clone(),
+                name,
+                kind: self.kind.clone(),
+                host,
+                port: None,
+                database: None,
+                username: String::new(),
+                password: None,
+                tls: false,
+                production: self.production,
+            });
         }
         if host.is_empty() {
             self.errors.push((Field::Host, "Host is required.".into()));
