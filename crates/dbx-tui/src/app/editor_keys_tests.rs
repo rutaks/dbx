@@ -757,7 +757,8 @@ async fn the_prefix_has_keys_for_a_new_line_after_and_before_and_the_mode_bar_sh
     act_undo(&mut h, "select ‸a\nfrom t", "ctrl+g o", "select a\n‸\nfrom t");
     act_undo(&mut h, "select ‸a\nfrom t", "ctrl+g O", "‸\nselect a\nfrom t");
     h.press("ctrl+g");
-    let bar = frame_rows(&mut h.app, 400, 30).pop().unwrap();
+    // (Wide: the navigator's `p go to` joined the prefix hints in slice 21.)
+    let bar = frame_rows(&mut h.app, 480, 30).pop().unwrap();
     assert!(bar.contains("o new line after") && bar.contains("new line before"), "{bar}");
 }
 

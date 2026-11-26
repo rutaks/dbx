@@ -22,10 +22,12 @@ pub mod form;
 pub mod format;
 pub mod grid;
 pub mod highlight;
+pub mod help;
 pub mod history;
 pub mod keys;
 pub mod layout;
 pub mod marks;
+pub mod navigator;
 pub mod overlay;
 pub mod pointer;
 #[cfg(feature = "test-support")]
@@ -55,6 +57,10 @@ mod export_tests;
 mod finish_tests;
 #[cfg(test)]
 mod history_tests;
+#[cfg(test)]
+mod help_tests;
+#[cfg(test)]
+mod navigator_tests;
 #[cfg(test)]
 mod editor_keys_tests;
 #[cfg(test)]
@@ -291,6 +297,9 @@ pub struct Ui {
     /// How the last dump ended (its words, and whether it failed), for the
     /// progress overlay once it is over.
     pub dump_ended: Option<(String, bool)>,
+    /// The table the navigator is taking the sidebar to, while the levels
+    /// above it load (slice 21).
+    pub reveal: Option<navigator::Reveal>,
     /// Which store is in use and where (given by the shell), for the welcome
     /// screen. None when it could not be worked out.
     pub store: Option<crate::core::StoreInfo>,
@@ -493,6 +502,7 @@ impl App {
                 store: None,
                 next_export: 1,
                 dump_ended: None,
+                reveal: None,
             },
         }
     }
@@ -548,6 +558,7 @@ impl App {
         self.template_housekeeping(&mut fx);
         self.refresh_marks(&mut fx);
         self.history_housekeeping(now, &mut fx);
+        self.navigator_housekeeping(now, &mut fx);
         self.sync_dump_overlay();
         self.ensure_rows();
         fx
@@ -566,7 +577,7 @@ impl App {
             Mode::Prefix { expires } => Some(expires),
             Mode::Normal | Mode::Resize => None,
         };
-        [prefix, self.query_deadline(), self.ui.tab.marks.deadline(), self.history_deadline(), self.dump_deadline()].into_iter().flatten().min()
+        [prefix, self.query_deadline(), self.ui.tab.marks.deadline(), self.history_deadline(), self.navigator_deadline(), self.dump_deadline()].into_iter().flatten().min()
     }
 
     pub fn view(&mut self, frame: &mut Frame) {
@@ -680,6 +691,10 @@ impl App {
                 self.open_history(fx);
                 None
             }
+            (Action::Navigator | Action::NavigatorDirect, _) => {
+                self.open_navigator(fx);
+                None
+            }
             (Action::NewTab, _) => {
                 self.new_tab(fx);
                 None
@@ -742,6 +757,9 @@ impl App {
             _ => None,
         };
         if let Some(pane) = target {
+            if pane != self.ui.focus {
+                self.cancel_reveal();
+            }
             self.ui.focus = pane;
         }
     }
@@ -796,6 +814,8 @@ impl App {
         let at = (mouse.column, mouse.row).into();
         let (x, y) = (mouse.column, mouse.row);
         self.ui.drag = None;
+        // The user took over with the mouse: a reveal on its way is given up.
+        self.cancel_reveal();
         // A hint in the mode bar does what its key does.
         if let Some(hit) = self.ui.mode_hints.iter().find(|h| h.rect.contains(at)).copied() {
             self.ui.clicks.forget();
@@ -912,6 +932,12 @@ impl App {
         if matches!(self.ui.overlay, Some(Overlay::History(_))) {
             return self.on_history_key(&key, combo, fx);
         }
+        if matches!(self.ui.overlay, Some(Overlay::Navigator(_))) {
+            return self.on_navigator_key(&key, combo, fx);
+        }
+        if matches!(self.ui.overlay, Some(Overlay::Help(_))) {
+            return self.on_help_key(&key, combo, fx);
+        }
         if self.on_chooser_or_help_key(&combo, fx) {
             return;
         }
@@ -971,25 +997,6 @@ impl App {
                 fx.repaint = true;
                 true
             }
-            Some(Overlay::Help(h)) => {
-                if key(&["down", "j"]) {
-                    h.scroll += 1;
-                } else if key(&["up", "k"]) {
-                    h.scroll = h.scroll.saturating_sub(1);
-                } else if key(&["pagedown", "space"]) {
-                    h.scroll += 10;
-                } else if key(&["pageup"]) {
-                    h.scroll = h.scroll.saturating_sub(10);
-                } else if key(&["g", "home"]) {
-                    h.scroll = 0;
-                } else if key(&["G", "end"]) {
-                    h.scroll = usize::MAX / 2;
-                } else {
-                    return false;
-                }
-                fx.repaint = true;
-                true
-            }
             _ => false,
         }
     }
@@ -1037,6 +1044,13 @@ impl App {
                 _ => {}
             }
         }
+        if matches!(self.ui.overlay, Some(Overlay::Navigator(_))) {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => return self.on_navigator_wheel(true, fx),
+                MouseEventKind::ScrollUp => return self.on_navigator_wheel(false, fx),
+                _ => {}
+            }
+        }
         match mouse.kind {
             MouseEventKind::ScrollDown => return self.scroll_viewer(WHEEL_ROWS, fx),
             MouseEventKind::ScrollUp => return self.scroll_viewer(-WHEEL_ROWS, fx),
@@ -1067,6 +1081,12 @@ impl App {
     fn on_overlay_paste(&mut self, text: &str, fx: &mut Effects) {
         if matches!(self.ui.overlay, Some(Overlay::History(_))) {
             return self.on_history_paste(text, fx);
+        }
+        if matches!(self.ui.overlay, Some(Overlay::Navigator(_))) {
+            return self.on_navigator_paste(text, fx);
+        }
+        if matches!(self.ui.overlay, Some(Overlay::Help(_))) {
+            return self.on_help_paste(text, fx);
         }
         if matches!(self.ui.overlay, Some(Overlay::Export(_))) {
             return self.on_export_paste(text, fx);
@@ -1128,6 +1148,7 @@ impl App {
             OverlayAction::HistoryInsert | OverlayAction::HistoryRun | OverlayAction::HistoryScope | OverlayAction::HistoryPick(_) => {
                 self.history_action(action, fx)
             }
+            OverlayAction::NavigatorReveal | OverlayAction::NavigatorOpen | OverlayAction::NavigatorPick(_) => self.navigator_action(action, fx),
             OverlayAction::ExportRun
             | OverlayAction::ExportReplace
             | OverlayAction::ExportKeep
@@ -1146,6 +1167,7 @@ impl App {
             | OverlayAction::QuitDumpYes => self.dump_action(action, fx),
             OverlayAction::Dismiss => {
                 self.forget_history_if_closing(fx);
+                self.forget_navigator_if_closing(fx);
                 self.ui.overlay = None;
                 fx.repaint = true;
             }
@@ -1210,6 +1232,11 @@ impl App {
                     return;
                 }
             }
+            (Target::Navigate, CoreReply::Completed(result)) => {
+                if !self.on_navigator_reply(result) {
+                    return;
+                }
+            }
             (Target::Export(serial), CoreReply::Exported(result)) => return self.on_exported(serial, result, fx),
             (Target::Dump, CoreReply::Dumped(result)) => return self.on_dumped(id, result, fx),
             (Target::SaveHistory(serial), CoreReply::HistorySaved(result)) => {
@@ -1218,8 +1245,13 @@ impl App {
                 return self.on_history_saved(serial, result, fx);
             }
             (Target::Children(node), CoreReply::Listed(result)) => {
+                // Only the listing the reveal waits for goes on with it.
+                let waited_for = self.reveal_waits_for(&node);
                 if !self.on_listed(node, result, fx) {
                     return;
+                }
+                if waited_for {
+                    self.continue_reveal(fx);
                 }
             }
             _ => return,

@@ -221,7 +221,7 @@ fn preview_lines(h: &HistoryOverlay, here: Option<&Here>, keys: &Keybinds, width
 
 /// `panel::buttons` with labels that are not static (the live run key, the
 /// scope the tab flips to).
-fn buttons(p: &Painter, buf: &mut Buffer, inner: Rect, y: u16, specs: &[(String, String, OverlayAction)]) -> Vec<OverlayButton> {
+pub(super) fn buttons(p: &Painter, buf: &mut Buffer, inner: Rect, y: u16, specs: &[(String, String, OverlayAction)]) -> Vec<OverlayButton> {
     let bg = p.theme.color(Role::PanelBg);
     let widths: Vec<usize> = specs.iter().map(|(k, l, _)| k.chars().count() + 1 + l.chars().count()).collect();
     let total: usize = widths.iter().sum::<usize>() + 3 * specs.len().saturating_sub(1);

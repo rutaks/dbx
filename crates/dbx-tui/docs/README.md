@@ -85,7 +85,13 @@ Keys that begin with `ctrl+g` use the prefix: press `ctrl+g`, release, then the
 next key (the prefix is `ctrl+g` and not `ctrl+b`, so tmux and herdr keep
 theirs). The mode bar at the bottom always shows the keys that work right now,
 and each hint is clickable. `ctrl+g ?` opens the full list from the live
-bindings.
+bindings: it is the reference for every key in every pane and overlay, each
+with the name the action has, and a search field narrows it by action or key.
+
+`ctrl+g p` opens the navigator: type part of a table or view name (its first
+letters, its word initials such as `fa` for `film_actor`, or any part of it),
+and `enter` shows it in the sidebar while `ctrl+o` opens its rows. It looks in
+the database the tab uses, or else the one under the sidebar cursor.
 
 <!-- keys: prefix -->
 | Key | Does |
@@ -103,6 +109,7 @@ bindings.
 | `ctrl+g ]` | next tab <!-- NextTab --> |
 | `ctrl+g [` | previous tab <!-- PrevTab --> |
 | `ctrl+g e` | history <!-- History --> |
+| `ctrl+g p` | go to a table or view by part of its name (the navigator) <!-- Navigator --> |
 | `ctrl+g c` | cancel the running statement <!-- Cancel --> |
 <!-- keys: direct -->
 | Key | Does |
@@ -111,6 +118,7 @@ bindings.
 | `ctrl+c` | cancel a running statement <!-- CancelDirect --> |
 | `ctrl+space` | completion in the editor <!-- CompleteOpen --> |
 | `ctrl+alt+e` | history <!-- HistoryDirect --> |
+| `cmd+o` | the navigator, in a terminal that delivers Cmd keys <!-- NavigatorDirect --> |
 <!-- keys: sidebar -->
 | Key | Does |
 |---|---|

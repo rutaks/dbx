@@ -45,6 +45,12 @@ impl App {
     /// own, or goes to the tab that already browses it.
     pub(super) fn open_table_at_cursor(&mut self, fx: &mut Effects) {
         let Some(path) = self.cursor_table() else { return };
+        self.open_table_path(path, fx);
+    }
+
+    /// Opens the table `path` names in a tab of its own (the sidebar's `o`,
+    /// and the navigator's `ctrl+o`).
+    pub(super) fn open_table_path(&mut self, path: TablePath, fx: &mut Effects) {
         let Some(connection) = self.connection(&path.schema.database.connection) else { return };
         if !connection.capabilities.browse {
             return;

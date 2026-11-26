@@ -157,6 +157,27 @@ before. The same key closes it.
 | `ctrl+alt+e` | open the history (reaches the program in more terminals) <!-- HistoryDirect --> |
 <!-- keys: end -->
 
+### Go to a table
+
+`ctrl+g p` (or `cmd+o` where your terminal sends it) opens the navigator. Type
+part of a name: tables the sidebar has already loaded show at once, and a
+moment after you stop typing the rest of the database is searched. `enter`
+shows the table in the sidebar (opening whatever is above it), `ctrl+o` opens
+its rows in a tab. It searches the database the tab runs on, or, if the tab has
+none, the one under the sidebar cursor. `ctrl+g ?` lists every key, and you can
+search that list.
+
+<!-- keys: prefix -->
+| Key | Does |
+|---|---|
+| `ctrl+g p` | open the navigator <!-- Navigator --> |
+| `ctrl+g ?` | every key, searchable <!-- Help --> |
+<!-- keys: direct -->
+| Key | Does |
+|---|---|
+| `cmd+o` | open the navigator <!-- NavigatorDirect --> |
+<!-- keys: end -->
+
 ## 8. Export
 
 With a result on screen and the results pane focused, press `e`. The overlay

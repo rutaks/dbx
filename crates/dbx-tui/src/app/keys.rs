@@ -297,6 +297,11 @@ pub enum Action {
     /// key (IntelliJ's console history, `ctrl+alt+e`).
     History,
     HistoryDirect,
+    /// The navigator overlay (slice 21): go to a table or view by typing part
+    /// of its name. After the prefix, and from a direct key (IntelliJ's go to
+    /// class).
+    Navigator,
+    NavigatorDirect,
     // The editor's own actions (slice 13). Each is bound in the editor's table
     // to IntelliJ's macOS key (Cmd), its Windows/Linux key (Ctrl) and, where
     // one exists, a key every terminal delivers; the prefix has a few more.
@@ -418,6 +423,7 @@ impl Action {
             Action::FinishStatementDirect | Action::FinishStatement => "finish",
             Action::Help => "help",
             Action::History | Action::HistoryDirect => "history",
+            Action::Navigator | Action::NavigatorDirect => "go to",
             Action::Duplicate => "duplicate",
             Action::DeleteLine => "delete line",
             Action::MoveLineUp => "move line up",
@@ -484,6 +490,7 @@ impl Action {
             | Action::FinishStatement
             | Action::Help
             | Action::History
+            | Action::Navigator
             | Action::NewTab
             | Action::CloseTab
             | Action::NextTab
@@ -499,6 +506,7 @@ impl Action {
             | Action::PrevUnresolved
             | Action::FinishStatementDirect
             | Action::HistoryDirect
+            | Action::NavigatorDirect
             | Action::CloseTabDirect
             | Action::NextTabDirect
             | Action::PrevTabDirect => Scope::Direct,
@@ -617,6 +625,7 @@ impl Default for Keybinds {
                 (plain(';'), Action::FinishStatement),
                 (plain('?'), Action::Help),
                 (plain('e'), Action::History),
+                (plain('p'), Action::Navigator),
                 (plain('t'), Action::NewTab),
                 (plain('T'), Action::CloseTab),
                 (plain(']'), Action::NextTab),
@@ -652,6 +661,10 @@ impl Default for Keybinds {
                 // the program in more terminals than Cmd does.
                 (key("ctrl+alt+e"), Action::HistoryDirect),
                 (key("cmd+alt+e"), Action::HistoryDirect),
+                // IntelliJ's go to class (it finds tables here). Not
+                // `ctrl+n`, its Windows and Linux key: the completion popup
+                // and the editor read it for "down".
+                (key("cmd+o"), Action::NavigatorDirect),
                 // Terminals differ in which of the two they can send.
                 (key("cmd+shift+enter"), Action::FinishStatementDirect),
                 (key("ctrl+shift+enter"), Action::FinishStatementDirect),
@@ -926,55 +939,192 @@ impl Keybinds {
     /// sections of (what it does, its keys). Built from the live bindings, so
     /// a rebound key shows as it is.
     pub fn help(&self) -> Vec<HelpSection> {
-        let row = |label: &'static str, actions: &[Action]| (label, self.bindings_of(actions));
+        use Action as A;
+        let row = |label: &'static str, actions: &[Action]| {
+            let mut bindings = self.bindings_of(actions);
+            // Nine keys that differ in one character are one row's worth.
+            if actions.len() == 9 && matches!(actions[0], A::GoToTab(_)) {
+                bindings = vec![Binding { text: format!("{} 1-9", self.prefix), needs_protocol: self.prefix.needs_protocol() }];
+            }
+            HelpRow { label, name: help_name(actions), actions: actions.to_vec(), bindings }
+        };
+        // Keys the overlays read themselves, which no binding table holds.
+        let fixed = |label: &'static str, keys: &[&str]| HelpRow {
+            label,
+            name: String::new(),
+            actions: Vec::new(),
+            bindings: keys.iter().map(|k| Binding { text: (*k).to_string(), needs_protocol: KeyCombo::parse(k).is_some_and(|c| c.needs_protocol()) }).collect(),
+        };
+        let run_key = self.key_for(A::RunDirect).unwrap_or_else(|| "f5".into());
         let run = vec![
-            row("run", &[Action::RunDirect, Action::Run]),
-            row("cancel", &[Action::CancelDirect, Action::Cancel]),
-            row("complete statement", &[Action::FinishStatementDirect, Action::FinishStatement]),
-            row("complete", &[Action::CompleteOpen]),
-            row("history", &[Action::HistoryDirect, Action::History]),
-            row("expand *", &[Action::ExpandStar]),
-            row("next error", &[Action::NextUnresolved]),
-            row("previous error", &[Action::PrevUnresolved]),
+            row("run", &[A::RunDirect, A::Run]),
+            row("cancel", &[A::CancelDirect, A::Cancel]),
+            row("complete statement", &[A::FinishStatementDirect, A::FinishStatement]),
+            row("complete", &[A::CompleteOpen]),
+            row("history", &[A::HistoryDirect, A::History]),
+            row("go to table or view", &[A::NavigatorDirect, A::Navigator]),
+            row("expand *", &[A::ExpandStar]),
+            row("next error", &[A::NextUnresolved]),
+            row("previous error", &[A::PrevUnresolved]),
         ];
         let edit: Vec<_> = EDIT_ACTIONS.iter().map(|a| row(a.label(), &[*a])).collect();
         let panes = vec![
-            row("focus left", &[Action::FocusLeft]),
-            row("focus down", &[Action::FocusDown]),
-            row("focus up", &[Action::FocusUp]),
-            row("focus right", &[Action::FocusRight]),
-            row("zoom", &[Action::Zoom]),
-            row("resize", &[Action::ResizeMode]),
-            row("new connection", &[Action::NewConnection]),
-            row("quit", &[Action::Quit]),
-            row("help", &[Action::Help]),
+            row("focus left", &[A::FocusLeft]),
+            row("focus down", &[A::FocusDown]),
+            row("focus up", &[A::FocusUp]),
+            row("focus right", &[A::FocusRight]),
+            row("zoom", &[A::Zoom]),
+            row("resize", &[A::ResizeMode]),
+            row("new connection", &[A::NewConnection]),
+            row("quit", &[A::Quit]),
+            row("help", &[A::Help]),
         ];
         let tabs = vec![
-            row("new tab", &[Action::NewTab]),
-            row("close tab", &[Action::CloseTabDirect, Action::CloseTab]),
-            row("next tab", &[Action::NextTabDirect, Action::NextTab]),
-            row("previous tab", &[Action::PrevTabDirect, Action::PrevTab]),
-            row("go to tab 1-9", &(1..=9).map(Action::GoToTab).collect::<Vec<_>>()),
+            row("new tab", &[A::NewTab]),
+            row("close tab", &[A::CloseTabDirect, A::CloseTab]),
+            row("next tab", &[A::NextTabDirect, A::NextTab]),
+            row("previous tab", &[A::PrevTabDirect, A::PrevTab]),
+            row("go to tab 1-9", &(1..=9).map(A::GoToTab).collect::<Vec<_>>()),
         ];
-        let browse = vec![
-            row("open table (sidebar)", &[Action::OpenTable]),
-            row("next page (results)", &[Action::NextPage]),
-            row("previous page (results)", &[Action::PrevPage]),
-            row("count rows (results)", &[Action::CountRows]),
+        let sidebar = vec![
+            row("move down", &[A::MoveDown]),
+            row("move up", &[A::MoveUp]),
+            row("open node", &[A::Expand]),
+            row("close node, or parent", &[A::Collapse]),
+            row("page down", &[A::PageDown]),
+            row("page up", &[A::PageUp]),
+            row("top", &[A::First]),
+            row("bottom", &[A::Last]),
+            row("reload node", &[A::Refresh]),
+            row("edit connection", &[A::EditConnection]),
+            row("remove connection", &[A::RemoveConnection]),
+            row("use for the tab", &[A::UseTarget]),
+            row("open table", &[A::OpenTable]),
+            row("dump database or schema", &[A::Dump]),
+        ];
+        let results = vec![
+            row("move left", &[A::GridLeft]),
+            row("move right", &[A::GridRight]),
+            row("move up", &[A::GridUp]),
+            row("move down", &[A::GridDown]),
+            row("page up", &[A::GridPageUp]),
+            row("page down", &[A::GridPageDown]),
+            row("first column", &[A::GridFirstCol]),
+            row("last column", &[A::GridLastCol]),
+            row("first row", &[A::GridFirstRow]),
+            row("last row", &[A::GridLastRow]),
+            row("view cell", &[A::OpenCell]),
+            row("copy cell", &[A::CopyCell]),
+            row("copy row", &[A::CopyRow]),
+            row("export to a file", &[A::Export]),
+            row("copy as", &[A::CopyAs]),
+            row("load more rows", &[A::LoadMore]),
+            row("next page", &[A::NextPage]),
+            row("previous page", &[A::PrevPage]),
+            row("count rows", &[A::CountRows]),
+            row("raw or pretty (viewer)", &[A::ToggleRaw]),
+        ];
+        let resize = vec![
+            row("sidebar narrower", &[A::ResizeLeft]),
+            row("sidebar wider", &[A::ResizeRight]),
+            row("split up", &[A::ResizeUp]),
+            row("split down", &[A::ResizeDown]),
+            row("leave resize mode", &[A::ResizeDone]),
+        ];
+        let completion = vec![
+            row("insert", &[A::CompleteInsert]),
+            row("replace the word", &[A::CompleteReplace]),
+            row("expand template", &[A::ExpandTemplate]),
+            row("move down", &[A::CompleteDown]),
+            row("move up", &[A::CompleteUp]),
+            row("page down", &[A::CompletePageDown]),
+            row("page up", &[A::CompletePageUp]),
+            row("close", &[A::CompleteClose]),
+        ];
+        let template = vec![
+            row("next variable", &[A::TemplateNext]),
+            row("previous variable", &[A::TemplatePrev]),
+            row("leave template", &[A::TemplateDone]),
+        ];
+        // `esc`, and the key that opened it, which closes it too.
+        let mut navigator_close = fixed("close", &["esc"]);
+        navigator_close.bindings.extend(self.bindings_of(&[A::NavigatorDirect]));
+        let navigator = vec![
+            fixed("move", &["down", "up", "ctrl+n", "ctrl+p", "pagedown", "pageup"]),
+            fixed("reveal in the sidebar", &["enter"]),
+            fixed("open its rows", &["ctrl+o"]),
+            navigator_close,
+        ];
+        let history = vec![
+            fixed("move", &["down", "up", "ctrl+n", "ctrl+p", "pagedown", "pageup"]),
+            fixed("put in the editor", &["enter"]),
+            fixed("run again", &[run_key.as_str()]),
+            fixed("this connection or all", &["tab"]),
+            fixed("scroll the statement", &["shift+down", "shift+up"]),
+            fixed("close", &["esc"]),
         ];
         let export = vec![
-            row("export to a file (results)", &[Action::Export]),
-            row("copy as text (results)", &[Action::CopyAs]),
-            row("dump a database or schema (sidebar)", &[Action::Dump]),
+            fixed("next or previous row", &["tab", "shift+tab", "down", "up"]),
+            fixed("pick a format", &["h", "l", "left", "right", "1-5"]),
+            fixed("empty or NULL (CSV)", &["space"]),
+            fixed("write the file", &["enter"]),
+            fixed("replace the file", &["y"]),
+            fixed("cancel", &["esc"]),
         ];
+        let dump = vec![
+            fixed("next or previous row", &["tab", "shift+tab", "down", "up"]),
+            fixed("pick content or scope", &["h", "l", "left", "right", "1-3"]),
+            fixed("toggle scope or drop", &["space"]),
+            fixed("start the dump", &["enter"]),
+            fixed("replace the file", &["y"]),
+            fixed("cancel the dump", &["c"]),
+            fixed("close", &["esc"]),
+        ];
+        let confirm = vec![
+            fixed("confirm a run or quit", &["y"]),
+            fixed("confirm a removal", &["enter"]),
+            fixed("decline", &["esc"]),
+        ];
+        let section = |title: &'static str, rows: Vec<HelpRow>| HelpSection { title, rows };
         vec![
-            HelpSection { title: "Run", rows: run },
-            HelpSection { title: "Browse", rows: browse },
-            HelpSection { title: "Export", rows: export },
-            HelpSection { title: "Edit", rows: edit },
-            HelpSection { title: "Panes", rows: panes },
-            HelpSection { title: "Tabs", rows: tabs },
+            section("Run", run),
+            section("Edit", edit),
+            section("Panes", panes),
+            section("Tabs", tabs),
+            section("Sidebar", sidebar),
+            section("Results", results),
+            section("Resize mode (prefix R)", resize),
+            section("Completion popup", completion),
+            section("Template mode", template),
+            section("Go to overlay", navigator),
+            section("History overlay", history),
+            section("Export overlay", export),
+            section("Dump overlay", dump),
+            section("Confirmations", confirm),
         ]
+    }
+
+    /// Every action that any key is bound to, in any scope (the prefix's
+    /// editing keys too): what the help must list.
+    pub fn bound_actions(&self) -> Vec<Action> {
+        let mut out: Vec<Action> = Vec::new();
+        for (_, a) in self
+            .bindings
+            .iter()
+            .chain(&self.editor_prefix)
+            .chain(&self.direct)
+            .chain(&self.sidebar)
+            .chain(&self.results)
+            .chain(&self.resize)
+            .chain(&self.complete)
+            .chain(&self.template)
+            .chain(&self.editor)
+        {
+            if !out.contains(a) {
+                out.push(*a);
+            }
+        }
+        out
     }
 
     /// The key bound to `action`, as shown, if any. When several keys do the
@@ -1080,7 +1230,109 @@ impl Keybinds {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelpSection {
     pub title: &'static str,
-    pub rows: Vec<(&'static str, Vec<Binding>)>,
+    pub rows: Vec<HelpRow>,
+}
+
+/// One row of the help: what it does, the name the config file gives it, and
+/// every key that does it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpRow {
+    pub label: &'static str,
+    /// `scope.action` (`editor.duplicate`, `direct/prefix.run`): what slice 22
+    /// reads in the config file. Empty for keys an overlay reads itself,
+    /// which no binding table holds and the config does not rebind.
+    pub name: String,
+    /// The actions the row stands for; none for an overlay's own keys.
+    pub actions: Vec<Action>,
+    pub bindings: Vec<Binding>,
+}
+
+impl HelpRow {
+    /// Whether the row answers a search: every word of `search` is in the
+    /// label, the name or one of the keys, without regard to case.
+    pub fn matches(&self, search: &str) -> bool {
+        let hay = self.haystack();
+        search.to_lowercase().split_whitespace().all(|word| hay.iter().any(|h| h.contains(word)))
+    }
+
+    /// Whether the whole of `search`, spaces and all, is one of the row's keys
+    /// (`ctrl+g t`). Case counts here, as it does to the keys: `ctrl+g T` is
+    /// another key.
+    pub fn matches_whole(&self, search: &str) -> bool {
+        let whole = search.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.bindings.iter().any(|b| b.text == whole)
+    }
+
+    fn haystack(&self) -> Vec<String> {
+        [self.label.to_lowercase(), self.name.to_lowercase()].into_iter().chain(self.bindings.iter().map(|b| b.text.to_lowercase())).collect()
+    }
+}
+
+impl Scope {
+    /// The section of the config file the scope's keys are in.
+    pub fn name(self) -> &'static str {
+        match self {
+            Scope::Prefix => "prefix",
+            Scope::Direct => "direct",
+            Scope::Sidebar => "sidebar",
+            Scope::Results => "results",
+            Scope::Resize => "resize",
+            Scope::Complete => "complete",
+            Scope::Template => "template",
+            Scope::Editor => "editor",
+        }
+    }
+}
+
+impl Action {
+    /// The action's name without its scope, in snake case. A direct key's
+    /// action shares the name of the prefix key's (`run` for `RunDirect` and
+    /// `Run`): the scope tells them apart.
+    pub fn config_name(self) -> String {
+        let camel = match self {
+            Action::GoToTab(n) => format!("GoToTab{n}"),
+            other => format!("{other:?}"),
+        };
+        let mut out = String::new();
+        let mut previous: Option<char> = None;
+        for c in camel.chars() {
+            let split = (c.is_uppercase() && previous.is_some()) || (c.is_ascii_digit() && previous.is_some_and(|p| !p.is_ascii_digit()));
+            if split {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+            previous = Some(c);
+        }
+        match out.strip_suffix("_direct") {
+            Some(base) => base.to_string(),
+            None => out,
+        }
+    }
+
+    /// `scope.name`, as the config file addresses the action.
+    pub fn qualified_name(self) -> String {
+        format!("{}.{}", self.scope().name(), self.config_name())
+    }
+}
+
+/// The names of a row's actions: one `scope.name`, or `scope/scope.name` when
+/// the actions are the same thing in several scopes (`direct/prefix.run`), or
+/// the qualified names side by side when they differ.
+fn help_name(actions: &[Action]) -> String {
+    let Some(first) = actions.first() else { return String::new() };
+    // Nine tab keys are one name.
+    if actions.len() == 9 && matches!(first, Action::GoToTab(_)) {
+        return "prefix.go_to_tab_N".to_string();
+    }
+    let base = first.config_name();
+    if actions.iter().all(|a| a.config_name() == base) {
+        let mut scopes: Vec<&str> = actions.iter().map(|a| a.scope().name()).collect();
+        scopes.sort();
+        scopes.dedup();
+        format!("{}.{base}", scopes.join("/"))
+    } else {
+        actions.iter().map(|a| a.qualified_name()).collect::<Vec<_>>().join(", ")
+    }
 }
 
 /// The editor's actions in the order the help lists them.

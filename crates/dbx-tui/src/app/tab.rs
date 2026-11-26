@@ -185,6 +185,7 @@ impl App {
         let Some(i) = self.ui.parked.iter().position(|t| t.id == id) else { return fx };
         self.close_completion(&mut fx);
         self.leave_template(&mut fx);
+        self.cancel_reveal();
         self.ui.tab.complete.forget_pending();
         // A drag or a double-click begun in the tab left ends with it.
         self.ui.drag = None;

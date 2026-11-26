@@ -412,7 +412,7 @@ impl App {
     }
 
     pub(super) fn open_help(&mut self, fx: &mut Effects) {
-        self.ui.overlay = Some(Overlay::Help(HelpOverlay { scroll: 0 }));
+        self.ui.overlay = Some(Overlay::Help(HelpOverlay::default()));
         self.ui.mode = Mode::Normal;
         fx.repaint = true;
     }

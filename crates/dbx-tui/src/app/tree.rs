@@ -263,6 +263,27 @@ impl SchemaCache {
         }
     }
 
+    /// Every table and view of `db` that is loaded, with its schema (empty
+    /// where the connection has none): what the sidebar could show of it
+    /// without asking the Core anything.
+    pub fn tables_in(&self, db: &DatabasePath) -> Vec<(String, Table)> {
+        let root = if db.database.is_empty() { NodeId::Connection(db.connection.clone()) } else { NodeId::Database(db.clone()) };
+        let mut out = Vec::new();
+        match self.state(&root).listing() {
+            Some(Listing::Schemas(names)) => {
+                for name in names {
+                    let node = NodeId::Schema(SchemaPath { database: db.clone(), schema: name.clone() });
+                    if let Some(Listing::Tables(tables)) = self.state(&node).listing() {
+                        out.extend(tables.iter().map(|t| (name.clone(), t.clone())));
+                    }
+                }
+            }
+            Some(Listing::Tables(tables)) => out.extend(tables.iter().map(|t| (String::new(), t.clone()))),
+            _ => {}
+        }
+        out
+    }
+
     /// Every cached node below `node`, at any depth.
     pub fn descendants(&self, node: &NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();

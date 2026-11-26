@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 
 use super::{panel, Drawn, Painter};
-use crate::app::keys::{Binding, Keybinds};
+use crate::app::keys::{HelpRow, Keybinds};
 use crate::app::overlay::{Chooser, ConfirmRun, HelpOverlay, Overlay, OverlayAction, OverlayButton};
 use crate::core::Reason;
 use crate::app::theme::Role;
@@ -46,29 +46,55 @@ pub(super) fn draw_chooser(c: &Chooser, p: &Painter, buf: &mut Buffer) -> Drawn 
     Drawn { buttons, fields: Vec::new() }
 }
 
-/// A row of the help, as drawn.
+/// A line of the help, as drawn. The keys of a row that do not fit on its
+/// line carry on, on lines under it.
 enum Line<'a> {
     Title(&'static str),
-    Row(&'static str, &'a [Binding]),
+    /// The row, which of its keys this line has, and whether it has the label.
+    Row(&'a HelpRow, std::ops::Range<usize>, bool),
     Blank,
 }
 
-fn lines(sections: &[crate::app::keys::HelpSection]) -> Vec<Line<'_>> {
+/// What a key looks like in the list: one this terminal cannot deliver is in
+/// `[brackets]`.
+fn key_text(b: &crate::app::keys::Binding, caps: Capabilities) -> String {
+    if b.needs_protocol && !caps.keyboard_protocol {
+        format!("[{}]", b.text)
+    } else {
+        b.text.clone()
+    }
+}
+
+/// The lines of the help, the keys of each row broken into lines of at most
+/// `avail` columns (a key too wide for a line has one to itself).
+fn lines(sections: &[crate::app::keys::HelpSection], avail: u16, caps: Capabilities) -> Vec<Line<'_>> {
     let mut out = Vec::new();
     for (i, s) in sections.iter().enumerate() {
         if i > 0 {
             out.push(Line::Blank);
         }
         out.push(Line::Title(s.title));
-        for (label, bindings) in &s.rows {
-            out.push(Line::Row(label, bindings));
+        for row in &s.rows {
+            let (mut start, mut used, mut first) = (0, 0u16, true);
+            for (j, b) in row.bindings.iter().enumerate() {
+                let w = super::drawn_width(&key_text(b, caps)) as u16;
+                if j > start && used + 2 + w > avail {
+                    out.push(Line::Row(row, start..j, first));
+                    (start, used, first) = (j, 0, false);
+                }
+                used += if j > start { 2 } else { 0 } + w;
+            }
+            out.push(Line::Row(row, start..row.bindings.len(), first));
         }
     }
     out
 }
 
-/// How wide the label column is.
+/// How wide the label column is, and the config name's.
 const LABEL: u16 = 24;
+const NAME: u16 = 32;
+/// A terminal narrower than this has no room for the config name column.
+const WIDE: u16 = 110;
 
 /// Every action with all its keys, from the live bindings. A key this
 /// terminal cannot deliver is in `[brackets]` and dimmed.
@@ -78,29 +104,57 @@ pub(super) fn draw_help(h: &mut HelpOverlay, keys: &Keybinds, caps: Capabilities
     let height = area.height.saturating_sub(4).max(8.min(area.height));
     let rect = panel::centred(area, width, height);
     let inner = panel::panel(p, buf, rect, "Keys", Role::Accent, Role::Accent);
-    if inner.width < 12 || inner.height < 4 {
+    if inner.width < 30 || inner.height < 4 {
+        panel::too_small(p, buf, rect);
         return Drawn::default();
     }
     let bg = p.theme.color(Role::PanelBg);
     let pane = p.within(inner);
-    let sections = keys.help();
-    let all = lines(&sections);
-    let rows = (inner.height - 2) as usize;
+    // The config name is a column only where there is room for it.
+    let named = area.width >= WIDE;
+    let keys_at = if named { LABEL + NAME } else { LABEL };
+    // The search field, then a line saying what the columns are.
+    pane.put(buf, inner.x, inner.y, "search", p.bold(Role::Accent).bg(bg));
+    let input = Rect::new(inner.x + 8, inner.y, inner.width.saturating_sub(8), 1);
+    super::form::draw_input(&pane, buf, input, &mut h.search, true, Some("an action, a name or a key"));
+    pane.put(buf, inner.x, inner.y + 1, "does", p.fg(Role::Overlay0).bg(bg));
+    if named {
+        pane.put(buf, inner.x + LABEL, inner.y + 1, "config name", p.fg(Role::Overlay0).bg(bg));
+    }
+    pane.put(buf, inner.x + keys_at, inner.y + 1, "keys", p.fg(Role::Overlay0).bg(bg));
+    let sections = crate::app::help::filter(keys.help(), h.search.text());
+    let all = lines(&sections, inner.width.saturating_sub(keys_at), caps);
+    // Two lines on top, the note and the foot below.
+    let rows = (inner.height.saturating_sub(4)) as usize;
+    h.rows = rows;
     h.scroll = h.scroll.min(all.len().saturating_sub(rows));
+    if all.is_empty() {
+        let text = format!("No key, name or action matches \"{}\". Clear the search to see everything.", h.search.text().trim());
+        for (i, line) in panel::wrap(&text, inner.width as usize).iter().take(rows).enumerate() {
+            pane.put(buf, inner.x, inner.y + 2 + i as u16, line, p.fg(Role::Subtext0).bg(bg));
+        }
+    }
     for (i, line) in all.iter().skip(h.scroll).take(rows).enumerate() {
-        let y = inner.y + i as u16;
+        let y = inner.y + 2 + i as u16;
         match line {
             Line::Title(t) => {
                 pane.put(buf, inner.x, y, t, p.bold(Role::Accent).bg(bg));
             }
             Line::Blank => {}
-            Line::Row(label, bindings) => {
-                pane.put(buf, inner.x, y, label, p.fg(Role::Subtext0).bg(bg));
-                let mut x = inner.x + LABEL;
-                for b in bindings.iter() {
+            Line::Row(row, which, first) => {
+                if *first {
+                    pane.within(Rect::new(inner.x, y, LABEL - 1, 1)).put(buf, inner.x, y, row.label, p.fg(Role::Subtext0).bg(bg));
+                    if named {
+                        // A name longer than its column is cut at it, not into the keys.
+                        let at = inner.x + LABEL;
+                        pane.within(Rect::new(at, y, NAME - 1, 1)).put(buf, at, y, &row.name, p.fg(Role::Overlay0).bg(bg));
+                    }
+                }
+                let mut x = inner.x + keys_at;
+                for b in &row.bindings[which.clone()] {
                     let missing = b.needs_protocol && !caps.keyboard_protocol;
-                    let (text, style) = if missing { (format!("[{}]", b.text), p.fg(Role::Overlay0).bg(bg)) } else { (b.text.clone(), p.bold(Role::Text).bg(bg)) };
-                    x = pane.put(buf, x, y, &text, style) + 2;
+                    let style = if missing { p.fg(Role::Overlay0).bg(bg) } else { p.bold(Role::Text).bg(bg) };
+                    x = pane.put(buf, x, y, &key_text(b, caps), style) + 2;
                 }
             }
         }

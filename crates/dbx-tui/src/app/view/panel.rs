@@ -168,6 +168,17 @@ pub(super) fn split_at_width(word: &str, width: usize) -> (String, String) {
     (word[..end].to_string(), word[end..].to_string())
 }
 
+/// What an overlay says where it has no room to be drawn: one line, on the
+/// middle row of the space it was given.
+pub(super) fn too_small(p: &Painter, buf: &mut Buffer, area: Rect) {
+    let y = area.y + area.height / 2;
+    let row = Rect::new(area.x, y, area.width, 1);
+    let bg = p.theme.color(Role::PanelBg);
+    let pr = p.within(row);
+    pr.fill(buf, Style::default().bg(bg));
+    pr.put(buf, area.x, y, "terminal too small", p.fg(Role::Yellow).bg(bg));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

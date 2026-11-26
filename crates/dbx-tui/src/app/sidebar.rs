@@ -149,6 +149,8 @@ impl App {
     /// The sidebar takes its keys directly: it accepts no text. Which key does
     /// what comes from the live keybindings.
     pub(super) fn on_sidebar_key(&mut self, combo: super::keys::KeyCombo, fx: &mut Effects) {
+        // The user took over: a reveal on its way no longer moves the cursor.
+        self.cancel_reveal();
         if self.ui.note.take().is_some() {
             fx.repaint = true;
         }
@@ -429,6 +431,9 @@ impl App {
     /// no longer be true: forget its tree, and stop waiting for its listings.
     pub(super) fn forget_connection(&mut self, id: &ConnectionId, fx: &mut Effects) {
         let node = NodeId::Connection(id.clone());
+        if self.ui.reveal.as_ref().is_some_and(|r| &r.path.schema.database.connection == id) {
+            self.ui.reveal = None;
+        }
         self.release_below(&node, false, fx);
         self.invalidate_completions(&node, fx);
         self.model.schema.remove_connection(id);

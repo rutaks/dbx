@@ -39,6 +39,8 @@ pub enum Target {
     History,
     /// The next page of the search on screen; a new search makes it stale.
     HistoryMore,
+    /// The navigator's search of the database: the latest wins.
+    Navigate,
     /// One save of a run to the history, by its serial: each stands alone.
     SaveHistory(u64),
     /// One export to a file, by its serial: each stands alone.

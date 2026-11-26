@@ -41,6 +41,8 @@ pub enum Overlay {
     /// Earlier statements, shared with the desktop app: search, preview,
     /// insert or run again (slice 18).
     History(Box<super::history::HistoryOverlay>),
+    /// Go to a table or view by part of its name (slice 21).
+    Navigator(Box<super::navigator::NavigatorOverlay>),
     /// Write the result to a file: format, path, and what the format loses
     /// (slice 19).
     Export(Box<super::export::ExportOverlay>),
@@ -74,10 +76,14 @@ pub struct Chooser {
     pub selected: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct HelpOverlay {
     /// The first row shown.
     pub scroll: usize,
+    /// Narrows the rows to those whose action name, label or key match.
+    pub search: super::text_field::TextField,
+    /// How many lines the list shows: set by the view, for the page keys.
+    pub rows: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +213,11 @@ pub enum OverlayAction {
     HistoryRun,
     HistoryScope,
     HistoryPick(usize),
+    /// The navigator: reveal the highlighted name in the sidebar, open its
+    /// rows in a browse tab, or highlight the name that was clicked.
+    NavigatorReveal,
+    NavigatorOpen,
+    NavigatorPick(usize),
     /// The export overlay: write the file; replace the file that is there;
     /// keep it and go back to the overlay; pick a format; focus a row; pick
     /// the CSV NULL literal (true: an empty field).
@@ -309,6 +320,9 @@ const HELP_BUTTONS: &[ButtonSpec] = &[button("esc", "esc", "close", OverlayActio
 // The history's own keys are read by `App::on_history_key` (the run key is
 // the live one), and its buttons are drawn with the live key labels.
 const HISTORY_BUTTONS: &[ButtonSpec] = &[];
+// The navigator's keys are `enter`, `ctrl+o` and `esc`; its buttons are drawn
+// by its own view (they change with what is highlighted).
+const NAVIGATOR_BUTTONS: &[ButtonSpec] = &[];
 const FAILURE_BUTTONS: &[ButtonSpec] = &[button("↵", "enter", "close", OverlayAction::Dismiss)];
 const EXPORT_BUTTONS: &[ButtonSpec] =
     &[button("↵", "enter", "export", OverlayAction::ExportRun), button("esc", "esc", "cancel", OverlayAction::Dismiss)];
@@ -354,6 +368,7 @@ impl Overlay {
             Overlay::Chooser(_) => CHOOSER_BUTTONS,
             Overlay::Help(_) => HELP_BUTTONS,
             Overlay::History(_) => HISTORY_BUTTONS,
+            Overlay::Navigator(_) => NAVIGATOR_BUTTONS,
             Overlay::Export(o) => match &o.stage {
                 super::export::Stage::Writing(_) => EXPORT_WRITING_BUTTONS,
                 super::export::Stage::Replace(_) => EXPORT_REPLACE_BUTTONS,

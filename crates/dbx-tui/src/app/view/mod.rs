@@ -6,6 +6,7 @@ mod editor;
 mod export;
 mod form;
 mod history;
+mod navigator;
 mod overlays;
 mod panel;
 mod popup;
@@ -177,6 +178,7 @@ fn draw_overlay(
         Overlay::ConfirmRun(c) => overlays::draw_confirm_run(c, p, buf),
         Overlay::Help(h) => overlays::draw_help(h, keys, caps, p, buf),
         Overlay::History(h) => history::draw(h, keys, here, p, buf),
+        Overlay::Navigator(n) => navigator::draw(n, p, buf),
         Overlay::Export(o) => export::draw(o, buttons, keys.key_for(Action::LoadMore).as_deref(), p, buf),
         Overlay::CopyAs(c) => export::draw_copy_as(c, buttons, p, buf),
         Overlay::Dump(o) => dump::draw(o, buttons, p, buf),
