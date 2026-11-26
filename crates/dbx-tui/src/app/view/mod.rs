@@ -93,7 +93,7 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
                 Overlay::ConfirmCloseTab(ask) => app.model.tab(ask.tab).is_some_and(|t| t.run.in_flight().is_some()),
                 _ => false,
             };
-            draw_overlay(overlay, running, &app.ui.keys, app.ui.caps, app.ui.notice.as_ref(), here.as_ref(), &p, buf)
+            draw_overlay(overlay, running, &app.ui.keys, app.ui.caps, &app.ui.config, app.ui.notice.as_ref(), here.as_ref(), &p, buf)
         }
         None => Drawn::default(),
     };
@@ -114,6 +114,7 @@ fn draw_overlay(
     closing_tab_running: bool,
     keys: &super::keys::Keybinds,
     caps: super::Capabilities,
+    config: &super::config::Report,
     notice: Option<&super::query::Notice>,
     here: Option<&history::Here>,
     p: &Painter,
@@ -176,7 +177,7 @@ fn draw_overlay(
         Overlay::CellViewer(v) => viewer::draw(v, keys, notice, p, buf),
         Overlay::Chooser(c) => overlays::draw_chooser(c, p, buf),
         Overlay::ConfirmRun(c) => overlays::draw_confirm_run(c, p, buf),
-        Overlay::Help(h) => overlays::draw_help(h, keys, caps, p, buf),
+        Overlay::Help(h) => overlays::draw_help(h, keys, config, caps, p, buf),
         Overlay::History(h) => history::draw(h, keys, here, p, buf),
         Overlay::Navigator(n) => navigator::draw(n, p, buf),
         Overlay::Export(o) => export::draw(o, buttons, keys.key_for(Action::LoadMore).as_deref(), p, buf),
@@ -445,7 +446,9 @@ fn put_right(p: &Painter, buf: &mut Buffer, row: Rect, min_x: u16, right: &str, 
 fn draw_row(p: &Painter, buf: &mut Buffer, row: Rect, r: &Row, cursor: bool, cache: &super::tree::SchemaCache) {
     let p = p.within(row);
     if cursor {
-        p.fill(buf, Style::default().bg(p.theme.color(Role::SelectionBg)));
+        // Reversed in a theme whose selection colour is the terminal's own
+        // background, where no colour would show.
+        p.fill(buf, Style::default().bg(p.theme.color(Role::SelectionBg)).add_modifier(p.theme.modifier(Role::SelectionBg)));
     }
     let base = row.x + MARGIN + 2 * r.depth;
     let text = p.fg(Role::Text);

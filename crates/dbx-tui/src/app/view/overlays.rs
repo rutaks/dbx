@@ -53,6 +53,39 @@ enum Line<'a> {
     /// The row, which of its keys this line has, and whether it has the label.
     Row(&'a HelpRow, std::ops::Range<usize>, bool),
     Blank,
+    /// A line of text of our own (the config file's path and problems), in
+    /// the role's colour, bold or not.
+    Note(String, Role, bool),
+}
+
+/// The config file's place and each problem in it, as the top of the help:
+/// where the file was read from, then a line (wrapped) per problem. A search
+/// keeps the problems whose words it has, and hides the path.
+fn config_lines(config: &crate::app::config::Report, search: &str, width: usize) -> Vec<Line<'static>> {
+    let words: Vec<String> = search.to_lowercase().split_whitespace().map(str::to_string).collect();
+    let mut out = Vec::new();
+    if words.is_empty() {
+        if let Some(path) = &config.path {
+            let state = if config.found { "read at startup" } else { "not found: the defaults are in use" };
+            for line in panel::wrap(&format!("config file: {} ({state})", path.display()), width) {
+                out.push(Line::Note(line, Role::Overlay0, false));
+            }
+        }
+    }
+    let shown: Vec<_> = config.problems.iter().filter(|p| words.iter().all(|w| p.text().to_lowercase().contains(w.as_str()))).collect();
+    if !shown.is_empty() {
+        let n = config.problems.len();
+        out.push(Line::Note(format!("Config problems ({n}): each was left at its default"), Role::Yellow, true));
+        for p in shown {
+            for (i, line) in panel::wrap(&p.text(), width.saturating_sub(2)).into_iter().enumerate() {
+                out.push(Line::Note(format!("{}{line}", if i == 0 { "- " } else { "  " }), Role::Text, false));
+            }
+        }
+    }
+    if !out.is_empty() {
+        out.push(Line::Blank);
+    }
+    out
 }
 
 /// What a key looks like in the list: one this terminal cannot deliver is in
@@ -92,15 +125,19 @@ fn lines(sections: &[crate::app::keys::HelpSection], avail: u16, caps: Capabilit
 
 /// How wide the label column is, and the config name's.
 const LABEL: u16 = 24;
-const NAME: u16 = 32;
+/// Wide enough for the longest name, `after_prefix/direct.finish_statement`.
+const NAME: u16 = 38;
 /// A terminal narrower than this has no room for the config name column.
 const WIDE: u16 = 110;
 
 /// Every action with all its keys, from the live bindings. A key this
 /// terminal cannot deliver is in `[brackets]` and dimmed.
-pub(super) fn draw_help(h: &mut HelpOverlay, keys: &Keybinds, caps: Capabilities, p: &Painter, buf: &mut Buffer) -> Drawn {
+pub(super) fn draw_help(h: &mut HelpOverlay, keys: &Keybinds, config: &crate::app::config::Report, caps: Capabilities, p: &Painter, buf: &mut Buffer) -> Drawn {
     let area = buf.area;
-    let width = 100.min(area.width.saturating_sub(4)).max(24.min(area.width));
+    // The config names are a long column (`after_prefix/direct.run`): with
+    // room for it the box is wider, so the keys still fit on a line.
+    let wide = if area.width >= WIDE { 110 } else { 100 };
+    let width = wide.min(area.width.saturating_sub(4)).max(24.min(area.width));
     let height = area.height.saturating_sub(4).max(8.min(area.height));
     let rect = panel::centred(area, width, height);
     let inner = panel::panel(p, buf, rect, "Keys", Role::Accent, Role::Accent);
@@ -123,7 +160,8 @@ pub(super) fn draw_help(h: &mut HelpOverlay, keys: &Keybinds, caps: Capabilities
     }
     pane.put(buf, inner.x + keys_at, inner.y + 1, "keys", p.fg(Role::Overlay0).bg(bg));
     let sections = crate::app::help::filter(keys.help(), h.search.text());
-    let all = lines(&sections, inner.width.saturating_sub(keys_at), caps);
+    let mut all = config_lines(config, h.search.text(), inner.width as usize);
+    all.extend(lines(&sections, inner.width.saturating_sub(keys_at), caps));
     // Two lines on top, the note and the foot below.
     let rows = (inner.height.saturating_sub(4)) as usize;
     h.rows = rows;
@@ -141,6 +179,10 @@ pub(super) fn draw_help(h: &mut HelpOverlay, keys: &Keybinds, caps: Capabilities
                 pane.put(buf, inner.x, y, t, p.bold(Role::Accent).bg(bg));
             }
             Line::Blank => {}
+            Line::Note(text, role, bold) => {
+                let style = if *bold { p.bold(*role) } else { p.fg(*role) };
+                pane.put(buf, inner.x, y, text, style.bg(bg));
+            }
             Line::Row(row, which, first) => {
                 if *first {
                     pane.within(Rect::new(inner.x, y, LABEL - 1, 1)).put(buf, inner.x, y, row.label, p.fg(Role::Subtext0).bg(bg));
@@ -151,6 +193,10 @@ pub(super) fn draw_help(h: &mut HelpOverlay, keys: &Keybinds, caps: Capabilities
                     }
                 }
                 let mut x = inner.x + keys_at;
+                if row.bindings.is_empty() {
+                    // An action the config file left with no key.
+                    pane.put(buf, x, y, "unbound", p.fg(Role::Overlay0).bg(bg));
+                }
                 for b in &row.bindings[which.clone()] {
                     let missing = b.needs_protocol && !caps.keyboard_protocol;
                     let style = if missing { p.fg(Role::Overlay0).bg(bg) } else { p.bold(Role::Text).bg(bg) };

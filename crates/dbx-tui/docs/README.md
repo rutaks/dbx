@@ -151,6 +151,106 @@ the database the tab uses, or else the one under the sidebar cursor.
 (The `ctrl+g` table is checked against dbpane's live key bindings by a test, so
 a key listed here is a key that works in the pane named above its table.)
 
+## Config
+
+Theme, keys and a few editor and run settings live in one TOML file, read
+once when dbpane starts (there is no reload: quit and start again after a
+change). With no file, or with anything left out of it, you get the defaults.
+
+The file is, in order:
+
+1. `$DBPANE_CONFIG`, if set (`$DBX_TUI_CONFIG`, the name it had before the
+   rename, still works).
+2. `$XDG_CONFIG_HOME/dbpane/config.toml`.
+3. `~/.config/dbpane/config.toml`, on macOS as well as Linux.
+
+`dbpane config --path` prints the one in use (so does `dbpane --help`, and the
+help overlay names it). `dbpane config` prints a commented file holding every
+default, every action with its keys; start from it:
+
+```sh
+mkdir -p ~/.config/dbpane && dbpane config > ~/.config/dbpane/config.toml
+```
+
+A small file is enough. This one changes the theme, the prefix, one editor key
+and a few settings:
+
+```toml
+[theme]
+name = "intellij-dark"            # catppuccin, terminal or intellij-dark
+
+[keys]
+prefix = "ctrl+b"                 # the default is ctrl+g
+
+[keys.editor]
+duplicate = ["ctrl+shift+d", "prefix+d"]   # a list is every key the action has
+
+[keys.sidebar]
+refresh = "R"
+
+[editor]
+tab_width = 2
+format_keyword_case = "upper"
+
+[run]
+row_cap = 5000                    # rows a run fetches; 1 to 100000
+confirm_dangerous = true
+```
+
+- **`[theme] name`**, and `[keys] prefix`: one key such as `"ctrl+b"`. The
+  `DBPANE_THEME` variable (`DBX_TUI_THEME` too) wins over the file's theme.
+- **`[keys.<group>]`** gives an action a key, or a list of keys; `[]` unbinds it.
+  The groups are `after_prefix` (keys typed after the prefix), `direct` (read
+  whichever pane has focus), `sidebar`, `results`, `resize`, `complete`,
+  `template` and `editor`. The name of every action is in the help overlay, in
+  its *config name* column (`editor.duplicate`: group `editor`, action
+  `duplicate`), and `dbpane config` lists them all. A key is modifiers joined to
+  a key with `+` (`ctrl+shift+d`, `alt+enter`, `f5`, `space`), and `prefix+d`
+  means `d` typed after the prefix. A list is complete: rebinding `duplicate`
+  as above keeps the prefix key because `prefix+d` is in the list.
+- **`[editor]`** holds `alias_on_table`, `auto_pair`, `smart_enter`,
+  `smart_home`, `hard_tabs`, `tab_width`, `run_at_caret`, `format_keyword_case`,
+  `format_indent` and `format_comma`.
+- **`[run]`** holds `row_cap` and `confirm_dangerous`. Writes to a production
+  connection are always confirmed: there is no setting for it.
+
+**A mistake never stops dbpane.** An entry that is wrong keeps its default and
+the rest of the file still applies. dbpane shows one notice at startup that
+says how many problems there are, and the help overlay (`ctrl+g ?`, or your
+prefix) starts with each one, with its line and column. For this file:
+
+<!-- config: problems -->
+```toml
+[theme]
+colour = "red"
+[run]
+row_cap = 0
+```
+
+the help lists:
+
+```text
+line 2, column 1: unknown key "colour" in [theme]. The keys are name
+line 4, column 11: [run] row_cap: expected a whole number from 1 to 100000
+```
+
+A key that is not a key name, a wrong type, an unknown section or action, and a
+file that cannot be read are reported the same way. Invalid TOML, such as an
+unclosed string, is one problem with its line, and then the whole file is
+ignored. A key you give to an action takes it from any other action that has it
+in a place read at the same time (the help lists that as a problem too), and an
+action left with no key shows as `unbound` in the help, except `quit`, `help`
+and leaving the resize mode, which keep their keys (and `esc` always leaves the
+resize mode). A plain character (`x`, with no `ctrl`, `alt` or `cmd`) cannot be
+bound where you type, and a direct key cannot be a bare `enter`, `tab`, arrow,
+`home`, `end`, `backspace`, `delete` or page key either. The prefix must be a
+function key or have `ctrl`, `alt` or `cmd`. Key names such as `Ctrl`, `Enter`
+and `Space` are read in any case; a letter keeps its case.
+
+The key tables in this guide are the defaults. After you remap a key,
+`ctrl+g ?` (your prefix, then `?`) shows what every action does now, and the
+mode bar shows the live keys.
+
 ## Where your data is stored
 
 dbpane keeps connections, their passwords and the statement history in a

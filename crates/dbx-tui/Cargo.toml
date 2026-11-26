@@ -39,6 +39,11 @@ serde_json = "1"
 # Tokens for the syntax colouring: the same version and features dbx uses.
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+# The config file (slice 22): a TOML parser that gives each key and value its
+# position, for the line and column of a problem. Already in the workspace lock
+# (0.25.13, through proc-macro-crate) with exactly these features, so no new
+# crate enters the lock or the third-party list.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 # Single-line text fields: grapheme clusters for the cursor, display widths for
 # scrolling and clicks. Both are already in the workspace lock.
 unicode-segmentation = "1"

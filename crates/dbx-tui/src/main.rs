@@ -14,7 +14,21 @@ fn main() {
             // The store in force is the one the environment (and nothing
             // else) would pick: the same resolver the client uses.
             let store = StoreOptions::from_env(&StoreChoice::Auto).map(|o| o.info()).map_err(|e| e.message);
-            return print!("{}", cli::help_text(store));
+            let config = shell::config::locate(&|k| std::env::var(k).ok()).map(|f| f.path);
+            return print!("{}", cli::help_text(store, config));
+        }
+        // `dbpane config` prints the defaults as a config file; with `--path`,
+        // where the client reads its file.
+        Ok(cli::Cli::Config { path: false }) => return print!("{}", dbx_tui::app::config::default_file()),
+        Ok(cli::Cli::Config { path: true }) => {
+            match shell::config::locate(&|k| std::env::var(k).ok()) {
+                Ok(file) => println!("{}", file.path.display()),
+                Err(e) => {
+                    eprintln!("dbpane: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
         }
         // `dbpane kitty-setup [--write]` prints where kitty's include file is.
         Ok(cli::Cli::KittySetup { write }) => {
@@ -46,7 +60,9 @@ fn main() {
     // The layout preferences sit beside the store, if the store is known.
     let prefs = core.store_dir().map(shell::prefs::path_in);
     let store = core.store_info();
-    let result = runtime.block_on(shell::run(core, prefs, store));
+    // Where the config file is; if that cannot be known, the defaults.
+    let config = shell::config::locate(&|k| std::env::var(k).ok()).ok();
+    let result = runtime.block_on(shell::run(core, prefs, store, config));
     // The terminal is already restored (the guard is dropped inside `run`). Do not wait for Core calls still in
     // flight: quitting is immediate.
     runtime.shutdown_background();

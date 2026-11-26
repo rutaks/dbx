@@ -55,7 +55,7 @@ impl KeyCombo {
         let mut mods = KeyModifiers::NONE;
         if !mod_names.is_empty() {
             for m in mod_names.split('+') {
-                mods |= match m {
+                mods |= match m.to_ascii_lowercase().as_str() {
                     "ctrl" => KeyModifiers::CONTROL,
                     "alt" => KeyModifiers::ALT,
                     "shift" => KeyModifiers::SHIFT,
@@ -64,7 +64,9 @@ impl KeyCombo {
                 };
             }
         }
-        let code = match last {
+        // Names are read in any case; a single character keeps its own.
+        let named = last.to_ascii_lowercase();
+        let code = match named.as_str() {
             "esc" => KeyCode::Esc,
             "enter" => KeyCode::Enter,
             "tab" => KeyCode::Tab,
@@ -83,7 +85,7 @@ impl KeyCombo {
             f if f.len() > 1 && f.starts_with('f') && f[1..].chars().all(|c| c.is_ascii_digit()) => {
                 KeyCode::F(f[1..].parse().ok()?)
             }
-            c if c.chars().count() == 1 => KeyCode::Char(c.chars().next()?),
+            _ if last.chars().count() == 1 => KeyCode::Char(last.chars().next()?),
             _ => return None,
         };
         Some(Self::new(code, mods))
@@ -154,7 +156,7 @@ impl KeyCombo {
 
 /// Where an action's keys are read: after the prefix, or directly by the
 /// sidebar when it has focus (it accepts no text, so it needs no prefix).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
     Prefix,
     /// Read directly, whichever pane has focus, before the pane sees the key
@@ -178,7 +180,7 @@ pub enum Scope {
 }
 
 /// A named thing the client can do, to which keys are bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     FocusLeft,
     FocusDown,
@@ -846,6 +848,187 @@ impl Default for Keybinds {
 }
 
 impl Keybinds {
+    fn table_ref(&self, t: Tbl) -> &Vec<(KeyCombo, Action)> {
+        match t {
+            Tbl::AfterPrefix => &self.bindings,
+            Tbl::EditorPrefix => &self.editor_prefix,
+            Tbl::Direct => &self.direct,
+            Tbl::Sidebar => &self.sidebar,
+            Tbl::Results => &self.results,
+            Tbl::Resize => &self.resize,
+            Tbl::Complete => &self.complete,
+            Tbl::Template => &self.template,
+            Tbl::Editor => &self.editor,
+        }
+    }
+
+    fn table_mut(&mut self, t: Tbl) -> &mut Vec<(KeyCombo, Action)> {
+        match t {
+            Tbl::AfterPrefix => &mut self.bindings,
+            Tbl::EditorPrefix => &mut self.editor_prefix,
+            Tbl::Direct => &mut self.direct,
+            Tbl::Sidebar => &mut self.sidebar,
+            Tbl::Results => &mut self.results,
+            Tbl::Resize => &mut self.resize,
+            Tbl::Complete => &mut self.complete,
+            Tbl::Template => &mut self.template,
+            Tbl::Editor => &mut self.editor,
+        }
+    }
+
+    /// Every key that does two things in a set of scopes read together, and
+    /// the prefix key counted as doing `OpenPrefix` wherever it is read. None
+    /// for the defaults (a test), and none after a config file is applied.
+    pub fn conflicts(&self) -> Vec<Conflict> {
+        let mut out: Vec<Conflict> = Vec::new();
+        for set in READ_TOGETHER {
+            let mut entries: Vec<(KeyCombo, Action)> = Vec::new();
+            if set.prefix_read {
+                entries.push((self.prefix, Action::OpenPrefix));
+            }
+            for t in set.tables {
+                entries.extend(self.table_ref(*t).iter().copied());
+            }
+            for (i, (key, first)) in entries.iter().enumerate() {
+                for (other, second) in &entries[i + 1..] {
+                    if key == other && first != second && !template_pair(*first, *second) {
+                        let conflict = Conflict { key: *key, first: *first, second: *second };
+                        if !out.contains(&conflict) {
+                            out.push(conflict);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Replaces the keys of `action` with `chords`, in the place of its first
+    /// key so its hint keeps its place in the bar. A key another action has in
+    /// a scope read at the same time is taken from it (and returned), unless
+    /// that action is one of `claimed` (set earlier from the config file), the
+    /// key is the prefix, or it is a plain character in a place that takes
+    /// text: then nothing changes and the reason is returned.
+    pub fn set_keys(&mut self, action: Action, chords: &[Chord], claimed: &[Action]) -> Result<Vec<Taken>, Refused> {
+        let mut placed: Vec<(Tbl, KeyCombo)> = Vec::new();
+        for chord in chords {
+            let (table, key) = match (action.scope(), chord) {
+                (Scope::Prefix, Chord::Direct(k) | Chord::AfterPrefix(k)) => (Tbl::AfterPrefix, *k),
+                (Scope::Editor, Chord::AfterPrefix(k)) => (Tbl::EditorPrefix, *k),
+                (_, Chord::AfterPrefix(_)) => return Err(Refused::NoPrefixKeys),
+                (scope, Chord::Direct(k)) => (Tbl::of(scope), *k),
+            };
+            // The popups and the editor's own table read enter, tab and the
+            // arrows on purpose (the editor's defaults do); the direct keys
+            // are read before the text, so they must leave those to it.
+            let edits = table == Tbl::Direct;
+            if table.reads_text() && (if edits { is_typing(&key) } else { is_typing_char(&key) }) {
+                return Err(Refused::Typing(key));
+            }
+            if !placed.contains(&(table, key)) {
+                placed.push((table, key));
+            }
+        }
+        let mut next = self.clone();
+        let own: &[Tbl] = match action.scope() {
+            Scope::Editor => &[Tbl::Editor, Tbl::EditorPrefix],
+            scope => &[Tbl::of(scope)],
+        };
+        for &t in own {
+            let table = next.table_mut(t);
+            let at = table.iter().position(|(_, a)| *a == action);
+            table.retain(|(_, a)| *a != action);
+            let at = at.unwrap_or(table.len()).min(table.len());
+            let new: Vec<(KeyCombo, Action)> = placed.iter().filter(|(pt, _)| *pt == t).map(|(_, key)| (*key, action)).collect();
+            table.splice(at..at, new);
+        }
+        let mut taken: Vec<(Tbl, Taken)> = Vec::new();
+        for &(t, key) in &placed {
+            for set in READ_TOGETHER.iter().filter(|s| s.tables.contains(&t)) {
+                if set.prefix_read && key == next.prefix {
+                    return Err(Refused::IsPrefix(key));
+                }
+                for &u in set.tables {
+                    for (k, other) in next.table_ref(u) {
+                        if *k != key || *other == action || (t == Tbl::Complete && u == Tbl::Complete && template_pair(action, *other)) {
+                            continue;
+                        }
+                        if claimed.contains(other) {
+                            return Err(Refused::Claimed { key, by: *other });
+                        }
+                        let found = (u, Taken { key, from: *other });
+                        if !taken.contains(&found) {
+                            taken.push(found);
+                        }
+                    }
+                }
+            }
+        }
+        for (u, t) in &taken {
+            next.table_mut(*u).retain(|(k, a)| !(*k == t.key && *a == t.from));
+        }
+        *self = next;
+        Ok(taken.into_iter().map(|(_, t)| t).collect())
+    }
+
+    /// Makes `key` the prefix. Any action that had it in a scope where the
+    /// prefix is read loses it (the user's key wins), and is returned.
+    pub fn set_prefix(&mut self, key: KeyCombo) -> Result<Vec<Taken>, Refused> {
+        // Only a function key (or one with ctrl, alt or cmd) can be the prefix:
+        // esc, enter, tab and the like do their own work.
+        if is_typing(&key) || (key.mods.difference(KeyModifiers::SHIFT).is_empty() && !matches!(key.code, KeyCode::F(_))) {
+            return Err(Refused::Typing(key));
+        }
+        let mut taken: Vec<(Tbl, Taken)> = Vec::new();
+        for set in READ_TOGETHER.iter().filter(|s| s.prefix_read) {
+            for &u in set.tables {
+                for (k, a) in self.table_ref(u) {
+                    let found = (u, Taken { key, from: *a });
+                    if *k == key && !taken.contains(&found) {
+                        taken.push(found);
+                    }
+                }
+            }
+        }
+        for (u, t) in &taken {
+            self.table_mut(*u).retain(|(k, a)| !(*k == t.key && *a == t.from));
+        }
+        self.prefix = key;
+        Ok(taken.into_iter().map(|(_, t)| t).collect())
+    }
+
+    /// Every action's keys as the config file spells them, scope by scope, each
+    /// action once in the order of its first key: `(scope, action, keys)`.
+    /// Keys after the prefix are written `prefix+x`.
+    pub fn entries(&self) -> Vec<(Scope, Action, Vec<String>)> {
+        let mut out = Vec::new();
+        for scope in Scope::ALL {
+            let tables: &[Tbl] = match scope {
+                Scope::Editor => &[Tbl::Editor, Tbl::EditorPrefix],
+                other => &[Tbl::of(other)],
+            };
+            let mut actions: Vec<Action> = Vec::new();
+            for &t in tables {
+                for (_, a) in self.table_ref(t) {
+                    if !actions.contains(a) {
+                        actions.push(*a);
+                    }
+                }
+            }
+            for action in actions {
+                let keys = tables
+                    .iter()
+                    .flat_map(|&t| {
+                        let after = matches!(t, Tbl::EditorPrefix | Tbl::AfterPrefix);
+                        self.table_ref(t).iter().filter(move |(_, a)| *a == action).map(move |(k, _)| if after { format!("prefix+{k}") } else { k.to_string() })
+                    })
+                    .collect();
+                out.push((scope, action, keys));
+            }
+        }
+        out
+    }
+
     /// The action bound to `key` after the prefix.
     pub fn lookup(&self, key: &KeyCombo) -> Option<Action> {
         self.bindings.iter().chain(&self.editor_prefix).find(|(k, _)| k == key).map(|(_, a)| *a)
@@ -1226,6 +1409,153 @@ impl Keybinds {
     }
 }
 
+/// A key that does two things in scopes read at the same time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub key: KeyCombo,
+    pub first: Action,
+    pub second: Action,
+}
+
+/// A key as the config file gives it: read directly in the action's place, or
+/// after the prefix (`prefix+d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chord {
+    Direct(KeyCombo),
+    AfterPrefix(KeyCombo),
+}
+
+impl Chord {
+    /// `"ctrl+d"`, or `"prefix+d"` for a key after the prefix.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.strip_prefix("prefix+") {
+            Some(rest) => KeyCombo::parse(rest).map(Chord::AfterPrefix),
+            None => KeyCombo::parse(s).map(Chord::Direct),
+        }
+    }
+}
+
+/// Why a set of keys was not given to an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The action is not one a key after the prefix does.
+    NoPrefixKeys,
+    /// A plain character where the key would be read before the text sees it.
+    Typing(KeyCombo),
+    /// The key is the prefix.
+    IsPrefix(KeyCombo),
+    /// The key is an action the config file already gave it to.
+    Claimed { key: KeyCombo, by: Action },
+}
+
+/// A key an action lost because the user's binding won it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Taken {
+    pub key: KeyCombo,
+    pub from: Action,
+}
+
+/// The tables of keys, by where they are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tbl {
+    AfterPrefix,
+    EditorPrefix,
+    Direct,
+    Sidebar,
+    Results,
+    Resize,
+    Complete,
+    Template,
+    Editor,
+}
+
+impl Tbl {
+    fn of(scope: Scope) -> Tbl {
+        match scope {
+            Scope::Prefix => Tbl::AfterPrefix,
+            Scope::Direct => Tbl::Direct,
+            Scope::Sidebar => Tbl::Sidebar,
+            Scope::Results => Tbl::Results,
+            Scope::Resize => Tbl::Resize,
+            Scope::Complete => Tbl::Complete,
+            Scope::Template => Tbl::Template,
+            Scope::Editor => Tbl::Editor,
+        }
+    }
+
+    /// Whether a key here is read before the text it may be part of: a plain
+    /// character bound here could not be typed.
+    fn reads_text(self) -> bool {
+        matches!(self, Tbl::Direct | Tbl::Editor | Tbl::Complete | Tbl::Template)
+    }
+}
+
+/// A set of tables read for the same key press (design section 4's routing),
+/// and whether the prefix key is read first. A key bound twice within a set
+/// does one of two things, so it is a conflict.
+struct ReadTogether {
+    tables: &'static [Tbl],
+    prefix_read: bool,
+}
+
+const READ_TOGETHER: &[ReadTogether] = &[
+    ReadTogether { tables: &[Tbl::Direct, Tbl::Sidebar], prefix_read: true },
+    ReadTogether { tables: &[Tbl::Direct, Tbl::Results], prefix_read: true },
+    ReadTogether { tables: &[Tbl::Direct, Tbl::Editor], prefix_read: true },
+    // The popup is read before the editor, so the two do not meet.
+    ReadTogether { tables: &[Tbl::Direct, Tbl::Complete], prefix_read: true },
+    ReadTogether { tables: &[Tbl::Direct, Tbl::Template], prefix_read: true },
+    ReadTogether { tables: &[Tbl::AfterPrefix, Tbl::EditorPrefix], prefix_read: false },
+    ReadTogether { tables: &[Tbl::Resize], prefix_read: false },
+];
+
+/// Expanding a template and the popup's own keys share keys on purpose: the
+/// expansion is read first, and only while a template is highlighted.
+fn template_pair(a: Action, b: Action) -> bool {
+    (a == Action::ExpandTemplate || b == Action::ExpandTemplate) && a.scope() == Scope::Complete && b.scope() == Scope::Complete
+}
+
+/// A character with no modifier but shift: typed text.
+fn is_typing_char(key: &KeyCombo) -> bool {
+    matches!(key.code, KeyCode::Char(_)) && key.mods.difference(KeyModifiers::SHIFT).is_empty()
+}
+
+/// A key the text is typed or edited with: a character, or enter, tab, the
+/// arrows, home, end, backspace, delete and page keys, with no modifier but
+/// shift.
+fn is_typing(key: &KeyCombo) -> bool {
+    let bare = key.mods.difference(KeyModifiers::SHIFT).is_empty();
+    match key.code {
+        KeyCode::Char(_) => bare,
+        // The keys the text moves and deletes by, which the editor and the
+        // bars read as they are (with shift, to select).
+        KeyCode::Enter
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown => bare,
+        _ => false,
+    }
+}
+
+impl Scope {
+    /// Every scope, in the order the config file lists them.
+    pub const ALL: [Scope; 8] =
+        [Scope::Prefix, Scope::Direct, Scope::Sidebar, Scope::Results, Scope::Resize, Scope::Complete, Scope::Template, Scope::Editor];
+
+    pub fn from_name(name: &str) -> Option<Scope> {
+        Scope::ALL.into_iter().find(|s| s.name() == name)
+    }
+}
+
 /// A titled run of rows in the help overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelpSection {
@@ -1238,8 +1568,8 @@ pub struct HelpSection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelpRow {
     pub label: &'static str,
-    /// `scope.action` (`editor.duplicate`, `direct/prefix.run`): what slice 22
-    /// reads in the config file. Empty for keys an overlay reads itself,
+    /// `scope.action` (`editor.duplicate`, `after_prefix/direct.run`): what
+    /// slice 22 reads in the config file. Empty for keys an overlay reads itself,
     /// which no binding table holds and the config does not rebind.
     pub name: String,
     /// The actions the row stands for; none for an overlay's own keys.
@@ -1264,7 +1594,8 @@ impl HelpRow {
     }
 
     fn haystack(&self) -> Vec<String> {
-        [self.label.to_lowercase(), self.name.to_lowercase()].into_iter().chain(self.bindings.iter().map(|b| b.text.to_lowercase())).collect()
+        let unbound = (self.bindings.is_empty() && !self.actions.is_empty()).then(|| "unbound".to_string());
+        [self.label.to_lowercase(), self.name.to_lowercase()].into_iter().chain(self.bindings.iter().map(|b| b.text.to_lowercase())).chain(unbound).collect()
     }
 }
 
@@ -1272,7 +1603,9 @@ impl Scope {
     /// The section of the config file the scope's keys are in.
     pub fn name(self) -> &'static str {
         match self {
-            Scope::Prefix => "prefix",
+            // Not `prefix`: `[keys] prefix = "ctrl+g"` is the prefix key itself,
+            // and TOML cannot have a value and a table of one name.
+            Scope::Prefix => "after_prefix",
             Scope::Direct => "direct",
             Scope::Sidebar => "sidebar",
             Scope::Results => "results",
@@ -1316,13 +1649,13 @@ impl Action {
 }
 
 /// The names of a row's actions: one `scope.name`, or `scope/scope.name` when
-/// the actions are the same thing in several scopes (`direct/prefix.run`), or
+/// the actions are the same thing in several scopes (`after_prefix/direct.run`), or
 /// the qualified names side by side when they differ.
 fn help_name(actions: &[Action]) -> String {
     let Some(first) = actions.first() else { return String::new() };
     // Nine tab keys are one name.
     if actions.len() == 9 && matches!(first, Action::GoToTab(_)) {
-        return "prefix.go_to_tab_N".to_string();
+        return "after_prefix.go_to_tab_N".to_string();
     }
     let base = first.config_name();
     if actions.iter().all(|a| a.config_name() == base) {
@@ -1469,6 +1802,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn conflicts_finds_a_key_that_does_two_things_where_scopes_are_read_together_and_the_prefix_too() {
+        let key = |s: &str| KeyCombo::parse(s).unwrap();
+        let mut k = Keybinds::default();
+        assert!(k.conflicts().is_empty());
+        // `f5` is a direct key, read while the sidebar has focus.
+        k.sidebar.push((key("f5"), Action::Refresh));
+        assert_eq!(k.conflicts(), [Conflict { key: key("f5"), first: Action::RunDirect, second: Action::Refresh }]);
+        // The same key in two scopes never read together is no conflict: `r`
+        // is the sidebar's refresh and the results pane's raw toggle, and the
+        // popup's `ctrl+d` does not meet the editor's.
+        let mut k = Keybinds::default();
+        k.complete.push((key("ctrl+d"), Action::CompleteClose));
+        assert!(k.conflicts().is_empty());
+        // The prefix key counts.
+        let mut k = Keybinds::default();
+        k.direct.push((k.prefix, Action::HistoryDirect));
+        assert_eq!(k.conflicts()[0].first, Action::OpenPrefix);
     }
 
     #[test]

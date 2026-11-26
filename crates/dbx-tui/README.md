@@ -68,6 +68,31 @@ runs every journey: `PROFILE=release bash crates/dbx-tui/tests/journeys/<name>.s
 Under the release profile's `panic = "abort"` a panic still runs our hook, which
 restores the terminal and exits 101 before any abort.
 
+## Config (slice 22)
+
+One TOML file, read once at startup: `$DBPANE_CONFIG` (`$DBX_TUI_CONFIG` too),
+else `$XDG_CONFIG_HOME/dbpane/config.toml`, else `~/.config/dbpane/config.toml`
+on macOS and Linux alike (`dbpane config --path` prints it; `dbpane config`
+prints every default as a file that reads back as the defaults). The user docs
+(`docs/README.md`, "Config", and `docs/getting-started.md`, section 11) have the
+sections and an example; `tests/docs_keys.rs` parses every ```toml block in them
+and checks the problems they quote.
+
+- `src/app/config.rs` parses the text (`toml_edit`, parser only: it is already in
+  the lock) into a `Config` and a list of `Problem`s with line and column; an
+  entry with a problem keeps its default, invalid TOML means all defaults.
+  `App::apply_config` puts it to use, shows one notice and keeps the problems
+  for the help overlay. `src/shell/config.rs` finds and reads the file.
+- Keys: `Keybinds::set_keys` / `set_prefix` / `conflicts` (`src/app/keys.rs`).
+  A key given to an action is taken from any other action in a scope read at the
+  same time (`READ_TOGETHER`); the prefix key, a plain character where you type,
+  and a key a config entry already gave away are refused. The config group for
+  the keys after the prefix is `after_prefix` (a TOML key cannot be both the
+  string `[keys] prefix` and a table `[keys.prefix]`).
+- Tests are layer 2 (`src/app/config_tests.rs`, config as text), the shell's path
+  and file tests use temp directories only, and the journey `config` runs the
+  binary with `DBPANE_CONFIG` under its scratch directory.
+
 ## Capabilities (what a connection can do)
 
 Each `Connection` carries a `Capabilities` value (`src/core/mod.rs`): whether

@@ -61,11 +61,12 @@ fn every_row_shows_all_the_keys_bound_to_its_actions_and_the_config_name() {
 #[test]
 fn an_action_is_named_by_its_scope_and_the_name_the_config_file_will_use() {
     assert_eq!(Action::RunDirect.qualified_name(), "direct.run");
-    assert_eq!(Action::Run.qualified_name(), "prefix.run");
+    // Not `prefix.run`: `[keys] prefix` is the prefix key, and a TOML key cannot be both a value and a table.
+    assert_eq!(Action::Run.qualified_name(), "after_prefix.run");
     assert_eq!(Action::Duplicate.qualified_name(), "editor.duplicate");
     assert_eq!(Action::OpenTable.qualified_name(), "sidebar.open_table");
     assert_eq!(Action::CopyCell.qualified_name(), "results.copy_cell");
-    assert_eq!(Action::GoToTab(3).qualified_name(), "prefix.go_to_tab_3");
+    assert_eq!(Action::GoToTab(3).qualified_name(), "after_prefix.go_to_tab_3");
     assert_eq!(Action::FinishStatementDirect.qualified_name(), "direct.finish_statement");
     assert_eq!(Action::NavigatorDirect.qualified_name(), "direct.navigator");
     assert_eq!(Action::CompleteInsert.qualified_name(), "complete.complete_insert");

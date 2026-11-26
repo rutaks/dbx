@@ -19,6 +19,25 @@ for needle in 'dbpane' '--store dbx|own|<dir>' '--version' '--licenses' 'kitty-s
 done
 run -h >/dev/null || fail "-h exited non-zero"
 
+# The config file (slice 22): --help names it, `config --path` prints it,
+# `config` prints a commented file of the defaults. Nothing is read or written.
+noconfig() { env -u DBX_SECRET_KEY -u XDG_CONFIG_HOME -u DBPANE_CONFIG -u DBX_TUI_CONFIG HOME="$SCRATCH_HOME" DBX_DATA_DIR="$STORE" DBX_SECRET_KEY_FILE="$KEYFILE" "$BIN" "$@"; }
+want="$SCRATCH_HOME/.config/dbpane/config.toml"
+out="$(noconfig --help)" || fail "--help (config)"
+for needle in 'dbpane config [--path]' 'DBPANE_CONFIG' 'DBX_TUI_CONFIG' 'DBPANE_THEME' 'XDG_CONFIG_HOME' 'Config file read at startup' "$want"; do
+  echo "$out" | grep -Fq -- "$needle" || fail "--help lacks $needle"
+done
+[ "$(noconfig config --path)" = "$want" ] || fail "config --path is $(noconfig config --path), not $want"
+[ ! -e "$want" ] || fail "config --path created the file"
+[ "$(env -u DBX_SECRET_KEY -u XDG_CONFIG_HOME DBPANE_CONFIG="$OUT/mine.toml" HOME="$SCRATCH_HOME" "$BIN" config --path)" = "$OUT/mine.toml" ] || fail "config --path ignores DBPANE_CONFIG"
+[ "$(env -u DBX_SECRET_KEY -u XDG_CONFIG_HOME -u DBPANE_CONFIG DBX_TUI_CONFIG="$OUT/old.toml" HOME="$SCRATCH_HOME" "$BIN" config --path)" = "$OUT/old.toml" ] || fail "config --path ignores DBX_TUI_CONFIG"
+[ "$(env -u DBX_SECRET_KEY -u DBPANE_CONFIG -u DBX_TUI_CONFIG XDG_CONFIG_HOME="$OUT/xdg" HOME="$SCRATCH_HOME" "$BIN" config --path)" = "$OUT/xdg/dbpane/config.toml" ] || fail "config --path ignores XDG_CONFIG_HOME"
+noconfig config >"$OUT/defaults.toml" || fail "config exited non-zero"
+for needle in '[theme]' 'prefix = "ctrl+g"' '[keys.editor]' 'duplicate = ["cmd+d", "ctrl+d", "prefix+d"]' '[run]' 'row_cap = 1000' '# '; do
+  grep -Fq -- "$needle" "$OUT/defaults.toml" || fail "config output lacks $needle"
+done
+noconfig config --wat >/dev/null 2>"$OUT/err.txt"; [ "$?" = 2 ] || fail "config --wat exits 2"
+
 out="$(run --licenses)" || fail "--licenses exited non-zero"
 for needle in 'modified work of dbx' 'https://github.com/rutaks/dbx' 'herdr' 'Apache License' 'ratatui' 'sqlparser'; do
   echo "$out" | grep -Fq -- "$needle" || fail "--licenses lacks $needle"

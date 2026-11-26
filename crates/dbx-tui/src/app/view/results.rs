@@ -364,7 +364,9 @@ fn draw_grid(p: &Painter, buf: &mut Buffer, area: Rect, set: &ResultSet, g: &mut
     g.data = Rect::new(area.x + gutter, area.y + 1, avail, rows_h as u16);
 
     let row_bg = Style::default().bg(p.theme.color(Role::ActiveRowBg));
-    let cursor_bg = Style::default().bg(p.theme.color(Role::SelectionBg));
+    // Reversed in a theme whose selection colour is the terminal's own
+    // background, where no colour would show.
+    let cursor_bg = Style::default().bg(p.theme.color(Role::SelectionBg)).add_modifier(p.theme.modifier(Role::SelectionBg));
     let header = p.bold(Role::Subtext0);
     for span in &g.spans {
         let c = &set.columns[span.col];

@@ -14,6 +14,9 @@ pub enum Cli {
     Licenses,
     /// `kitty-setup [--write]`.
     KittySetup { write: bool },
+    /// `config` prints a commented file of every default; `config --path`
+    /// prints the path the client reads.
+    Config { path: bool },
 }
 
 /// The version and the dbx commit this binary was built from.
@@ -23,10 +26,14 @@ pub fn version_text() -> String {
 
 /// `--help`, ending with the store that would be used now (`store` is why
 /// it cannot be worked out, if it cannot).
-pub fn help_text(store: Result<StoreInfo, String>) -> String {
+pub fn help_text(store: Result<StoreInfo, String>, config: Result<std::path::PathBuf, String>) -> String {
     let in_force = match store {
         Ok(info) => format!("{}:\n  {}", info.describe(), info.path.display()),
         Err(why) => format!("not known: {why}\n  Name one with --store <dir> or DBX_DATA_DIR."),
+    };
+    let config_in_force = match config {
+        Ok(path) => format!("\n  {}", path.display()),
+        Err(why) => format!(" not known: {why}"),
     };
     format!(
         "dbpane: a terminal database client, built on dbx's core.\n\
@@ -34,6 +41,7 @@ pub fn help_text(store: Result<StoreInfo, String>) -> String {
          Usage:\n\
          \x20 dbpane [--store dbx|own|<dir>]\n\
          \x20 dbpane kitty-setup [--write]\n\
+         \x20 dbpane config [--path]\n\
          \x20 dbpane --version | --help | --licenses\n\
          \n\
          Options:\n\
@@ -49,17 +57,27 @@ pub fn help_text(store: Result<StoreInfo, String>) -> String {
          Subcommands:\n\
          \x20 kitty-setup [--write]  Print (or, with --write, install) the kitty configuration\n\
          \x20                        that frees kitty's Cmd shortcuts while dbpane has focus.\n\
+         \x20 config                 Print a commented config file holding every default (keys,\n\
+         \x20                        theme, editor and run settings); reading it back changes nothing.\n\
+         \x20 config --path          Print the path of the config file dbpane reads.\n\
          \n\
          Environment:\n\
          \x20 DBX_DATA_DIR           The store directory (absolute, must exist). --store wins.\n\
          \x20 DBX_SECRET_KEY_FILE    A file holding the store's 64-hex-digit key. Wins over\n\
          \x20                        every other key source, so no keychain is asked.\n\
          \x20 DBX_SECRET_KEY         The same key as a value. DBX_SECRET_KEY_FILE comes first.\n\
-         \x20 DBX_TUI_THEME          The colour theme: catppuccin (default) or terminal.\n\
+         \x20 DBPANE_CONFIG          The config file (DBX_TUI_CONFIG, its old name, works too).\n\
+         \x20                        Else $XDG_CONFIG_HOME/dbpane/config.toml, else\n\
+         \x20                        ~/.config/dbpane/config.toml, on macOS as well.\n\
+         \x20 DBPANE_THEME           The colour theme: catppuccin (default), terminal or\n\
+         \x20                        intellij-dark. Wins over the config file. DBX_TUI_THEME,\n\
+         \x20                        its old name, works too.\n\
          \x20 HOME, XDG_DATA_HOME    Where the default stores live (on Linux, $XDG_DATA_HOME\n\
          \x20                        or ~/.local/share; on macOS, ~/Library/Application Support).\n\
+         \x20 XDG_CONFIG_HOME        Where the config directory is, if not ~/.config.\n\
          \n\
-         Store in use now: {in_force}\n"
+         Store in use now: {in_force}\n\
+         Config file read at startup:{config_in_force}\n"
     )
 }
 
@@ -83,6 +101,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         return match &args[1..] {
             [] => Ok(Cli::KittySetup { write: false }),
             [w] if w == "--write" => Ok(Cli::KittySetup { write: true }),
+            [other, ..] => Err(unknown(other)),
+        };
+    }
+    if args.first().map(String::as_str) == Some("config") && !args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        return match &args[1..] {
+            [] => Ok(Cli::Config { path: false }),
+            [p] if p == "--path" => Ok(Cli::Config { path: true }),
             [other, ..] => Err(unknown(other)),
         };
     }
@@ -170,6 +195,26 @@ mod tests {
     }
 
     #[test]
+    fn the_config_subcommand_prints_the_defaults_or_the_path() {
+        assert_eq!(parsed(&["config"]), Ok(Cli::Config { path: false }));
+        assert_eq!(parsed(&["config", "--path"]), Ok(Cli::Config { path: true }));
+        let e = parsed(&["config", "--wat"]).unwrap_err();
+        assert!(e.contains("--wat") && e.contains("--help"), "{e}");
+        assert_eq!(parsed(&["config", "--help"]), Ok(Cli::Help), "an informational flag still wins");
+    }
+
+    #[test]
+    fn help_names_the_config_file_where_it_is_and_the_variables_that_move_it() {
+        let info = StoreInfo { kind: StoreKind::Own, source: StoreSource::Auto, path: PathBuf::from("/scratch/home/dbpane") };
+        let text = help_text(Ok(info.clone()), Ok(PathBuf::from("/scratch/home/.config/dbpane/config.toml")));
+        for needle in ["dbpane config [--path]", "config --path ", "DBPANE_CONFIG", "DBX_TUI_CONFIG", "DBPANE_THEME", "XDG_CONFIG_HOME", "/scratch/home/.config/dbpane/config.toml"] {
+            assert!(text.contains(needle), "help lacks {needle}:\n{text}");
+        }
+        let failed = help_text(Ok(info), Err("HOME is not set".into()));
+        assert!(failed.contains("HOME is not set") && failed.contains("DBPANE_CONFIG"), "{failed}");
+    }
+
+    #[test]
     fn the_kitty_subcommand_is_still_there() {
         assert_eq!(parsed(&["kitty-setup"]), Ok(Cli::KittySetup { write: false }));
         assert_eq!(parsed(&["kitty-setup", "--write"]), Ok(Cli::KittySetup { write: true }));
@@ -195,7 +240,7 @@ mod tests {
     #[test]
     fn help_lists_every_flag_and_environment_variable_and_names_the_store_in_force() {
         let info = StoreInfo { kind: StoreKind::Own, source: StoreSource::Auto, path: PathBuf::from("/scratch/home/dbpane") };
-        let text = help_text(Ok(info));
+        let text = help_text(Ok(info), Ok(PathBuf::from("/scratch/home/.config/dbpane/config.toml")));
         for needle in [
             "dbpane",
             "--store",
@@ -213,7 +258,7 @@ mod tests {
         ] {
             assert!(text.contains(needle), "help lacks {needle}:\n{text}");
         }
-        let failed = help_text(Err("HOME is not set".into()));
+        let failed = help_text(Err("HOME is not set".into()), Err("no home".into()));
         assert!(failed.contains("HOME is not set") && failed.contains("--store"), "{failed}");
     }
 

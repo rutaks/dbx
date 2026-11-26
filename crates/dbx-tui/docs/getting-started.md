@@ -7,7 +7,9 @@ particular no Docker.
 
 Keys that begin with `ctrl+g` are the **prefix**: press `ctrl+g`, release it,
 then press the next key. The bar at the bottom of the window always shows the
-keys that work right now; click a hint and it does what its key does.
+keys that work right now; click a hint and it does what its key does. The keys
+in this guide are the defaults; [section 11](#11-config) shows how to change
+them in a config file.
 
 ## 1. Install
 
@@ -243,6 +245,54 @@ is one (then every key above works). Where there is none, `f5` and the
 - **macOS Terminal.app:** no keyboard protocol; use `f5` and the prefix.
 - **Over SSH** nothing extra is needed beyond the above on the machine whose
   terminal you are typing in.
+
+## 11. Config
+
+Everything above uses the defaults. To change the theme, the prefix, a key or
+an editor setting, make a config file. Ask dbpane where it belongs:
+
+```sh
+dbpane config --path
+```
+
+That prints `$DBPANE_CONFIG` if you set it, else
+`$XDG_CONFIG_HOME/dbpane/config.toml`, else `~/.config/dbpane/config.toml` (on
+macOS too). The file need not exist. To start from every default, written out
+with a comment for each group:
+
+```sh
+mkdir -p ~/.config/dbpane && dbpane config > ~/.config/dbpane/config.toml
+```
+
+Edit what you want and delete the rest. For example, to make `ctrl+b` the
+prefix, as in tmux, give the editor's duplicate-line action a different key,
+and fetch 500 rows per run instead of 1,000:
+
+```toml
+[keys]
+prefix = "ctrl+b"
+
+[keys.editor]
+duplicate = ["ctrl+shift+d", "prefix+d"]
+
+[run]
+row_cap = 500
+```
+
+dbpane reads the file once, at start, so quit and start it again. Now `ctrl+b`
+is the prefix (the mode bar shows it), and `ctrl+b ?` opens the help, where
+every action has a *config name* such as `editor.duplicate` (the group, a dot,
+the action) and the keys it has now. A name written in the file as
+`[keys.editor]` then `duplicate = ...` is that action. A list of keys is every
+key the action has: `[]` unbinds it, and the help shows `unbound`.
+
+If something in the file is wrong, dbpane still starts. It shows a notice
+saying how many problems there are, and the help overlay lists each at the top
+with its line and column, for example `line 3, column 1: unknown key "foo" in
+[run]. The keys are row_cap, confirm_dangerous`. The entry with the problem
+keeps its default; the rest of the file applies. Fix the file and start again.
+Which keys exist, what a key name looks like and the other settings are in the
+[README](../README.md#config).
 
 ## Troubleshooting
 

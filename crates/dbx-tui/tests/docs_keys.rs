@@ -141,6 +141,118 @@ fn the_checker_catches_a_wrong_doc() {
     assert_eq!(check(&doc("sidebar", "| open | x <!-- OpenTable -->"), &kb).0.len(), 1);
 }
 
+// ---- the config examples ------------------------------------------------------------------
+//
+// The key tables above are checked against the *default* `Keybinds`, so a
+// remapped key never reaches them: the docs say they show the defaults, and the
+// config file is how they change. What this half checks is the config section
+// itself: every ```toml block must be a file dbpane reads without a problem,
+// unless the line before it is `<!-- config: problems -->`, in which case the
+// next ```text block must be exactly the problems dbpane reports for it.
+
+/// Fenced blocks of a document: (the marker comment just above, the language,
+/// the body).
+fn fences(doc: &str) -> Vec<(Option<String>, String, String)> {
+    let mut out = Vec::new();
+    let mut previous = String::new();
+    let mut open: Option<(Option<String>, String, String)> = None;
+    for line in doc.lines() {
+        let t = line.trim_end();
+        match (&mut open, t.strip_prefix("```")) {
+            (None, Some(lang)) => {
+                let marker = previous.strip_prefix("<!-- config:").and_then(|m| m.strip_suffix("-->")).map(|m| m.trim().to_string());
+                open = Some((marker, lang.trim().to_string(), String::new()));
+            }
+            (Some(_), Some("")) => out.push(open.take().expect("open")),
+            (Some((_, _, body)), _) => {
+                body.push_str(t);
+                body.push('\n');
+            }
+            (None, None) => {}
+        }
+        if !t.is_empty() {
+            previous = t.to_string();
+        }
+    }
+    out
+}
+
+/// Checks one document's config examples: returns the problems and how many
+/// toml blocks were checked.
+fn check_config(doc: &str) -> (Vec<String>, usize) {
+    let blocks = fences(doc);
+    let (mut problems, mut checked) = (Vec::new(), 0);
+    for (i, (marker, lang, body)) in blocks.iter().enumerate() {
+        if lang != "toml" {
+            continue;
+        }
+        checked += 1;
+        let found: Vec<String> = dbx_tui::app::config::parse(body).problems.iter().map(|p| p.text()).collect();
+        if marker.as_deref() == Some("problems") {
+            let shown = blocks[i + 1..].iter().find(|(_, l, _)| l == "text").map(|(_, _, b)| b.lines().map(str::to_string).collect::<Vec<_>>());
+            match shown {
+                Some(shown) if shown == found => {}
+                Some(shown) => problems.push(format!("block {}: the docs say the help lists {shown:?}, dbpane reports {found:?}", i + 1)),
+                None => problems.push(format!("block {}: marked `config: problems` with no text block after it", i + 1)),
+            }
+        } else if !found.is_empty() {
+            problems.push(format!("block {}: the example has problems: {found:?}", i + 1));
+        }
+    }
+    (problems, checked)
+}
+
+#[test]
+fn the_readme_config_examples_are_files_dbpane_reads_as_the_docs_say() {
+    let (problems, checked) = check_config(&read("README.md"));
+    assert!(problems.is_empty(), "README.md:\n{}", problems.join("\n"));
+    assert!(checked >= 2, "README.md has {checked} toml blocks: the config section lost its examples?");
+}
+
+#[test]
+fn the_getting_started_config_example_is_a_file_dbpane_reads_without_a_problem() {
+    let (problems, checked) = check_config(&read("getting-started.md"));
+    assert!(problems.is_empty(), "getting-started.md:\n{}", problems.join("\n"));
+    assert!(checked >= 1, "getting-started.md has {checked} toml blocks");
+}
+
+#[test]
+fn the_config_checker_catches_a_wrong_doc() {
+    let doc = |marker: &str, toml: &str, text: &str| format!("{marker}\n```toml\n{toml}```\n\n```text\n{text}```\n");
+    // A clean example, and a marked one whose quoted problem is the real one.
+    assert_eq!(check_config(&doc("", "[run]\nrow_cap = 5\n", "")), (vec![], 1));
+    let real = "line 2, column 11: [run] row_cap: expected a whole number from 1 to 100000\n";
+    assert_eq!(check_config(&doc("<!-- config: problems -->", "[run]\nrow_cap = 0\n", real)), (vec![], 1));
+    // An example with a mistake the docs do not mark.
+    assert_eq!(check_config(&doc("", "[run]\nrow_cap = 0\n", "")).0.len(), 1);
+    // A quoted problem that is not what dbpane says (wrong line).
+    let wrong = real.replace("line 2", "line 3");
+    assert_eq!(check_config(&doc("<!-- config: problems -->", "[run]\nrow_cap = 0\n", &wrong)).0.len(), 1);
+    // A marked example that has no problem.
+    assert_eq!(check_config(&doc("<!-- config: problems -->", "[run]\nrow_cap = 5\n", real)).0.len(), 1);
+}
+
+/// The docs name every place the file can be, the command that prints it and
+/// the variables, as `dbpane --help` does.
+#[test]
+fn the_docs_name_where_the_file_is_and_the_commands_and_variables_for_it() {
+    let readme = read("README.md");
+    let started = read("getting-started.md");
+    for needle in ["DBPANE_CONFIG", "DBX_TUI_CONFIG", "XDG_CONFIG_HOME/dbpane/config.toml", "~/.config/dbpane/config.toml", "dbpane config --path", "dbpane config >", "DBPANE_THEME"] {
+        assert!(readme.contains(needle), "README.md does not mention {needle}");
+    }
+    for needle in ["dbpane config --path", "~/.config/dbpane/config.toml", "DBPANE_CONFIG"] {
+        assert!(started.contains(needle), "getting-started.md does not mention {needle}");
+    }
+    // What the docs say is where the binary looks.
+    let at = dbx_tui::shell::config::locate(&|k| match k {
+        "HOME" => Some("/h".to_string()),
+        _ => None,
+    })
+    .expect("a path");
+    assert_eq!(at.path, Path::new("/h/.config/dbpane/config.toml"));
+}
+
 /// When the staged `rutaks/dbpane` repo is next to the fork (`.dbpane-repo`),
 /// its copies of the docs are the canonical ones. Skipped where it is absent
 /// (a fresh checkout of the fork).

@@ -4,6 +4,7 @@
 //! next deadline; it draws only when an update asks for a repaint.
 
 pub mod cli;
+pub mod config;
 pub mod dump;
 pub mod export;
 pub mod kitty;
@@ -182,7 +183,12 @@ pub fn install_crypto_provider() {
 /// `prefs` is the layout preferences file (beside the store): read at the
 /// start, written when the layout changes. Without one the layout is the
 /// default and nothing is written.
-pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>, store: Option<crate::core::StoreInfo>) -> io::Result<Option<String>> {
+pub async fn run(
+    core: Arc<dyn Core>,
+    prefs: Option<std::path::PathBuf>,
+    store: Option<crate::core::StoreInfo>,
+    config: Option<config::ConfigFile>,
+) -> io::Result<Option<String>> {
     let mut guard = TerminalGuard::enter()?;
     let (tx, mut rx) = mpsc::unbounded_channel::<(RequestId, CoreReply)>();
     let mut events = EventStream::new();
@@ -198,7 +204,17 @@ pub async fn run(core: Arc<dyn Core>, prefs: Option<std::path::PathBuf>, store: 
         stamp: Arc::new(|| chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()),
         temp_dir: std::env::temp_dir(),
     };
-    app.ui.theme = crate::app::theme::Palette::from_setting(std::env::var("DBX_TUI_THEME").ok().as_deref());
+    // The config file, read once (design section 8: no reload). The theme the
+    // environment names wins over the file's, which is how tests pick one.
+    let env = |name: &str| std::env::var(name).ok();
+    let env_theme = config::env_theme(&env);
+    match &config {
+        Some(file) => {
+            let (loaded, found) = config::read(file);
+            app.apply_config(loaded, Some(file.path.clone()), found, env_theme);
+        }
+        None => app.apply_config(crate::app::config::parse(""), None, false, env_theme),
+    }
     if let Some(path) = &prefs {
         app.set_layout(self::prefs::load(path));
     }

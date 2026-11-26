@@ -15,6 +15,7 @@ pub mod complete_insert;
 pub mod complete_match;
 pub mod complete_popup;
 pub mod complete_scope;
+pub mod config;
 pub mod edit_ops;
 pub mod editor;
 pub mod export;
@@ -74,6 +75,8 @@ mod complete_tests;
 #[cfg(test)]
 mod complete_scope_tests;
 #[cfg(test)]
+mod config_tests;
+#[cfg(test)]
 mod confirm_tests;
 #[cfg(test)]
 mod connections_tests;
@@ -104,7 +107,7 @@ mod tree_tests;
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 
 use crate::core::{
@@ -276,6 +279,8 @@ pub struct Ui {
     /// statement finder and the type names of each kind of database.
     pub syntax: syntax::SyntaxState,
     pub notice: Option<Notice>,
+    /// The config file read at startup: where it is and what was wrong in it.
+    pub config: config::Report,
     /// The `now` of the last update: what the view measures elapsed time by.
     pub now: Option<Instant>,
     /// Where the user put the dividers; `None` is the automatic size. The
@@ -493,6 +498,7 @@ impl App {
                 note: None,
                 syntax: syntax::SyntaxState::default(),
                 notice: None,
+                config: config::Report::default(),
                 now: None,
                 layout: LayoutPrefs::default(),
                 layout_unsaved: false,
@@ -628,7 +634,10 @@ impl App {
             // The resize mode takes every key: the ones it binds move a divider
             // or leave it, the rest do nothing.
             Mode::Resize => {
-                if let Some(action) = self.ui.keys.lookup_resize(&combo) {
+                // Esc leaves whatever the bindings say, so no config can trap the user.
+                let esc = KeyCombo::new(KeyCode::Esc, KeyModifiers::NONE);
+                let action = if combo == esc { Some(Action::ResizeDone) } else { self.ui.keys.lookup_resize(&combo) };
+                if let Some(action) = action {
                     self.perform_resize(action, fx);
                 }
             }
