@@ -887,6 +887,7 @@ fn run_state(app: &App) -> Option<(String, Role)> {
                 CancelEnd::FinishedFirst => ("finished before the cancel".to_string(), Role::Peach),
                 CancelEnd::Failed(_) => (format!("failed after the cancel, {}", duration_text(*after)), Role::Red),
                 CancelEnd::Abandoned => ("stopped waiting: not confirmed stopped".to_string(), Role::Peach),
+                CancelEnd::OutcomeUnknown => ("cancelled: earlier statements may have run".to_string(), Role::Peach),
             });
         }
         RunState::Idle => {}

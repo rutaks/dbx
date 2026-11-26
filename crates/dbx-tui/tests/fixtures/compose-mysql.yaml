@@ -1,0 +1,31 @@
+# MySQL test database for slice 23b. Bring up with ./up-mysql.sh, remove with
+# ./down-mysql.sh. Compose project: dbxtui-fixtures-mysql, so bringing it up or
+# down never touches the Postgres container of compose.yaml (project
+# dbxtui-fixtures).
+#
+# MySQL 8.4 LTS, pinned by digest (mysql:8.4 = MySQL Community Server 8.4.13 on
+# 2026-11-26; the digest is the image index's).
+# Host port 127.0.0.1:53307 (free when checked 2026-11-26; 3306 is the usual
+# MySQL port, 55433 is the Postgres fixture's).
+# Databases: `sakila` (jOOQ/sakila at e089a5b, fetched by fetch-sakila.sh), `edge`
+# and `edge_other` (our edge-case schema, mysql/edge/*.sql). root / dbxtui.
+name: dbxtui-fixtures-mysql
+services:
+  mysql:
+    image: mysql@sha256:8c233bad33d520a7aae1c1e619c3a9775f4a1ba2d463d692fada04ec7f40be00
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      # MySQL 8.4 has this off; `LOAD DATA LOCAL` is refused by the server
+      # unless a test turns it on for itself.
+      - --local-infile=0
+    environment:
+      MYSQL_ROOT_PASSWORD: dbxtui
+    ports:
+      - "127.0.0.1:53307:3306"
+    volumes:
+      - ./init-mysql:/docker-entrypoint-initdb.d:ro
+      - ./sakila:/fixtures/sakila:ro
+      - ./mysql/edge:/fixtures/edge:ro
+    tmpfs:
+      - /var/lib/mysql

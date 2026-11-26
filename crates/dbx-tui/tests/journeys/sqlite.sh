@@ -32,11 +32,12 @@ wait_for 00-empty 'No connections yet'
 # The form: the type row first; SQLite has only a name and a file.
 key C-g n
 wait_for 01-form 'New connection'
-expect form 'type +● PostgreSQL +○ SQLite'
+expect form 'type +● PostgreSQL +○ MySQL +○ SQLite'
 expect form 'host'
 key Up
 key Space
-wait_for 02-sqlite-form 'type +○ PostgreSQL +● SQLite'
+key Space
+wait_for 02-sqlite-form 'type +○ PostgreSQL +○ MySQL +● SQLite'
 expect sqlite-form 'file'
 expect sqlite-form 'production'
 expect_not sqlite-form 'host'

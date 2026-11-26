@@ -130,6 +130,15 @@ pub(super) fn saved_of(result: &Result<ResultSet, CoreError>, measured: Duration
             error: None,
             affected: set.columns.is_empty().then_some(set.affected),
         }),
+        // It reached the server and what it did there is not known: saved,
+        // as neither a success nor a plain failure.
+        Err(e) if e.outcome_unknown => e.statement.clone().filter(|s| !s.trim().is_empty()).map(|sql| Saved {
+            sql,
+            elapsed: measured,
+            success: false,
+            error: Some(format!("The outcome is unknown: {}", clean_paste(e.message.trim()))),
+            affected: None,
+        }),
         Err(e) if matches!(e.kind, CoreErrorKind::Cancelled | CoreErrorKind::NeedsConfirmation | CoreErrorKind::Connect | CoreErrorKind::Key | CoreErrorKind::Store) => {
             None
         }

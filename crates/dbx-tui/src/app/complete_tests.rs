@@ -558,10 +558,10 @@ async fn columns_of_the_tables_in_the_statement_are_listed_with_the_keywords() {
 }
 
 #[tokio::test]
-async fn a_kind_other_than_postgres_gets_keywords_and_the_core_is_never_asked() {
+async fn a_kind_completion_is_not_built_for_gets_keywords_and_the_core_is_never_asked() {
     let mut h = editing(pagila()).await;
-    h.app.model.connections = Loadable::Ready(vec![super::connections_tests::conn("local pg", DbKind::MySql)]);
-    // The tab's connection is now a MySQL one.
+    h.app.model.connections = Loadable::Ready(vec![super::connections_tests::conn("local pg", DbKind::Other("oracle".into()))]);
+    // The tab's connection is now one of a kind that is not browsed here.
     h.app.ui.tab.editor.set_text("");
     let before = h.fake.calls().len();
     type_and_settle(&mut h, "sele").await;

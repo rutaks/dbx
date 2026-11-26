@@ -179,6 +179,8 @@ pub struct DbxCore {
     closed_sessions: std::sync::Mutex<std::collections::HashSet<SessionId>>,
     /// Sessions in which a `USE` has been sent (`SwitchedSessions`).
     switched: SwitchedSessions,
+    /// MySQL sessions that may have changed their client charset (`CharsetSessions`).
+    charsets: CharsetSessions,
 }
 
 /// The most early cancels remembered. A cancel for a run that has already
@@ -208,7 +210,7 @@ impl DbxCore {
 
     fn with_options(options: Result<StoreOptions, CoreError>) -> Self {
         let policy = options.as_ref().map_or(SecretKeyPolicy::PlatformDefault, StoreOptions::key_policy);
-        DbxCore { options, state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default(), switched: Default::default() }
+        DbxCore { options, state: Mutex::new(None), opened: std::sync::OnceLock::new(), policy, mutations: Mutex::new(()), early_cancels: Default::default(), closed_sessions: Default::default(), switched: Default::default(), charsets: Default::default() }
     }
 
     /// Which store this is and why, when it could be worked out.
@@ -603,12 +605,25 @@ fn not_ready(dir: &Path, p: &MigrationPreflight, source: KeySource) -> CoreError
 /// The connection types this client browses and edits in its form so far.
 /// dbx describes ninety; the adapter behind `Core::schemas`, completion and the
 /// form is built and tested for these only. One line to grow.
-const BROWSED_HERE: [DatabaseType; 2] = [DatabaseType::Postgres, DatabaseType::Sqlite];
+const BROWSED_HERE: [DatabaseType; 3] = [DatabaseType::Postgres, DatabaseType::Mysql, DatabaseType::Sqlite];
 
 /// The types completion, templates and marks run on: a subset of
 /// `BROWSED_HERE`, for which the catalogue searches they ask for are tested
 /// against dbx (README "Completion").
-const COMPLETED_HERE: [DatabaseType; 2] = [DatabaseType::Postgres, DatabaseType::Sqlite];
+const COMPLETED_HERE: [DatabaseType; 3] = [DatabaseType::Postgres, DatabaseType::Mysql, DatabaseType::Sqlite];
+
+/// The statement that tells which schema unqualified names resolve in, for the
+/// types that have to be asked (`Core::current_schema`). dbx has no getter for
+/// it. MySQL has no `current_schema()` (it is an error there): a schema is a
+/// database, and the current one is `database()`, NULL when the session has
+/// none selected. SQLite's is fixed (`FIXED_SCHEMA`) and never asked.
+fn current_schema_sql(db_type: DatabaseType) -> Option<&'static str> {
+    match db_type {
+        DatabaseType::Mysql => Some("select database()"),
+        DatabaseType::Sqlite => None,
+        _ => Some("select current_schema()"),
+    }
+}
 
 /// The schema SQLite resolves unqualified names in, and the one dbx lists
 /// its tables under.
@@ -666,7 +681,7 @@ fn capabilities_of(db_type: DatabaseType) -> Capabilities {
             _ => Dialect::Generic,
         },
         single_connection: entry.single_connection_pool,
-        dump_loses: matches!(db_type, DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss | DatabaseType::Sqlite),
+        dump_loses: matches!(db_type, DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss | DatabaseType::Mysql | DatabaseType::Sqlite),
         local_file: entry.local_file && here,
         completes: COMPLETED_HERE.contains(&db_type),
         fixed_schema: db_type == DatabaseType::Sqlite,
@@ -934,14 +949,70 @@ async fn session_pool_exists(state: &AppState, connection: &str, id: &str) -> bo
     state.with_connection_pools(|pools| pools.keys().any(|k| k.starts_with(&prefix) && k.ends_with(&suffix))).await
 }
 
+/// How long a MySQL run may go on after the `KILL QUERY` a timeout sends
+/// before it is let go of, and how long the session then has to answer
+/// (`wait_for_session`). A kill that lands ends the statement within a round
+/// trip or two.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `future`'s output, unless it takes longer than `grace` (then it is
+/// dropped, and `None`).
+async fn within<F: std::future::Future>(grace: std::time::Duration, future: F) -> Option<F::Output> {
+    tokio::time::timeout(grace, future).await.ok()
+}
+
+/// Whether `sql` is a proven read once its `SLEEP(...)` calls are taken for a
+/// pure function (`abs`). dbx's proof does not list SLEEP, which only waits,
+/// and answers a kill with 1: so `select sleep(30)` answered after a cancel is
+/// the cancel working, not a statement whose effects are unknown.
+fn proven_but_for_sleep(sql: &str, db_type: DatabaseType) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let (mut out, mut last, mut from) = (String::with_capacity(sql.len()), 0, 0);
+    while let Some(found) = lower[from..].find("sleep") {
+        let at = from + found;
+        let starts_word = at == 0 || !(b[at - 1].is_ascii_alphanumeric() || matches!(b[at - 1], b'_' | b'$' | b'`' | b'.'));
+        if starts_word && lower[at + 5..].trim_start().starts_with('(') {
+            out.push_str(&sql[last..at]);
+            out.push_str("abs");
+            last = at + 5;
+        }
+        from = at + 5;
+    }
+    out.push_str(&sql[last..]);
+    out != sql && rerun_on(&out, db_type, None) == Rerun::Proven
+}
+
+/// What is known of a statement the connection's query timeout cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutEnd {
+    /// The session answered again afterwards: the statement has ended.
+    Stopped,
+    /// The session did not answer (or the run was let go of).
+    NotKnown,
+    /// The server answered the statement with a result after the cancel:
+    /// it finished, or was ended early with that answer. Not "stopped".
+    Answered,
+}
+
+/// `e` for a run that reached the server and was cut short when what it did
+/// there cannot be known (`CoreError::outcome_unknown`).
+fn outcome_unknown(mut e: CoreError) -> CoreError {
+    const WHY: &str = "earlier statements may have run, or part of this one: what the run changed is not known.";
+    e.message = match e.kind {
+        CoreErrorKind::Cancelled => format!("Cancelled; {WHY}"),
+        _ => format!("{} It was cut short, and {WHY}", e.message.trim_end()),
+    };
+    e.outcome_unknown = true;
+    e
+}
+
 /// The connection's query timeout passed and the run was cancelled for it.
-/// `stopped` says whether the session answered again afterwards, which is
-/// when the statement has ended.
-fn timeout_error(secs: u64, stopped: bool, statement: &str) -> CoreError {
-    let how = if stopped {
-        "and was stopped"
-    } else {
-        "and was cancelled; whether the server has stopped it is not known"
+fn timeout_error(secs: u64, end: TimeoutEnd, statement: &str) -> CoreError {
+    let how = match end {
+        TimeoutEnd::Stopped => "and was stopped",
+        TimeoutEnd::NotKnown => "and was cancelled; whether the server has stopped it is not known",
+        TimeoutEnd::Answered => "and was cancelled; the server then answered it with a result (it may have finished first), which is not shown",
     };
     let mut e = CoreError::new(
         CoreErrorKind::Timeout,
@@ -1037,7 +1108,26 @@ fn rerun_of(sql: &str, database_type: DatabaseType) -> Rerun {
 }
 
 /// `rerun_of` for a statement that ran on the SQLite file `file`, if any.
+///
+/// On MySQL the worst of the readings of the text stands (`judged_texts`), and
+/// a text whose statements depend on the SQL mode is never run again.
 fn rerun_on(sql: &str, database_type: DatabaseType, file: Option<&Path>) -> Rerun {
+    if database_type != DatabaseType::Mysql {
+        return rerun_text(sql, database_type, file);
+    }
+    let readings = mysql_readings(sql);
+    if readings.ambiguous {
+        return Rerun::Write;
+    }
+    let rank = |r: &Rerun| match r {
+        Rerun::Proven => 0,
+        Rerun::ReadOnlyUnproven => 1,
+        Rerun::Write => 2,
+    };
+    judged_of(&readings, sql).iter().map(|t| rerun_text(t, database_type, file)).max_by_key(rank).unwrap_or(Rerun::Write)
+}
+
+fn rerun_text(sql: &str, database_type: DatabaseType, file: Option<&Path>) -> Rerun {
     let mut rest = sql.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix("--") {
@@ -1116,7 +1206,346 @@ struct Verdict {
 ///
 /// A write on a `read_only` connection is let through to dbx, which refuses
 /// it with its own error: asking first would only offer a yes that fails.
+#[cfg(test)]
 fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerous: bool, switched: bool) -> Option<Verdict> {
+    assess_in(config, database, sql, confirm_dangerous, SessionMarks { switched, charset: false })
+}
+
+/// What the gate knows of the session a statement runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SessionMarks {
+    /// A `USE` has been sent in it (`SwitchedSessions`).
+    switched: bool,
+    /// A statement that may change the client charset has been sent in it
+    /// (`CharsetSessions`).
+    charset: bool,
+}
+
+/// `assess` in a session with these marks.
+fn assess_in(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerous: bool, marks: SessionMarks) -> Option<Verdict> {
+    let switched = marks.switched;
+    if config.db_type != DatabaseType::Mysql {
+        return assess_text(config, database, sql, confirm_dangerous, switched);
+    }
+    // MySQL: the text is judged in every reading the server may give it
+    // (`mysql_read`: each SQL mode that changes quotes, each server version
+    // its version comments name), rewritten so dbx's scanners read it as that
+    // reading does, as well as written: dbx's scanners read `--1` as a
+    // comment, block comments as nesting, and know nothing of the SQL mode.
+    // The verdicts are merged: production if any is, with every reason and
+    // every named database (production verdicts first).
+    let readings = mysql_readings(sql);
+    // Under a client charset that can swallow a `\` or a `` ` `` the readings
+    // are not the server's for text that is not ASCII (`mysql_unread`).
+    let unread = mysql_unread(config, sql, marks.charset);
+    let mut ambiguous = readings.ambiguous || unread;
+    let mut judged = judged_of(&readings, sql);
+    // Readings that differ, each one statement (no `;` outside quotes and
+    // comments in any), are not other statements: a reading whose quote never
+    // closes is a syntax error to the server, and when every other reading
+    // gets the same verdict, that verdict is the server's whichever it reads.
+    if readings.ambiguous && !unread && readings.single {
+        let live: Vec<&mysql_read::Reading> = readings.readings.iter().filter(|r| !r.unterminated).collect();
+        let verdict = |r: &mysql_read::Reading| assess_text(config, database, &r.neutral, confirm_dangerous, switched);
+        if let Some(first) = live.first() {
+            let v = verdict(first);
+            if live.iter().all(|r| verdict(r) == v) {
+                ambiguous = false;
+                judged = judged_from(live.into_iter(), sql);
+            }
+        }
+    }
+    let mut verdicts: Vec<Verdict> = judged.iter().filter_map(|text| assess_text(config, database, text, confirm_dangerous, switched)).collect();
+    verdicts.sort_by_key(|v| !v.production);
+    let best = verdicts.into_iter().reduce(Verdict::merge);
+    if !ambiguous {
+        return best;
+    }
+    // It may be more than one statement, and only the server's SQL mode says.
+    let listed = config.is_production || !config.production_databases.is_empty();
+    match best {
+        Some(mut v) => {
+            v.reasons.insert(0, Reason::Ambiguous);
+            if listed {
+                // Which statements it is, and so which database, is not known.
+                v.production = true;
+                v.target_unknown = true;
+            }
+            Some(v)
+        }
+        None if listed => Some(Verdict { production: true, reasons: vec![Reason::Ambiguous], named: Vec::new(), target_unknown: true }),
+        None if confirm_dangerous => Some(Verdict { production: false, reasons: vec![Reason::Ambiguous], named: Vec::new(), target_unknown: false }),
+        None => None,
+    }
+}
+
+impl Verdict {
+    /// Both verdicts at once: production if either is, every reason and named
+    /// database of both (this one's first), the target unknown if either's is.
+    fn merge(mut self, other: Verdict) -> Verdict {
+        self.production |= other.production;
+        self.target_unknown |= other.target_unknown;
+        for r in other.reasons {
+            if !self.reasons.contains(&r) {
+                self.reasons.push(r);
+            }
+        }
+        for n in other.named {
+            if !self.named.contains(&n) {
+                self.named.push(n);
+            }
+        }
+        self
+    }
+}
+
+/// How the MySQL server may read a text (`mysql_read`): its readings, one per
+/// SQL mode and server version that reads it differently, the first in the
+/// default mode on a server new enough for every version comment.
+struct MysqlReadings {
+    readings: Vec<mysql_read::Reading>,
+    /// The server may read it as other statements than one reading says
+    /// (`Reason::Ambiguous`): the readings differ in what lies outside quotes
+    /// and comments, or dbx's own scanner (`strip_sql_comments_and_literals`,
+    /// what its classifier's checks of comments, literals and `;` stand on)
+    /// reads the text, or a rewritten reading of it, otherwise. Then dbx's
+    /// verdict on the text as written cannot be leaned on: dbx takes any `--`
+    /// for a comment, closes `/*! */`, knows no `ANSI_QUOTES` and quotes `$$`.
+    ambiguous: bool,
+    /// Every reading is one statement (no `;` outside quotes and comments)
+    /// that dbx's scanner reads as the reading does, and at least one closes
+    /// every quote it opens: however the server reads the text, it is one
+    /// statement or a syntax error. The versions were not too many to read.
+    single: bool,
+}
+
+fn mysql_readings(sql: &str) -> MysqlReadings {
+    let (modes, capped) = mysql_read::modes(sql);
+    let mut readings: Vec<mysql_read::Reading> = Vec::new();
+    for mode in modes {
+        let r = mysql_read::read(sql, mode);
+        if !readings.contains(&r) {
+            readings.push(r);
+        }
+    }
+    let dbx = |text: &str| mysql_read::collapsed(&dbx_core::query_execution_sql::strip_sql_comments_and_literals(text));
+    let first = readings[0].skeleton.clone();
+    let faithful = readings.iter().all(|r| dbx(&r.neutral) == r.skeleton);
+    let ambiguous = capped || readings.iter().any(|r| r.skeleton != first) || dbx(sql) != first || !faithful;
+    let single = !capped && faithful && readings.iter().all(|r| !r.skeleton.contains(';')) && readings.iter().any(|r| !r.unterminated);
+    MysqlReadings { readings, ambiguous, single }
+}
+
+/// The client charsets of MySQL 8.4 with a two-byte character whose second
+/// byte can be `\` (0x5C) or `` ` `` (0x60): such a character swallows the
+/// backslash or backtick that the bytes of a UTF-8 character before it would
+/// otherwise leave alone, and where a quote ends moves. None of them has one
+/// ending in `'` or `"` (second bytes start at 0x40). Found on the fixture by
+/// `char_length(convert(unhex(...) using cs)) = 1` for every lead byte;
+/// eucjpms, ujis, euckr and gb2312 have none, and ucs2, utf16, utf16le and
+/// utf32 cannot be a client charset. ASCII text reads alike in all of them.
+const SWALLOWING_CHARSETS: [&str; 5] = ["big5", "cp932", "gb18030", "gbk", "sjis"];
+
+/// `%XX` decoded, `+` as a space, as a URL parameter is.
+fn url_decoded(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |at: usize| b.get(at).and_then(|&x| (x as char).to_digit(16));
+        match (b[i], hex(i + 1), hex(i + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                i += 3;
+            }
+            (b'+', _, _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (x, _, _) => {
+                out.push(x);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether a MySQL connection's URL parameters may set a client charset that
+/// swallows (`SWALLOWING_CHARSETS`): dbx sends `SET NAMES` with `charset=`
+/// at connect, and the `sessionVariables=` it sends too. Any parameter that
+/// names one, or `character_set`, counts, as written or decoded; but for
+/// `dataCharset=` (a way of reading results, which needs the session in
+/// utf8mb4, dbx refuses it otherwise).
+fn mysql_swallowing_connection(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::Mysql
+        && config.url_params.as_deref().is_some_and(|params| {
+            params.split('&').any(|segment| {
+                [segment.to_ascii_lowercase(), url_decoded(segment).to_ascii_lowercase()].iter().any(|s| {
+                    let key = s.split_once('=').map_or(s.as_str(), |(k, _)| k).trim();
+                    key != "datacharset" && (s.contains("character_set") || SWALLOWING_CHARSETS.iter().any(|cs| s.contains(cs)))
+                })
+            })
+        })
+}
+
+/// Whether `word` is in `lower` (lower case) with no letter, digit, `_` or `$`
+/// either side.
+fn has_word(lower: &str, word: &str) -> bool {
+    let b = lower.as_bytes();
+    let part = |x: u8| x.is_ascii_alphanumeric() || x == b'_' || x == b'$';
+    lower.match_indices(word).any(|(at, _)| (at == 0 || !part(b[at - 1])) && b.get(at + word.len()).is_none_or(|&x| !part(x)))
+}
+
+/// Whether a MySQL text may change the session's client charset, wherever
+/// in it: `SET NAMES`, `SET CHARACTER SET`, `SET CHARSET`, anything naming
+/// `character_set_...`, a `PREPARE` (of a statement built from strings), or a
+/// `SET` of a name that is not all ASCII (the server compares variable names
+/// as utf8mb3_general_ci: `@@chàracter_ſet_client` is `character_set_client`).
+/// Keywords are ASCII to the server. Stored routines put the charset back
+/// when they return.
+fn may_change_client_charset(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    lower.contains("character")
+        || has_word(&lower, "names")
+        || has_word(&lower, "charset")
+        || has_word(&lower, "prepare")
+        || (has_word(&lower, "set") && mysql_readings(sql).readings.iter().any(|r| r.bare_non_ascii))
+}
+
+/// Whether the server may read a MySQL text otherwise than every reading of
+/// `mysql_read`, which reads it as UTF-8: it is not all ASCII, and the client
+/// charset may be one that swallows a `\` or a `` ` `` (`SWALLOWING_CHARSETS`):
+/// the connection's parameters may set one, or the session has run something
+/// that may (`charset_marked`), or the text itself may set one and go on to
+/// another statement.
+fn mysql_unread(config: &ConnectionConfig, sql: &str, charset_marked: bool) -> bool {
+    config.db_type == DatabaseType::Mysql
+        && !sql.is_ascii()
+        && (charset_marked || mysql_swallowing_connection(config) || (may_change_client_charset(sql) && mysql_many_statements(sql)))
+}
+
+/// The texts dbx judges for a MySQL text: each reading rewritten so dbx's
+/// scanners read it as that reading does (`neutral`), each as written with
+/// its comments gone (`plain`, for names exactly as typed), and the text as
+/// written. The most severe of the verdicts stands, merged.
+fn judged_of(readings: &MysqlReadings, sql: &str) -> Vec<String> {
+    judged_from(readings.readings.iter(), sql)
+}
+
+/// `judged_of`, for these readings.
+fn judged_from<'a>(readings: impl Iterator<Item = &'a mysql_read::Reading>, sql: &str) -> Vec<String> {
+    let mut texts: Vec<String> = Vec::new();
+    for r in readings {
+        for t in [&r.neutral, &r.plain] {
+            if !texts.contains(t) {
+                texts.push(t.clone());
+            }
+        }
+    }
+    if !texts.iter().any(|t| t == sql) {
+        texts.push(sql.to_string());
+    }
+    texts
+}
+
+fn judged_texts(sql: &str) -> Vec<String> {
+    judged_of(&mysql_readings(sql), sql)
+}
+
+/// Whether a MySQL text is more than one statement in some reading (a run of
+/// it cut short may have run the earlier ones).
+fn mysql_many_statements(sql: &str) -> bool {
+    let m = mysql_readings(sql);
+    (m.ambiguous && !m.single) || m.readings.iter().any(|r| r.statements().len() > 1)
+}
+
+/// Where the quoted text that opens at `c[at]` (a quote `q`) ends: the index
+/// after its closing quote, or the end of the text.
+fn quoted_end(c: &[char], at: usize, q: char, backslash_escapes: bool) -> usize {
+    let mut i = at + 1;
+    while i < c.len() {
+        let d = c[i];
+        i += 1;
+        if d == '\\' && q != '`' && backslash_escapes {
+            i += 1;
+        } else if d == q {
+            if c.get(i) == Some(&q) {
+                i += 1;
+            } else {
+                return i;
+            }
+        }
+    }
+    c.len()
+}
+
+/// The text of `sql` with its comments gone as the MySQL server reads it in
+/// its default quoting (or without backslash escapes), on a server new enough
+/// for every version comment (`mysql_read::Reading::plain`).
+#[cfg(test)]
+fn mysql_view(sql: &str, backslash_escapes: bool) -> String {
+    mysql_read::read(sql, mysql_read::Mode { backslash_escapes, ..mysql_read::Mode::DEFAULT }).plain
+}
+
+/// The words of `view` outside quotes, lower case, with what follows each
+/// (for `into outfile`): whether the words `into` and then `outfile` or
+/// `dumpfile` follow one another.
+fn writes_server_file(view: &str) -> bool {
+    let c: Vec<char> = view.chars().collect();
+    let (mut i, mut previous) = (0, String::new());
+    while i < c.len() {
+        match c[i] {
+            q @ ('\'' | '"' | '`') => {
+                i = quoted_end(&c, i, q, true);
+                previous.clear();
+            }
+            ch if ch.is_alphanumeric() || ch == '_' || ch == '$' => {
+                let start = i;
+                while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_' || c[i] == '$') {
+                    i += 1;
+                }
+                let word: String = c[start..i].iter().collect::<String>().to_lowercase();
+                if previous == "into" && (word == "outfile" || word == "dumpfile") {
+                    return true;
+                }
+                previous = word;
+            }
+            ch if ch.is_whitespace() => i += 1,
+            _ => {
+                previous.clear();
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+/// The databases of `marked` that `view` mentions as a name, anywhere: with
+/// backticks and case set aside, as a whole name (the characters either side
+/// are not those a name has). Over-inclusive on purpose: a name in a string
+/// counts. It is for what dbx does not look in: it finds the target of a
+/// write after `FROM`, `JOIN`, `UPDATE` or `INTO`, one name at a time.
+fn mentioned_databases(view: &str, marked: &[String]) -> Vec<String> {
+    let plain = |s: &str| s.replace('`', "").to_lowercase();
+    let text: Vec<char> = plain(view).chars().collect();
+    let part = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    marked
+        .iter()
+        .filter(|name| {
+            let want: Vec<char> = plain(name).chars().collect();
+            !want.is_empty()
+                && text.windows(want.len()).enumerate().any(|(at, w)| {
+                    w == want.as_slice()
+                        && (at == 0 || !part(text[at - 1]))
+                        && text.get(at + want.len()).is_none_or(|&c| !part(c))
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+fn assess_text(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerous: bool, switched: bool) -> Option<Verdict> {
     use dbx_core::production_safety::{is_production_database, targets_production_database};
     use dbx_core::sql_risk::{classify_sql_risk_for_database, is_dangerous_sql_for_database, prove_read_only_for_database, ReadProof, SqlRisk};
     let db_type = config.db_type;
@@ -1168,9 +1597,24 @@ fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerou
     // lists as production: judged against the tab's database, a write would
     // pass. Whatever is not proven read-only is aimed at production.
     let listed = config.is_production || !config.production_databases.is_empty();
+    // MySQL: a file written on the server's host (`INTO OUTFILE`) is in no
+    // database, and the host has the production ones: asked wherever the
+    // connection lists any. Not proven read-only, whatever dbx says.
+    let mysql = db_type == DatabaseType::Mysql;
+    let writes_file = mysql && writes_server_file(sql);
+    if first.is_none() && writes_file {
+        first = Some(Reason::WritesFile);
+    }
     let by_sql = first.is_some() && targets_production_database(config, database, sql);
-    let by_session = first.is_some() && !by_sql && switched && listed;
-    let production = by_sql || by_session;
+    // dbx finds the target of a write after FROM, JOIN, UPDATE and INTO, one
+    // object at a time (`delete b from a, prod.b`, `load data ... into table
+    // prod.t`, `select prod.f()`): on MySQL, whatever is not proven read-only
+    // and names a production database anywhere is aimed at it.
+    let mentioned = if mysql && first.is_some() { mentioned_databases(sql, &config.production_databases) } else { Vec::new() };
+    let by_name = !by_sql && !mentioned.is_empty();
+    let by_file = writes_file && listed;
+    let by_session = first.is_some() && !by_sql && !by_name && !by_file && switched && listed;
+    let production = by_sql || by_name || by_file || by_session;
     let mut reasons = lead;
     if production {
         reasons.extend(first);
@@ -1180,14 +1624,20 @@ fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerou
         if dangerous && first != Some(Reason::Dangerous) {
             reasons.push(Reason::Dangerous);
         }
+        if writes_file && first != Some(Reason::WritesFile) {
+            reasons.push(Reason::WritesFile);
+        }
         if by_session {
             reasons.push(Reason::SessionSwitched);
         }
-    } else if dangerous && confirm_dangerous {
+    } else if (dangerous || writes_file) && confirm_dangerous {
         if first == Some(Reason::Unparsed) {
             reasons.push(Reason::Unparsed);
         }
         reasons.push(Reason::Dangerous);
+        if writes_file {
+            reasons.push(Reason::WritesFile);
+        }
     } else {
         return None;
     }
@@ -1207,20 +1657,23 @@ fn assess(config: &ConnectionConfig, database: &str, sql: &str, confirm_dangerou
             named = config.production_databases.iter().filter(|d| only(d)).map(|d| display_safe(d)).collect();
         }
     }
+    if by_name {
+        named = mentioned.iter().map(|d| display_safe(d)).collect();
+    }
     Some(Verdict { production, reasons, named, target_unknown })
 }
 
 /// The gate on a run: `Err` with what the user is asked, unless `statement`
 /// needs no yes, or the request carries a yes for exactly this statement,
 /// connection, `database` and session. A yes for anything else asks again.
-fn gate(config: &ConnectionConfig, request: &RunRequest, statement: &str, database: &str, switched: bool) -> Result<(), Box<Assessment>> {
+fn gate(config: &ConnectionConfig, request: &RunRequest, statement: &str, database: &str, marks: SessionMarks) -> Result<(), Box<Assessment>> {
     let this = Confirmation {
         statement: statement.to_string(),
         connection: request.connection.clone(),
         database: database.to_string(),
         session: request.session,
     };
-    let verdict = assess(config, database, statement, request.confirm_dangerous, switched);
+    let verdict = assess_in(config, database, statement, request.confirm_dangerous, marks);
     let mut verdict = match (&request.confirmation, verdict) {
         (Some(yes), _) if *yes == this => return Ok(()),
         (None, None) => return Ok(()),
@@ -1272,6 +1725,28 @@ fn switches_database(sql: &str) -> bool {
 /// read-only, and it switches nothing: the statements that need no second
 /// look at the saved flags.
 fn proven_read_only(sql: &str, config: &ConnectionConfig) -> bool {
+    if config.db_type == DatabaseType::Mysql {
+        let readings = mysql_readings(sql);
+        return !readings.ambiguous && judged_of(&readings, sql).iter().all(|t| proven_read_only_text(t, config));
+    }
+    proven_read_only_text(sql, config)
+}
+
+/// What the gate reads `sql` as on MySQL: its statements, or `None` when the
+/// server may read it as other statements (`Reason::Ambiguous`), or more than
+/// one statement when it may be one. `swallowing`: the session's client
+/// charset may be one of `SWALLOWING_CHARSETS`. For the live differential
+/// test (feature `test-support`).
+#[cfg(any(test, feature = "test-support"))]
+pub fn mysql_statements_read(sql: &str, swallowing: bool) -> Option<Vec<String>> {
+    if swallowing && !sql.is_ascii() {
+        return None;
+    }
+    let readings = mysql_readings(sql);
+    (!readings.ambiguous || readings.single).then(|| readings.readings[0].statements())
+}
+
+fn proven_read_only_text(sql: &str, config: &ConnectionConfig) -> bool {
     use dbx_core::sql_risk::{classify_sql_risk_for_database, prove_read_only_for_database, ReadProof, SqlRisk};
     let db_type = config.db_type;
     let file = sqlite_file(config);
@@ -1297,9 +1772,23 @@ fn only_switches(sql: &str) -> bool {
 struct SwitchedSessions(std::sync::Mutex<std::collections::HashSet<SessionId>>);
 
 impl SwitchedSessions {
-    /// `sql` is about to be sent in `session`.
+    /// `sql` is about to be sent in `session`, on a connection that is not MySQL.
+    #[cfg(test)]
     fn note(&self, session: SessionId, sql: &str) {
-        if switches_database(sql) {
+        self.note_for(session, sql, DatabaseType::Postgres);
+    }
+    /// `note`, for a connection of `db_type`: on MySQL a `USE` the server
+    /// reads out of text this client takes for a comment counts too.
+    fn note_for(&self, session: SessionId, sql: &str, db_type: DatabaseType) {
+        let switches = if db_type == DatabaseType::Mysql { judged_texts(sql).iter().any(|t| switches_database(t)) } else { switches_database(sql) };
+        if switches {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).insert(session);
+        }
+    }
+    /// `sql`, which the gate cannot read as the server will (`mysql_unread`),
+    /// is about to be sent in `session`: the word `use` anywhere in it counts.
+    fn note_unread(&self, session: SessionId, sql: &str) {
+        if has_word(&sql.to_ascii_lowercase(), "use") {
             self.0.lock().unwrap_or_else(|p| p.into_inner()).insert(session);
         }
     }
@@ -1307,6 +1796,28 @@ impl SwitchedSessions {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).contains(&session)
     }
     /// The session is closed: a new one starts where the tab's database is.
+    fn forget(&self, session: SessionId) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(&session);
+    }
+}
+
+/// The MySQL sessions in which a statement that may change the client
+/// charset has been sent (`may_change_client_charset`). In such a session
+/// text that is not ASCII is not read (`mysql_unread`) until it closes: a new
+/// session gets dbx's `SET NAMES` at connect.
+#[derive(Default)]
+struct CharsetSessions(std::sync::Mutex<std::collections::HashSet<SessionId>>);
+
+impl CharsetSessions {
+    /// `sql` is about to be sent in `session`, on a connection of `db_type`.
+    fn note(&self, session: SessionId, sql: &str, db_type: DatabaseType) {
+        if db_type == DatabaseType::Mysql && may_change_client_charset(sql) {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).insert(session);
+        }
+    }
+    fn contains(&self, session: SessionId) -> bool {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).contains(&session)
+    }
     fn forget(&self, session: SessionId) {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(&session);
     }
@@ -1410,6 +1921,19 @@ fn run_error(error: QueryExecutionError, statement: &str, secret: &str, timeout:
         _ => (CoreErrorKind::Other, None),
     };
     let raw = error.into_legacy_string();
+    // MySQL: dbx lost the tab's session after the statement was sent (it could
+    // not settle the transaction afterwards, say): the statement ran, or some
+    // of it did. Not a failure to connect, which would say nothing ran. (Its
+    // other session-lost errors say "This statement was not executed.")
+    if raw.contains("MYSQL_CLIENT_SESSION_LOST") && !raw.contains("This statement was not executed") {
+        let mut e = CoreError::new(
+            CoreErrorKind::Other,
+            format!("The session was lost after the statement was sent, so what it did is not known. {}", run_message(&raw, secret)),
+        );
+        e.statement = Some(statement.to_string());
+        e.outcome_unknown = true;
+        return e;
+    }
     let kind = if kind != CoreErrorKind::Cancelled && dbx_core::query::is_connection_error(&raw) {
         CoreErrorKind::Connect
     } else {
@@ -1982,17 +2506,19 @@ impl Core for DbxCore {
         self.ensure_browsable(&at.connection).await?;
         // A SQLite file has one schema names resolve in, `main`: nothing to ask.
         let state = self.state().await?;
-        if state.configs.read().await.get(&at.connection.0).is_some_and(|c| c.db_type == DatabaseType::Sqlite) {
+        let db_type = state.configs.read().await.get(&at.connection.0).map(|c| c.db_type);
+        let Some(sql) = db_type.map_or(Some("select current_schema()"), current_schema_sql) else {
             return Ok(Some(SQLITE_SCHEMA.to_string()));
-        }
+        };
         let (conn, database) = (at.connection.0.clone(), self.database_name(&at.connection, &at.database).await);
         self.metadata(&at.connection, move |state| async move {
             // Through the query path: dbx has no getter for it. Its own pool
             // for the call, not the tab's session: the search path of a
             // session may have been `SET`, and this asks what a fresh
-            // connection resolves names in.
+            // connection resolves names in. (On MySQL that is the database
+            // the pool was opened on, so a `USE` typed in a tab is not seen.)
             let options = QueryExecutionOptions { max_rows: Some(1), timeout_secs: Some(0), ..Default::default() };
-            let result = execute_sql_statement_with_options_typed(&state, &conn, &database, "select current_schema()", None, None, options)
+            let result = execute_sql_statement_with_options_typed(&state, &conn, &database, sql, None, None, options)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(result.rows.first().and_then(|r| r.first()).and_then(|v| v.as_str()).map(str::to_string))
@@ -2001,12 +2527,12 @@ impl Core for DbxCore {
     }
     async fn release(&self, at: &DatabasePath) -> Result<(), CoreError> {
         let state = self.state().await?;
-        let postgres = state.configs.read().await.get(&at.connection.0).is_some_and(|c| kind_of(c.db_type) == DbKind::Postgres);
-        if !postgres {
+        let pooled = state.configs.read().await.get(&at.connection.0).is_some_and(|c| matches!(kind_of(c.db_type), DbKind::Postgres | DbKind::MySql));
+        if !pooled {
             return Ok(());
         }
-        // dbx keeps one pool per (connection, database) for a Postgres
-        // connection, under the key "<connection id>:<database>"
+        // dbx keeps one pool per (connection, database) for a Postgres or
+        // MySQL connection, under the key "<connection id>:<database>"
         // (`base_pool_key_for_with_catalog` in dbx-core's connection module),
         // and `remove_pool_by_key` closes that one pool and its bookkeeping
         // (keepalive task, activity, cancel context) and waits for the close.
@@ -2038,21 +2564,28 @@ impl Core for DbxCore {
         // The gate (slice 17), on the exact text about to be sent, with the
         // config as it is now (the desktop app can change the flags).
         // Nothing reaches dbx without the matching yes.
-        let switched = self.switched.contains(request.session);
-        let mut gated = gate(&config, &request, &statement, &database, switched);
+        let marks = SessionMarks { switched: self.switched.contains(request.session), charset: self.charsets.contains(request.session) };
+        // MySQL text the gate cannot read as the server will, the client
+        // charset being one that can swallow a `\` or a `` ` ``.
+        let unread = mysql_unread(&config, &statement, marks.charset);
+        let mut gated = gate(&config, &request, &statement, &database, marks);
         // A flag set in the desktop while this client runs is not in the
         // runtime copy. Before letting through anything not proven
         // read-only, look at the saved connection once more. A statement
         // already confirmed for this exact target has been asked about.
-        if gated.is_ok() && request.confirmation.is_none() && !proven_read_only(&statement, &config) {
+        if gated.is_ok() && request.confirmation.is_none() && (unread || !proven_read_only(&statement, &config)) {
             if let Some(saved) = self.saved_config(&state, &request.connection.0).await? {
-                gated = gate(&saved, &request, &statement, &database, switched);
+                gated = gate(&saved, &request, &statement, &database, marks);
             }
         }
         gated.map_err(|a| CoreError::needs_confirmation(*a))?;
-        // From here the statement is sent: a switch of database lasts in the
-        // session, and the gate remembers it.
-        self.switched.note(request.session, &statement);
+        // From here the statement is sent: a switch of database, or of the
+        // client charset, lasts in the session, and the gate remembers it.
+        self.switched.note_for(request.session, &statement, config.db_type);
+        if unread {
+            self.switched.note_unread(request.session, &statement);
+        }
+        self.charsets.note(request.session, &statement, config.db_type);
         let session = session_id(request.session);
         let registered = {
             let mut early = self.early_cancels.lock().unwrap_or_else(|p| p.into_inner());
@@ -2078,6 +2611,19 @@ impl Core for DbxCore {
             timeout_secs: Some(0),
             client_session_id: Some(session.clone()),
             execution_id: Some(run_key(run)),
+            // MySQL (a cancel is `KILL QUERY` from another connection):
+            // - the run keeps waiting for the server's answer to the kill
+            //   instead of dropping the statement's connection, so the tab's
+            //   session keeps its variables, temporary tables and open
+            //   transaction through a cancel (dropped mid-statement, dbx
+            //   discards the connection and the next run is a new session);
+            // - a transaction the user opens is kept open from run to run, as
+            //   a Postgres session keeps one (dbx's default for an
+            //   auto-commit tab is to roll it back when the run that opened
+            //   it ends, which turns `begin; update; rollback` into a
+            //   committed update).
+            await_cancel_completion: config.db_type == DatabaseType::Mysql,
+            preserve_explicit_transaction: config.db_type == DatabaseType::Mysql,
             ..Default::default()
         };
         let token = registered.token();
@@ -2091,35 +2637,129 @@ impl Core for DbxCore {
             options,
         );
         tokio::pin!(execution);
+        let mysql = config.db_type == DatabaseType::Mysql;
+        // MySQL: a run cut short leaves what it did unknown when it is more
+        // than one statement (each one the server finished stands) or one not
+        // proven read-only (part of it may have been done: a table that is not
+        // transactional keeps the rows written before the kill).
+        let many = mysql && (unread || mysql_many_statements(&statement));
+        let unsure_when_cut = mysql && (many || !proven_read_only(&statement, &config));
         // The connection's query timeout: when it passes, the run is
         // cancelled through its token, exactly as a user's cancel is (dbx
         // keeps the connection on a cancel), and its outcome is a timeout.
         let mut timed_out = false;
+        // MySQL: the run went on for `KILL_GRACE` after the timeout's kill,
+        // and was let go of (whether the statement stopped is not known).
+        let mut gave_up = false;
         let result = match timeout {
             Some(secs) => tokio::select! {
                 result = &mut execution => result,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {
                     timed_out = true;
+                    // MySQL is stopped by `KILL QUERY`, which only a cancel
+                    // through the running-query list sends (dbx's interrupt):
+                    // the token alone ends nothing on the server, and the run
+                    // here waits for the server's answer. A kill that does not
+                    // land (its connection cannot be opened, say) would leave
+                    // that wait without end: it is bounded.
+                    if mysql {
+                        state.running_queries.cancel(&run_key(run));
+                    }
                     token.cancel();
-                    execution.await
+                    if mysql {
+                        within(KILL_GRACE, &mut execution).await.unwrap_or_else(|| {
+                            gave_up = true;
+                            Err(QueryExecutionError::Canceled { stage: dbx_core::db::agent_driver::AgentErrorStage::Cancel, operation_outcome: dbx_core::db::agent_driver::AgentOperationOutcome::Unknown })
+                        })
+                    } else {
+                        execution.await
+                    }
                 }
             },
             None => execution.await,
         };
         registered.finish_with_late_cancel(&result, false);
+        // MySQL: a cancel or a timeout has been asked for, and the server
+        // answered. `KILL QUERY` makes most statements fail with error 1317
+        // ("Query execution was interrupted"), which is the cancel working.
+        // Some end with a result instead (`SLEEP()` returns 1 when it is
+        // interrupted, with no error): the server's answer is not known to be
+        // the end of a stopped statement or of one that finished first.
+        let result = if config.db_type == DatabaseType::Mysql && token.is_cancelled() {
+            match result {
+                Err(e) if !matches!(e, QueryExecutionError::Canceled { .. } | QueryExecutionError::Timeout(_)) && e.clone().into_legacy_string().contains("ERROR 1317 (70100)") => {
+                    Err(QueryExecutionError::Canceled { stage: dbx_core::db::agent_driver::AgentErrorStage::Cancel, operation_outcome: dbx_core::db::agent_driver::AgentOperationOutcome::Unknown })
+                }
+                other => other,
+            }
+        } else {
+            result
+        };
+        if mysql && token.is_cancelled() {
+            if let Ok(r) = &result {
+                let set = result_set_on(r.clone(), statement.clone(), config.db_type, None);
+                if set.rerun == Rerun::Proven || proven_but_for_sleep(&statement, config.db_type) {
+                    // A read proven read-only: nothing it did is lost by not
+                    // showing it. Anything else (a write, a read calling
+                    // functions dbx cannot vouch for) is shown as it
+                    // finished (below), with a note.
+                    return Err(if timed_out {
+                        timeout_error(timeout.unwrap_or_default(), TimeoutEnd::Answered, &statement)
+                    } else {
+                        let mut e = CoreError::new(
+                            CoreErrorKind::Cancelled,
+                            "Cancelled. The server answered the statement with a result when it was interrupted (MySQL's SLEEP() does), and the answer is not shown.",
+                        );
+                        e.statement = Some(statement.clone());
+                        e
+                    });
+                }
+            }
+        }
+        // Nothing reached the server: there is nothing to wait for, and nothing
+        // it did to be unsure of.
+        let not_started = matches!(&result, Err(QueryExecutionError::Canceled { operation_outcome: dbx_core::db::agent_driver::AgentOperationOutcome::NotStarted, .. }));
         let stopped = match &result {
-            // Nothing reached the server: there is nothing to wait for.
-            Err(QueryExecutionError::Canceled { operation_outcome: dbx_core::db::agent_driver::AgentOperationOutcome::NotStarted, .. }) => true,
+            _ if gave_up => false,
+            _ if not_started => true,
+            // MySQL's session answers once the killed statement has ended; if
+            // the kill did not land it may not for a long time.
+            Err(QueryExecutionError::Canceled { .. } | QueryExecutionError::Timeout(_)) if mysql => {
+                within(KILL_GRACE, self.wait_for_session(&state, &request.connection.0, &database, request.session)).await.unwrap_or(false)
+            }
             Err(QueryExecutionError::Canceled { .. } | QueryExecutionError::Timeout(_)) => {
                 self.wait_for_session(&state, &request.connection.0, &database, request.session).await
             }
             _ => true,
         };
+        let unsure = unsure_when_cut && !not_started;
         match (result, timeout) {
-            (Err(QueryExecutionError::Canceled { .. }), Some(secs)) if timed_out => Err(timeout_error(secs, stopped, &statement)),
+            (Err(QueryExecutionError::Canceled { .. }), Some(secs)) if timed_out => {
+                let end = if stopped { TimeoutEnd::Stopped } else { TimeoutEnd::NotKnown };
+                Err(if unsure { outcome_unknown(timeout_error(secs, end, &statement)) } else { timeout_error(secs, end, &statement) })
+            }
             (result, _) => result
-                .map(|r| result_set_on(r, statement.clone(), config.db_type, sqlite_file(&config).as_deref()))
-                .map_err(|e| run_error(e, &statement, &config.password, timeout)),
+                .map(|r| {
+                    let mut set = result_set_on(r, statement.clone(), config.db_type, sqlite_file(&config).as_deref());
+                    if mysql && token.is_cancelled() {
+                        // It ended with its result although a cancel (or the
+                        // time limit) was asked for: it finished, or the server
+                        // ended it early with this answer.
+                        set.messages.push("INFO: a cancel or the time limit was asked for while this ran; the server answered with this result".to_string());
+                        if many {
+                            set.messages.push("INFO: it was more than one statement: this is the first one's result, and the statements after it may have run".to_string());
+                        }
+                    }
+                    set
+                })
+                .map_err(|e| {
+                    let e = run_error(e, &statement, &config.password, timeout);
+                    if unsure && e.kind == CoreErrorKind::Cancelled {
+                        outcome_unknown(e)
+                    } else {
+                        e
+                    }
+                }),
         }
     }
     fn cancel(&self, run: RunId) {
@@ -2145,6 +2785,7 @@ impl Core for DbxCore {
         // otherwise open it again) sees it is gone.
         self.closed_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(session);
         self.switched.forget(session);
+        self.charsets.forget(session);
         state
             .close_client_session_pool(&at.connection.0, Some(self.database_name(&at.connection, &at.database).await.as_str()).filter(|d| !d.is_empty()), &session_id(session))
             .await
@@ -2473,6 +3114,11 @@ fn activity_kind(sql: &str) -> &'static str {
     }
 }
 
+mod mysql_read;
+
+#[cfg(test)]
+mod mysql_gate_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2776,6 +3422,64 @@ mod tests {
         let other = run_error(QueryExecutionError::Legacy("something odd\u{1b}[31m".into()), "s", "", None);
         assert_eq!(other.kind, CoreErrorKind::Other);
         assert!(!other.message.chars().any(char::is_control), "{other:?}");
+    }
+
+    #[test]
+    fn a_mysql_session_lost_after_the_statement_was_sent_is_an_unknown_outcome_not_a_failure_to_connect() {
+        // dbx-core `query/mod.rs`: the ROLLBACK that settles the statement's
+        // transaction failed, after the statement ran.
+        let after = "MYSQL_CLIENT_SESSION_LOST: The MySQL session state could not be verified. The transaction outcome may be unknown: Connection reset by peer (hunter2)";
+        let e = run_error(QueryExecutionError::Legacy(after.into()), "update t set v = 1", "hunter2", None);
+        assert_ne!(e.kind, CoreErrorKind::Connect, "{e:?}");
+        assert!(e.outcome_unknown, "{e:?}");
+        assert!(e.message.contains("not known") && !e.message.contains("hunter2"), "{e:?}");
+        assert_eq!(e.statement.as_deref(), Some("update t set v = 1"));
+        // The guard that refused to send it: nothing ran.
+        let before = "MYSQL_CLIENT_SESSION_LOST: The original MySQL session was lost. The previous transaction outcome is unknown. This statement was not executed.";
+        let e = run_error(QueryExecutionError::Legacy(before.into()), "select 1", "", None);
+        assert!(!e.outcome_unknown, "{e:?}");
+    }
+
+    #[test]
+    fn a_timeout_the_server_answered_with_a_result_is_not_said_to_be_stopped() {
+        let answered = timeout_error(1, TimeoutEnd::Answered, "select sleep(30)");
+        assert_eq!(answered.kind, CoreErrorKind::Timeout);
+        assert!(!answered.message.contains("stopped"), "{}", answered.message);
+        assert!(timeout_error(1, TimeoutEnd::NotKnown, "s").message.contains("not known"));
+        assert!(timeout_error(1, TimeoutEnd::Stopped, "s").message.contains("was stopped"));
+        let cut = outcome_unknown(timeout_error(1, TimeoutEnd::Stopped, "update t set v = 1; select sleep(30)"));
+        assert!(cut.outcome_unknown && cut.message.contains("earlier statements may have run"), "{cut:?}");
+        let cut = outcome_unknown(CoreError::new(CoreErrorKind::Cancelled, "Query canceled"));
+        assert!(cut.message.starts_with("Cancelled; earlier statements may have run"), "{cut:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_after_a_mysql_kill_is_bounded_and_a_run_that_never_answers_is_let_go_of() {
+        // A kill that does not land leaves dbx's future waiting for the server.
+        let never = std::future::pending::<Result<(), ()>>();
+        assert_eq!(within(KILL_GRACE, never).await, None, "let go of after the grace");
+        assert_eq!(within(KILL_GRACE, async { 7 }).await, Some(7));
+    }
+
+    #[test]
+    fn sleep_is_the_one_function_taken_for_pure_when_a_read_answers_a_cancel() {
+        let m = DatabaseType::Mysql;
+        assert_ne!(rerun_of("select sleep(30)", m), Rerun::Proven, "dbx does not prove SLEEP");
+        assert_eq!(rerun_of("select abs(30)", m), Rerun::Proven, "what it is replaced by is");
+        assert!(proven_but_for_sleep("select sleep(30)", m));
+        assert!(proven_but_for_sleep("SELECT SLEEP (30) AS x_sleep", m));
+        assert!(!proven_but_for_sleep("select sleep(30), database()", m), "another function dbx cannot prove");
+        assert!(!proven_but_for_sleep("select edge.sleep(30)", m), "a function of a database's own");
+        assert!(!proven_but_for_sleep("select 1", m), "no SLEEP: dbx's own answer stands");
+        assert!(!proven_but_for_sleep("update t set v = sleep(1)", m));
+    }
+
+    #[test]
+    fn a_mysql_run_of_more_than_one_statement_is_known_as_such_in_every_reading() {
+        assert!(mysql_many_statements("update t set v = 1; select sleep(5)"));
+        assert!(mysql_many_statements("select 1 --\u{a0}; select 2"));
+        assert!(!mysql_many_statements("select sleep(30)"));
+        assert!(!mysql_many_statements("select 1; "));
     }
 
     #[test]
@@ -3225,8 +3929,8 @@ mod tests {
     fn the_gate_asks_for_a_write_in_a_switched_session_and_a_yes_for_it_runs() {
         let c = mysql(false, &["prod"]);
         let sql = "delete from t where id = 1";
-        assert_eq!(gate(&c, &whole(sql), sql, "staging", false), Ok(()));
-        let a = gate(&c, &whole(sql), sql, "staging", true).expect_err("asked");
+        assert_eq!(gate(&c, &whole(sql), sql, "staging", SessionMarks::default()), Ok(()));
+        let a = gate(&c, &whole(sql), sql, "staging", SessionMarks { switched: true, charset: false }).expect_err("asked");
         assert!(a.production);
         assert_eq!(a.reasons, [Reason::Writes, Reason::SessionSwitched]);
     }
@@ -3285,12 +3989,12 @@ mod tests {
     #[test]
     fn the_gate_refuses_without_a_yes_and_names_what_a_yes_must_send() {
         let sql = "delete from t where id = 1";
-        let a = gate(&production(), &whole(sql), sql, "edge", false).expect_err("asked");
+        let a = gate(&production(), &whole(sql), sql, "edge", SessionMarks::default()).expect_err("asked");
         assert!(a.production);
         assert_eq!(a.reasons, [Reason::Writes]);
         assert_eq!(a.connection_name, "prod pg");
         assert_eq!(a.confirmation, yes(sql));
-        assert_eq!(gate(&production(), &whole("select 1"), "select 1", "edge", false), Ok(()));
+        assert_eq!(gate(&production(), &whole("select 1"), "select 1", "edge", SessionMarks::default()), Ok(()));
     }
 
     #[test]
@@ -3298,7 +4002,7 @@ mod tests {
         let sql = "delete from t where id = 1";
         let sent = |confirmation: Confirmation, statement: &str| {
             let request = RunRequest { confirmation: Some(confirmation), ..whole(statement) };
-            gate(&production(), &request, statement, "edge", false)
+            gate(&production(), &request, statement, "edge", SessionMarks::default())
         };
         assert_eq!(sent(yes(sql), sql), Ok(()));
         let other = "delete from t where id = 2";

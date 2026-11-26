@@ -74,3 +74,10 @@ check edge "select string_agg(ad::text || '|' || ai8::text || '|' || ae::text ||
 echo "OK fixtures: $n checks"
 # The SQLite fixtures need no Docker (sqlite/check.sh builds and checks them).
 ./sqlite/check.sh
+# The MySQL fixture is a container of its own (compose-mysql.yaml, up-mysql.sh):
+# checked when it is up, and said so when it is not.
+if docker ps --format '{{.Names}}' | grep -qx dbxtui-fixtures-mysql-mysql-1; then
+  ./check-mysql.sh
+else
+  echo "SKIP mysql fixtures: the container dbxtui-fixtures-mysql-mysql-1 is not running (tests/fixtures/up-mysql.sh)"
+fi

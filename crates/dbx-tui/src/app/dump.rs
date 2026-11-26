@@ -275,10 +275,15 @@ pub const KNOWN_LOSSES: &str = "domains, partitions, composite arrays, NaN and I
 /// loses on SQLite"; each is pinned by a live test).
 pub const KNOWN_LOSSES_SQLITE: &str = "blobs (written as text starting 0x), Infinity (written as NULL), a time zone in a date or time (dropped) and integers past 2^53 in an untyped column (written as text)";
 
+/// What dbx's dump is known to lose on MySQL (README "MySQL"; each is pinned
+/// by a live test in `tests/mysql.rs`).
+pub const KNOWN_LOSSES_MYSQL: &str = "FLOAT values (written with the six digits the grid shows, which is not always the number stored)";
+
 /// The losses of the dump of a connection speaking `dialect`.
 pub fn known_losses(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Sqlite => KNOWN_LOSSES_SQLITE,
+        Dialect::MySql => KNOWN_LOSSES_MYSQL,
         _ => KNOWN_LOSSES,
     }
 }

@@ -19,6 +19,8 @@ pub use dbx::{DbxCore, KeySource, StoreOptions};
 pub use store::{has_dbx_store, StoreChoice, StoreInfo, StoreKind, StoreSource};
 #[cfg(feature = "test-support")]
 pub use dbx::check_seed_dir;
+#[cfg(feature = "test-support")]
+pub use dbx::mysql_statements_read;
 pub use dump::{DumpContent, DumpEnd, DumpFailure, DumpId, DumpProgress, DumpRequest, DumpSink, DumpStatus, Dumped, FileLeft};
 pub use export::{ExportError, ExportFormat, ExportJob, ExportRequest, Exported};
 pub use fake::{Call, Catalogue, FakeCore, Scripted, ScriptedDump, SyntaxCalls};
@@ -504,6 +506,15 @@ pub enum Reason {
     SessionSwitched,
     /// `EXPLAIN ANALYZE` runs the statement it explains.
     ExplainRuns,
+    /// MySQL: the server can read its quotes or comments in more than one
+    /// way (the SQL modes `NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES`, and the
+    /// server's version for `/*!NNNNN */`, decide), or dbx's own scanner reads
+    /// them otherwise than the server does: it may be other statements than
+    /// this client judged.
+    Ambiguous,
+    /// MySQL: `INTO OUTFILE` or `INTO DUMPFILE` writes a file on the host the
+    /// server, and every database it has, is on.
+    WritesFile,
 }
 
 impl Reason {
@@ -522,6 +533,8 @@ impl Reason {
             Reason::SwitchesDatabase => "it switches the session's database; later statements in this tab will be confirmed",
             Reason::SessionSwitched => "an earlier USE in this tab switched its database, so this may run on production",
             Reason::ExplainRuns => "EXPLAIN ANALYZE runs the statement it explains",
+            Reason::Ambiguous => "the server may read its quotes or comments differently from this client (its SQL mode and version decide), which could make it other statements than it looks",
+            Reason::WritesFile => "it writes a file on the database server's host",
         }
     }
 }
@@ -815,11 +828,18 @@ pub struct CoreError {
     pub position: Option<SqlPosition>,
     /// For `NeedsConfirmation`: why, and what a yes sends back.
     pub assessment: Option<Box<Assessment>>,
+    /// The run reached the server and what it did there is not known: a
+    /// cancel (or the time limit) stopped a run of more than one statement,
+    /// or a statement not proven read-only, so earlier statements, or part of
+    /// this one, may have run; or the session was lost after the statement
+    /// was sent. Saved to the history as a run whose outcome is unknown, never
+    /// shown as merely "stopped".
+    pub outcome_unknown: bool,
 }
 
 impl CoreError {
     pub fn new(kind: CoreErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), statement: None, position: None, assessment: None }
+        Self { kind, message: message.into(), statement: None, position: None, assessment: None, outcome_unknown: false }
     }
 
     /// Nothing ran: `assessment` says why it waits for a yes.

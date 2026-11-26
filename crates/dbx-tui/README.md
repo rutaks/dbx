@@ -121,7 +121,7 @@ A level that is not there is not a node: the level above lists what is below
 it, and the paths carry an empty database or schema name (the Core uses the
 connection's own database). `browse` and `edit_in_form` are also gated by
 `BROWSED_HERE` in `dbx.rs`, the types whose adapter calls and form this client
-is built and tested for (PostgreSQL only so far): adding a database is one
+is built and tested for (PostgreSQL, MySQL and SQLite so far): adding a database is one
 line there plus its tests, not edits across `app`. A type whose
 `queryExecution` is false is listed, and running in it says it cannot be
 queried. `Syntax::capabilities(kind)` answers the same for a kind before any
@@ -206,6 +206,197 @@ given, not resolved), so the store names the same file from anywhere.
 - **Not supported:** encrypted files, attached databases, creating a file,
   SQLite over SSH.
 
+## MySQL (slice 23b)
+
+MySQL is on in `BROWSED_HERE` and `COMPLETED_HERE` (`src/core/dbx.rs`). The form
+is the Postgres form with the type row at MySQL and port 3306 from
+`Capabilities`; TLS is dbx's `require_ssl` with no certificate check (a live test
+reads `Ssl_cipher`). MariaDB, OceanBase and the other MySQL-family types stay
+unswitched (their `DbKind` is separate, design section 28).
+
+- **What dbx's MySQL calls take.** Completion's `database` names the pool and
+  `schema`, when it is not empty, names the database searched
+  (`completion_assistant_search` in `dbx-driver-mysql`): either field works for
+  the current database, and a search of another database sets `schema`
+  (`tests/mysql.rs`, `a_search_for_fil_in_sakila...`). `get_columns_core` and
+  `list_foreign_keys_core` do the same (`mysql_table_metadata_catalog`), so the
+  tree's empty schema name works. A `candidate.schema` is the database.
+- **Current database.** `Core::current_schema` runs `select database()` on the
+  database's own pool (`current_schema_sql`; `current_schema()` is an error on
+  MySQL). It does not see a `USE` typed in a tab, whose session is not that
+  pool: completion stays on the tab's database. The tree's `release` closes a
+  database's pool for MySQL too (`<connection id>:<database>`).
+- **Cancel is `KILL QUERY`** from a dedicated connection (dbx's
+  `register_interrupt` in `dbx-core/src/query/mod.rs`), sent only by a cancel
+  through the running-query list. Left alone, dbx stops waiting at once and
+  discards the session's connection (a later run is a new connection: the
+  variable, temporary table and transaction are gone). So a MySQL run asks for
+  `await_cancel_completion`: it waits for the server's answer to the kill, which
+  is error 1317 for almost every statement (mapped to `Cancelled`) and the
+  connection stays. `SLEEP()` is the exception: interrupted, it returns 1 and the
+  statement ends normally. After a cancel or timeout, a statement dbx proves
+  read-only (or would, but for its `SLEEP()` calls: dbx's proof does not list
+  SLEEP, which only waits; `proven_but_for_sleep`) that ended with a result is `Cancelled` (or the timeout, worded "the
+  server then answered it with a result", never "stopped"), and the result is
+  not shown; anything else that ended with a result (a write, a read calling a
+  function dbx cannot vouch for) is shown with a note (`tests/mysql.rs`,
+  `a_write_the_server_answers_after_a_cancel...`: an INSERT with `sleep(30)` in
+  its values writes the row; `a_read_dbx_cannot_prove...`), and a run of more
+  than one statement adds that the result is the first one's and the later
+  statements may have run. The connection's query timeout sends the same kill
+  (`running_queries.cancel`; `token.cancel()` alone ends nothing on the server)
+  and waits for the server's answer at most `KILL_GRACE` (10 s), then lets the
+  run go and says whether the server stopped it is not known; the `select 1`
+  probe after it is bounded the same way. The `select 1` probe after a cancel
+  runs on the session that survived; the tests check
+  `information_schema.processlist` after each cancel, and that the connection
+  id, a `SET @x`, and a temporary table are the same.
+- **A cancel that leaves the outcome unknown.** Each statement of a MySQL
+  multi-statement text commits on its own, and a table that is not
+  transactional keeps what a killed statement wrote. So a cancelled (or timed
+  out) run of more than one statement, or of one not proven read-only, is
+  `CoreError::outcome_unknown`: the tab says "cancelled after …; earlier
+  statements may have run, or part of this one: what it changed is not known",
+  and the history keeps it as a failed run whose error starts "The outcome is
+  unknown" (a plain cancel saves nothing). Postgres runs a multi-statement text
+  in one implicit transaction, so this is MySQL only (`tests/mysql.rs`,
+  `a_cancelled_run_of_more_than_one_statement...`: `update; <long select>`
+  cancelled in the select; `history_tests.rs` for the app).
+- **Transactions.** dbx's default for an auto-commit tab is to `ROLLBACK` an
+  explicit `BEGIN` when the run that opened it ends, which turns `begin;
+  update; rollback;` (three runs) into a committed update. Runs ask for
+  `preserve_explicit_transaction` on MySQL, so the transaction stays open
+  between runs, as on Postgres, and closing the tab's session rolls it back
+  (live test). dbx tracks a client session per tab (`mysql_client_sessions`): a
+  lost connection is `MYSQL_CLIENT_SESSION_LOST`, shown once with "This statement
+  was not executed.", and the next run starts a new session. The same code after
+  the statement was sent (dbx could not settle its transaction:
+  "The transaction outcome may be unknown") is not a failure to connect: it is
+  `outcome_unknown`, says "The session was lost after the statement was sent, so
+  what it did is not known", and is saved to the history (`run_error`, unit
+  test; no live repro: it needs the server to drop the connection between the
+  statement and dbx's `ROLLBACK`).
+- **Known gap: an open transaction is not shown.** dbx reports
+  `MysqlAutoCommitTransaction::Preserved` only through
+  `execute_sql_statement_with_options_typed_with_outcome`, which is
+  `pub(crate)` in dbx-core; the public call this client uses drops it. So a tab
+  with a `BEGIN` still open has no marker, and closing the tab, retargeting it,
+  forgetting the connection or quitting rolls the transaction back without
+  asking (as on Postgres, which has no marker either). Showing one needs a dbx
+  change (the outcome made public) or a second query per run
+  (`information_schema.innodb_trx` for the session's connection id).
+- **`LOAD DATA LOCAL INFILE`:** dbx sets no handler, so a file of the client's is
+  never sent. With the server's `local_infile` off the server refuses; with it
+  on, the connection is closed (an error, the session lost, no row from the
+  file). Tested both ways.
+- **Confirmations.** `assess` (`src/core/dbx.rs`) judges MySQL text in every
+  reading the server may give it (`src/core/dbx/mysql_read.rs`, a model of
+  MySQL 8.4's lexer): `#`, and `--` followed by ASCII whitespace or an ASCII
+  control character, run to the end of the line (a `--` followed by anything
+  else, a non-breaking space or U+3000 included, is two minus signs, written
+  `- -`); `/* */` ends at the first `*/`; `/*!` is code, and `/*!NNNNN` (five
+  digits, or six when a sixth follows) is code on a server of that version or
+  later and a comment, with one nested `/* */`, on an older one; `/*M!` is a
+  comment to MySQL and code to MariaDB. Each of `NO_BACKSLASH_ESCAPES` and
+  `ANSI_QUOTES` on and off, each server version the text's version comments
+  name (and one older than all), MySQL and MariaDB: each reading is judged
+  twice by dbx, as written with its comments gone and rewritten so that any
+  lexer reads it alike (strings `'...'`, names `` `...` ``, no backslash, quote,
+  `#` or comment mark inside), and the text is judged as written too. The
+  verdicts are merged (production if any is, every reason and named database).
+  A text is `Reason::Ambiguous` ("the server may read its quotes or comments
+  differently…") when its readings differ in what lies outside quotes and
+  comments, or when dbx's own scanner (`strip_sql_comments_and_literals`) reads
+  the text, or a rewritten reading, otherwise than the reading does (dbx takes
+  any `--` for a comment, closes `/*! */`, knows no `ANSI_QUOTES`, and quotes
+  `$$`): then it asks as for production on any connection that lists one, is
+  never proven read-only, and is never run again by "load more". Unless every
+  reading is one statement (no `;` outside quotes and comments in any, dbx's
+  scanner agreeing with each): then a reading whose quote never closes is a
+  syntax error to the server and is set aside, and if every other reading's
+  rewritten text gets the same verdict, the text is not ambiguous and that
+  verdict stands (`MysqlReadings::single`). So `select * from users where name
+  = 'O\'Brien'` and `"a\"b"` run without asking; a version comment, `--x`, or
+  a backslash before a quote with a `;` after it still ask on such a
+  connection.
+- **Client charsets that swallow a backslash.** In big5, cp932, gb18030, gbk
+  and sjis a two-byte character may end in `\` (0x5C) or `` ` `` (0x60), none
+  in `'` or `"` (found on the fixture with `char_length(convert(unhex(...)
+  using cs))` over every lead byte; eucjpms, ujis, euckr and gb2312 have none,
+  ucs2/utf16/utf32 cannot be a client charset). The bytes of a UTF-8
+  character there can join the next byte: `select '丁\\', '; delete …; -- '`
+  is one SELECT to a UTF-8 reading and a SELECT and a DELETE to gbk. The
+  gate does not model those lexers: MySQL text that is not all ASCII is
+  `Reason::Ambiguous` (`mysql_unread`) when the connection's URL parameters
+  name such a charset or `character_set` (dbx sends `SET NAMES` with
+  `charset=` at connect; `dataCharset=` aside, which needs utf8mb4), when the
+  session has run anything that may change the client charset
+  (`CharsetSessions`: `SET NAMES`, `SET CHARACTER SET`, `SET CHARSET`,
+  anything with `character`, `PREPARE`, or a `SET` of a name that is not
+  ASCII, since the server compares variable names as utf8mb3_general_ci and
+  `@@chàracter_ſet_client` sets it; stored routines put it back), until the
+  session closes, or when the text itself may change it and goes on to
+  another statement. ASCII text reads alike in every client charset. A `USE`
+  in such text marks the session as switched. Asking `@@character_set_client`
+  before each run was not chosen: it costs a round trip on the tab's session
+  per run, and a text can change the charset partway through itself.
+- **The differential.** `tests/mysql.rs`, `no_text_of_the_corpus_runs...`,
+  runs the 61 texts of `tests/fixtures/mysql/gate_corpus.rs` (`GATE_CORPUS`
+  and `CHARSET_CORPUS`, each followed by `select 'MARK'`, then by a write to a
+  scratch table) under the four combinations of the two modes and six client
+  charsets (utf8mb4, gbk, sjis, cp932, gb18030, big5, set by a confirmed `SET
+  NAMES`), reads what the server ran from
+  `performance_schema.events_statements_history`, and checks that the gate
+  never let through a statement it did not read, never let a write reach the
+  table through a production connection, and that whatever that connection
+  let through unasked ran as one SELECT or a syntax error.
+  `a_connection_whose_charset_parameter...` does the same for `charset=` in
+  the URL parameters. Found in the slice 23b review, round 3: under gbk,
+  `` select 1 as `丁`, '`; delete …; -- ' `` and `select '丁\\', '; delete …; -- '`
+  ran the delete unasked on a production connection. Found in the slice 23b review:
+  `select 1 --<U+00A0> …; delete …` and `select '\'' as "\"; delete … #"` (under
+  `ANSI_QUOTES`) ran the delete without asking, and `/*!99999 -- */ --1;
+  select …` was read only with its comment opened, which hid the second
+  statement. Found in slice 23b, against dbx's scanners: `select 5
+  --1; delete from prod.t` (a comment to dbx, two statements to MySQL) ran
+  without asking through a selection; `delete b from a, prod.b`, `load data ...
+  into table prod.t`, `select prod.f()` and `... lock in share mode` were not
+  seen as aimed at `prod`, since dbx finds one target after `FROM`, `JOIN`,
+  `UPDATE` or `INTO`. Whatever is not proven read-only and names a database of
+  `production_databases` anywhere in its text (backticks and case aside) is
+  now aimed at it, and `INTO OUTFILE`/`DUMPFILE` asks wherever the connection
+  lists any production database (`Reason::WritesFile`). `USE` taints the
+  session through the same views (so a `USE` behind `--1` counts). Unit tests
+  are `src/core/dbx/mysql_gate_tests.rs`; live ones in `tests/mysql.rs`. `PREPARE`
+  cannot hide a `USE` (MySQL answers 1295). Not covered: a function in the
+  tab's own database that writes elsewhere, a trigger, or an event; dbx cannot
+  know either, on Postgres as here.
+- **Dump and export.** dbx's dump checks `mysql_data_charset_policy` first: it
+  refuses only a connection whose URL parameters set `dataCharset` (GBK, GB18030
+  or BIG5, set in the desktop app), with `MYSQL_DATA_CHARSET_EXPORT_UNSUPPORTED`,
+  shown as dbx says it. A dump of Sakila (3.5 s) is tables, then views, then
+  procedures, functions and triggers; it names no database, and loads into a
+  scratch database with every table's checksum, row count and `SHOW CREATE
+  TABLE` the same. What it loses: FLOAT cells are the six digits the server
+  prints (`KNOWN_LOSSES_MYSQL`), in the dump and in a SQL INSERT export alike.
+- **Values:** `tests/ground_truth_mysql.rs` compares 316,008 cells of `edge` and
+  Sakila with `mysql --xml` (bytes and BIT through `hex()`, a FLOAT's stored
+  value through `cast(.. as double)`, a DOUBLE by its bits: MySQL prints the
+  shortest spelling that reads back). Thirteen groups differ and are in
+  `tests/fixtures/KNOWN_DIFFERENCES-mysql.md`: five FLOAT cells (LOSS: the
+  server's six digits are not the stored number, and the `mysql` client shows
+  them the same way), BIT as binary digits, bytes as `0x`+hex and zero fractions
+  of seconds dropped (FORMAT).
+- **Not looked at:** MariaDB, OceanBase, SSH tunnels, client certificates.
+- **Fixtures:** `tests/fixtures/compose-mysql.yaml` (project
+  `dbxtui-fixtures-mysql`, container `dbxtui-fixtures-mysql-mysql-1`, MySQL 8.4.13
+  pinned by digest, `127.0.0.1:53307`, root / `dbxtui`, data on tmpfs),
+  `up-mysql.sh` (also fetches Sakila, sha256-checked), `down-mysql.sh`,
+  `init-mysql/10-load.sh`, `mysql/edge/01-edge.sql` (databases `edge` and
+  `edge_other`), `check-mysql.sh` (run by `check.sh` when the container is up).
+  Run `cargo test -p dbx-tui --test mysql --test ground_truth_mysql --
+  --test-threads=1` and `tests/journeys/mysql.sh`.
+
 ## The schema tree (sidebar)
 
 Connection, database, schema, table or view, column, each level loaded on
@@ -240,8 +431,8 @@ node that is loading or reloading has a yellow arrow, and a connection's glyph
 is yellow while a call on it runs, even right after a failure.
 A `▕` scrollbar appears when the list is longer than the pane. Only the
 connection types the client was built for can be browsed so far
-(`Capabilities::browse`, see above): any other shows "Browsing MySQL is not
-supported yet." under it and asks dbx nothing. The sidebar is about 30% of the
+(`Capabilities::browse`, see above): any other (MariaDB, say) shows "Browsing
+MariaDB is not supported yet." under it and asks dbx nothing. The sidebar is about 30% of the
 width, between 26 and 34 columns (with its separator). Closing a database
 node, or a connection, tells the Core to `release` the databases it opened
 (`Core::release`: dbx's `remove_pool_by_key` for `<connection id>:<database>`),

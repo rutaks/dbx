@@ -219,6 +219,13 @@ fn run_line(app: &App) -> Option<(String, Role)> {
                     Role::Peach,
                 ),
                 CancelEnd::Failed(why) => (format!("failed after the cancel, after {}: {why}", duration_text(*after)), Role::Red),
+                CancelEnd::OutcomeUnknown => (
+                    format!(
+                        "cancelled after {}; earlier statements may have run, or part of this one: what it changed is not known{what}",
+                        duration_text(*after)
+                    ),
+                    Role::Peach,
+                ),
                 CancelEnd::Abandoned => (
                     format!(
                         "stopped waiting after {}: not confirmed stopped. This tab runs in a new session now.",

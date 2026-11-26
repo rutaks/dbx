@@ -309,13 +309,84 @@ keep a scratch store off your keychain, set `DBX_SECRET_KEY_FILE` as well as
   types used as arrays, partition definitions (six of Pagila's seven fail to
   parse), `NaN` and the infinities (written as `NULL`), geometric, `tsquery` and
   `tsvector` values, and tables with several parents. Restore into a scratch
-  database and read the errors before relying on one. Use `pg_dump` for backups.
+  database and read the errors before relying on one. Use `pg_dump` for backups
+  (`mysqldump` on MySQL, where a dump loses less: see below).
 
 ## Supported databases
 
-**PostgreSQL** and **SQLite**: browsing, queries, completion, export, dump.
-dbx's connection type for MySQL is listed in the tree but cannot be browsed
-yet; MySQL support is coming.
+**PostgreSQL**, **MySQL** and **SQLite**: browsing, queries, completion,
+export, dump. dbx has other connection types (MariaDB and the other
+MySQL-family servers among them); they are listed in the tree but cannot be
+browsed or edited yet.
+
+**What differs on MySQL** (`ctrl+g n`, then `space` on the type row until it
+says MySQL: name, host, port 3306, user, password, database, TLS and the
+production switch; checking TLS requires an encrypted connection and does not
+verify the server's certificate; SSH tunnels and client certificates are not
+supported):
+
+- The tree is databases, then tables and views, with no schema level, and lists
+  every database the server shows you, the system ones included. `D` on a
+  database dumps it. A tab is pointed at a database with `u`.
+- Names resolve in the tab's database, which the server calls its current
+  database. Completion offers its tables and, after `other_db.`, those of
+  another database. A `USE` typed in a tab changes what its statements run
+  against and not what completion offers: completion stays on the database the
+  tab was pointed at.
+- Each tab has its own session, so `SET @x`, temporary tables and an open
+  transaction last from one run to the next. `begin` stays open until `commit`,
+  `rollback` or the tab's session ends (closing the tab, or pointing it at
+  another database, rolls an open transaction back). dbx's own default would
+  roll it back as soon as the run that opened it ended; dbpane asks it not to.
+- Cancel stops the statement on the server (dbx sends `KILL QUERY` from a second
+  connection) and keeps the session, its variables, temporary tables and open
+  transaction. A statement MySQL ends with an answer instead of an error (`SELECT
+  SLEEP(30)` returns 1 when interrupted) is shown as cancelled when it is a
+  proven read; anything else that finished first is shown with its result and a
+  note. Each statement of a run of several commits on its own, so a cancelled
+  run of more than one statement, or of one that is not a proven read, says
+  "earlier statements may have run" and goes to the history with its outcome
+  unknown. The connection's query timeout works the same way. Known gap: a
+  transaction left open is not marked on the tab, and closing the tab rolls it
+  back without asking. `LOAD DATA LOCAL INFILE` never
+  sends a file from your machine: where the server allows it, the connection is
+  closed, the statement fails and the tab's session is lost.
+- Confirmations: a statement that is not a proven read, run from one database
+  while naming a database marked production (`delete from prod.t` on `staging`,
+  `update a, prod.b ...`, `select prod.f()`), asks, in any spelling of the
+  name. `USE` asks when it moves to a production database, and after any `USE` in
+  a tab every statement that is not proven read-only asks until its session is
+  closed. Statements that write a file on the server (`INTO OUTFILE`, `INTO
+  DUMPFILE`), `SET GLOBAL`, `HANDLER`, `LOCK TABLES`, `KILL`, `FLUSH`,
+  `PREPARE`/`EXECUTE` and `CALL` ask on a connection that lists any production
+  database, since the server cannot say what they touch; `LOAD DATA` asks like
+  any write, by the database it loads into. The text is judged as the server reads it, not as a comment scanner
+  does: `select 1 --1; delete ...` is two statements (so is a `--` followed by a
+  non-breaking space), `/*!50000 ... */` runs on a server that new, a block
+  comment ends at its first `*/`. Text the server would read differently under
+  its `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES` mode, or by its version (a
+  backslash before a quote, a `/*!NNNNN` comment),
+  asks on a connection that lists a production database, unless it is one
+  statement however it is read (`'O\'Brien'` does not ask). On a connection
+  or session whose client charset may be big5, cp932, gb18030, gbk or sjis
+  (a `charset=` URL parameter, or a `SET NAMES` run in the tab), whose
+  characters can swallow a backslash, text with any character that is not
+  ASCII asks there too, until the tab's session closes.
+- Values are checked against `mysql --xml` in about 316,000 cells; a few differ
+  (`tests/fixtures/KNOWN_DIFFERENCES-mysql.md`). A BIT column shows its bits
+  (`01000001`), bytes show as `0x` and hex, and a fraction of seconds drops
+  trailing zeros. A FLOAT column shows six significant digits, as `mysql` does,
+  which is not always the number stored (`3.40282e38` for the largest FLOAT);
+  DOUBLE, DECIMAL (65 digits), BIGINT UNSIGNED, TIME below zero, YEAR, JSON,
+  ENUM and SET, and utf8mb4 text come exactly.
+- A dump of a database restores into a new one with every table, its keys,
+  views, procedures, functions, triggers and rows (Sakila: every table's
+  checksum and structure the same). It loses the FLOAT cells' extra precision,
+  because the file holds the six digits the grid shows, and the same goes for
+  the SQL INSERT export. A connection that sets `dataCharset` in the dbx desktop
+  app is refused a dump with dbx's message. For a backup, use `mysqldump`.
+- Not supported: MariaDB, OceanBase and the other MySQL-family types, SSH
+  tunnels, TLS with client certificates.
 
 **What differs on SQLite** (a file you add with `ctrl+g n`, choosing the type
 SQLite: a name and the file's path, which must be an existing SQLite file;

@@ -259,6 +259,48 @@ async fn a_run_cancelled_and_stopped_saves_nothing_and_one_that_finished_first_s
     assert_eq!(h.fake.saved_history().len(), 1, "{:?}", h.fake.saved_history());
 }
 
+/// A cancel the Core says left the outcome unknown (slice 23b review: a
+/// MySQL run of more than one statement, or of one not proven read-only).
+fn cut_short(statement: &str) -> CoreError {
+    let mut e = CoreError::new(CoreErrorKind::Cancelled, "Cancelled; earlier statements may have run.");
+    e.statement = Some(statement.into());
+    e.outcome_unknown = true;
+    e
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_run_whose_outcome_is_unknown_is_saved_as_unknown_and_says_earlier_statements_may_have_run() {
+    let mut h = on_pagila().await;
+    let sql = "update t set v = 1; select slow";
+    h.fake.script_run(Scripted::fail(cut_short(sql)).after(Duration::from_secs(3)).deaf());
+    h.type_text(sql);
+    h.press("f5");
+    h.settle().await;
+    h.press("ctrl+c");
+    tokio::time::advance(Duration::from_secs(3)).await;
+    h.settle().await;
+    let saved = h.fake.saved_history();
+    assert_eq!(saved.len(), 1, "what ran may have changed something: it is in the history: {saved:?}");
+    assert_eq!(saved[0].sql, sql);
+    assert!(!saved[0].success);
+    assert!(saved[0].error.as_deref().is_some_and(|e| e.contains("outcome is unknown")), "{saved:?}");
+    let pane = results_rows(&mut h);
+    assert!(pane[0].contains("cancelled") && pane[0].contains("earlier statements may have run"), "{pane:#?}");
+    let bar = mode_bar(&mut h);
+    assert!(bar.contains("may have run"), "{bar}");
+}
+
+#[tokio::test]
+async fn a_run_cancelled_from_elsewhere_whose_outcome_is_unknown_says_so_too_and_is_saved() {
+    let mut h = on_pagila().await;
+    let sql = "update t set v = 1; select slow";
+    run_and_land(&mut h, sql, Scripted::fail(cut_short(sql))).await;
+    assert!(matches!(h.app.model.tabs[0].run, RunState::Cancelled { how: super::query::CancelEnd::OutcomeUnknown, .. }), "{:?}", h.app.model.tabs[0].run);
+    assert_eq!(h.fake.saved_history().len(), 1);
+    let pane = results_rows(&mut h);
+    assert!(pane[0].contains("earlier statements may have run"), "{pane:#?}");
+}
+
 #[tokio::test]
 async fn a_failed_save_shows_one_notice_and_a_good_one_shows_none() {
     let mut h = on_pagila().await;

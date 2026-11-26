@@ -988,10 +988,11 @@ async fn a_hundred_thousand_characters_pasted_into_a_field_are_cut_at_4_kib_and_
 }
 
 #[tokio::test]
-async fn e_edits_postgres_connections_only_and_says_where_to_edit_the_others() {
+async fn e_edits_the_kinds_with_a_form_and_says_where_to_edit_the_others() {
     let fake = FakeCore::new();
-    let mut shop = conn("shop", DbKind::MySql);
-    shop.port = Some(3306);
+    // A kind this client has no form for (MySQL has had one since slice 23b).
+    let mut shop = conn("shop", DbKind::Other("oracle".into()));
+    shop.port = Some(1521);
     fake.script_connections(Scripted::ok(vec![conn("alpha", DbKind::Postgres), shop, conn("notes", DbKind::Sqlite)]));
     let mut h = Harness::start(fake);
     h.settle().await;
@@ -999,9 +1000,9 @@ async fn e_edits_postgres_connections_only_and_says_where_to_edit_the_others() {
     assert!(bar(&mut h).contains("e edit"), "{:?}", bar(&mut h));
     h.press("j");
     let b = bar(&mut h);
-    assert!(!b.contains("e edit") && b.contains("d remove"), "no edit hint on a MySQL row: {b:?}");
+    assert!(!b.contains("e edit") && b.contains("d remove"), "no edit hint on a row of a kind with no form: {b:?}");
     h.press("e");
-    assert!(h.app.ui.overlay.is_none(), "no Postgres-shaped form for MySQL");
+    assert!(h.app.ui.overlay.is_none(), "no form for it");
     let side = sidebar_rows(&mut h, W, H).join("\n");
     assert!(side.contains("dbx app"), "it says where to edit it: {side}");
     h.press("j");

@@ -101,6 +101,8 @@ mod capabilities_tests;
 #[cfg(test)]
 mod sqlite_tests;
 #[cfg(test)]
+mod mysql_tests;
+#[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
 mod tests;

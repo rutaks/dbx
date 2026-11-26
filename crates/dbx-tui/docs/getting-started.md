@@ -1,9 +1,9 @@
 # Getting started with dbpane
 
 About ten minutes, from install to a first query, a browsed table and an
-export. You need a PostgreSQL server you can reach (a local one, a cloud one,
-or a throwaway you start yourself) or a SQLite file; dbpane itself needs
-nothing else, and in particular no Docker.
+export. You need a PostgreSQL or MySQL server you can reach (a local one, a
+cloud one, or a throwaway you start yourself) or a SQLite file; dbpane itself
+needs nothing else, and in particular no Docker.
 
 Keys that begin with `ctrl+g` are the **prefix**: press `ctrl+g`, release it,
 then press the next key. The bar at the bottom of the window always shows the
@@ -47,8 +47,18 @@ host, port (5432), user, password, database, then two switches, TLS and
 server's message, never your password) and `enter` to save. `esc` cancels
 without losing what you typed.
 
-**A SQLite file.** The first row of the form is the **type**: `space` (or a
-click on the row) switches between PostgreSQL and SQLite. A SQLite connection
+**A MySQL server.** The first row of the form is the **type**: `space` (or a
+click on the row) goes on to the next of PostgreSQL, MySQL and SQLite. MySQL has
+the same fields as PostgreSQL, with its own port, 3306. Leave the database
+empty to see every database on the server, or name the one tabs start in;
+opening the connection lists its databases and then their tables (there is no
+schema level), and `u` on a database points the query tab at it. The TLS
+switch requires an encrypted connection and does not check the server's
+certificate. A statement that is run in a tab keeps its session: `set @x = 1`,
+a temporary table and a `begin` last until the next run, and cancelling a
+statement keeps them (README, "What differs on MySQL").
+
+**A SQLite file.** A SQLite connection
 has only a name, the **file** (a path such as `~/data/app.db`) and the
 production switch: no host, port, user, password or TLS. The file must already
 exist and be a regular file; dbpane never creates one, and says so if the path
@@ -240,6 +250,14 @@ restore:
 A structure-only dump restores every table dbx can make, empty. For a backup,
 use `pg_dump`.
 
+**MySQL.** `D` on a database dumps it: every table with its keys, then the
+views, procedures, functions and triggers, and the rows. The dump of the
+Sakila sample database restores into a new database with every table's
+rows and structure the same, and its views, routines and triggers. It loses
+the extra precision of FLOAT columns (a FLOAT is written with the six digits
+the grid shows). A connection whose dbx settings set a `dataCharset` is
+refused, with dbx's message. For a backup, use `mysqldump`.
+
 **SQLite.** `D` on a SQLite connection dumps the whole file (the overlay is
 titled with the connection's name). The dump loads into a new file with every
 table, view, index and row count, but it loses: a blob is written as the text
@@ -364,10 +382,12 @@ see Terminal setup above.
 
 **No database to try it on, and no Docker needed.** Any SQLite file will do
 (`sqlite3 try.db "create table t(a); insert into t values (1);"`, then add
-`try.db` by its full path). Or any PostgreSQL. If
+`try.db` by its full path). Or any PostgreSQL or MySQL. If
 you have Docker and want a throwaway:
 `docker run --rm -e POSTGRES_PASSWORD=pw -p 55432:5432 postgres:16`, then
-connect to `127.0.0.1` port `55432`, user `postgres`. Stop it with `ctrl+c`;
+connect to `127.0.0.1` port `55432`, user `postgres`; or
+`docker run --rm -e MYSQL_ROOT_PASSWORD=pw -p 53306:3306 mysql:8.4`, then
+type MySQL, `127.0.0.1` port `53306`, user `root`. Stop it with `ctrl+c`;
 dbpane never starts or stops containers.
 
 **A window that is too small.** `ctrl+g z` zooms one pane to the whole

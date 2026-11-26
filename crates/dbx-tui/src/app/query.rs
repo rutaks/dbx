@@ -229,6 +229,11 @@ pub enum CancelEnd {
     /// new session and the old one is closed once dbx lets go of the run.
     /// Whether the server stopped the statement is not known.
     Abandoned,
+    /// It was stopped after it reached the server, and the Core says what it
+    /// did there is not known (`CoreError::outcome_unknown`): a run of more
+    /// than one statement, whose earlier statements may have run, or of one
+    /// not proven read-only. Saved to the history as such.
+    OutcomeUnknown,
 }
 
 /// How long a cancel may take before the tab says the statement is still
@@ -648,6 +653,7 @@ impl App {
         let saved = if std::mem::take(&mut t.history) { super::history::saved_of(&result, after) } else { None };
         let (statement, how) = match result {
             Ok(set) => (Some(set.ran), CancelEnd::FinishedFirst),
+            Err(e) if e.kind == CoreErrorKind::Cancelled && e.outcome_unknown => (e.statement, CancelEnd::OutcomeUnknown),
             // Nothing ran (it waited for a yes): it is as stopped as can be.
             Err(e) if matches!(e.kind, CoreErrorKind::Cancelled | CoreErrorKind::NeedsConfirmation) => (e.statement, CancelEnd::Stopped),
             Err(e) => {
@@ -739,7 +745,8 @@ impl App {
             // Cancelled by something other than this tab (it would have made
             // the reply stale): the run is over, and gave nothing to show.
             (Err(error), None) if error.kind == CoreErrorKind::Cancelled => {
-                t.run = RunState::Cancelled { after: elapsed, statement: error.statement, how: CancelEnd::Stopped };
+                let how = if error.outcome_unknown { CancelEnd::OutcomeUnknown } else { CancelEnd::Stopped };
+                t.run = RunState::Cancelled { after: elapsed, statement: error.statement, how };
             }
             (Err(error), None) if error.kind == CoreErrorKind::Timeout => {
                 t.outcome = Some(Outcome::TimedOut { error, elapsed });

@@ -203,15 +203,17 @@ impl Capabilities {
         }
     }
 
-    /// A MySQL-shaped connection: databases and then tables, no schemas.
+    /// A MySQL-shaped connection: databases and then tables, no schemas; the
+    /// database a session is in stands where Postgres's current schema does
+    /// (`Core::current_schema` answers it).
     pub fn mysql() -> Self {
         Capabilities {
             schemas: false,
-            edit_in_form: false,
+            edit_in_form: true,
             default_port: Some(3306),
             dialect: Dialect::MySql,
-            dump_loses: false,
-            completes: false,
+            dump_loses: true,
+            completes: true,
             ..Self::postgres()
         }
     }

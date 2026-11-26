@@ -33,7 +33,8 @@ async fn sqlite_form() -> Harness {
     let mut h = form().await;
     h.press("ctrl+g n");
     h.press("up");
-    h.press("right");
+    // PostgreSQL, MySQL, SQLite.
+    h.press("right right");
     h.press("down");
     h
 }
@@ -99,21 +100,21 @@ async fn switching_the_type_keeps_what_was_typed_for_each_type_and_brings_it_bac
     // Up to the type row, and on to SQLite.
     h.press("up up up up up up up");
     assert_eq!(the_form(&h).focus, super::form::Field::Kind);
-    h.press("right");
+    h.press("right right");
     assert_eq!(the_form(&h).kind, DbKind::Sqlite);
     let rows = form_rows(&mut h).join("\n");
     assert!(!rows.contains("db.example"), "the file row starts empty, not with the host:\n{rows}");
     h.press("down down");
     h.type_text("/tmp/a.db");
     // Back to PostgreSQL: everything typed for it is back.
-    h.press("up up left");
+    h.press("up up left left");
     let f = the_form(&h);
     assert_eq!(f.kind, DbKind::Postgres);
     let texts = |f: &crate::app::form::ConnectionForm| [f.name.text(), f.host.text(), f.port.text(), f.user.text(), f.password.text(), f.database.text()].map(str::to_string);
     assert_eq!(texts(f), ["keep me", "db.example", "6543", "alice", "s3cret", "appdb"].map(str::to_string));
     assert!(f.tls, "the TLS box too");
     // And on to SQLite again: its file is back.
-    h.press("right");
+    h.press("right right");
     assert_eq!(the_form(&h).host.text(), "/tmp/a.db");
     assert_eq!(the_form(&h).name.text(), "keep me");
     let drafts = saved(&h.press_fx("enter"));
@@ -141,8 +142,13 @@ async fn a_click_on_the_type_rows_label_changes_nothing_and_a_click_on_a_choice_
     assert_eq!(the_form(&h).kind, DbKind::Postgres, "the label is not a choice");
     click(&mut h, sx + 9, row);
     assert_eq!(the_form(&h).kind, DbKind::Postgres, "past the last choice is not a choice");
+    // A click on the choices picks the next type: PostgreSQL, MySQL, SQLite.
     click(&mut h, sx + 1, row);
-    assert_eq!(the_form(&h).kind, DbKind::Sqlite, "a click on a choice switches");
+    assert_eq!(the_form(&h).kind, DbKind::MySql, "a click on a choice switches to the next");
+    click(&mut h, sx + 1, row);
+    assert_eq!(the_form(&h).kind, DbKind::Sqlite);
+    click(&mut h, sx + 1, row);
+    assert_eq!(the_form(&h).kind, DbKind::Postgres, "and the last gives the first");
 }
 
 #[tokio::test]
